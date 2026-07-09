@@ -1,6 +1,6 @@
 # Architecture
 
-zimgx is an HTTP image proxy built for concurrent request handling. It fetches images from a configurable origin, transforms them with libvips, and serves results through a multi-tier cache.
+imgx is an HTTP image proxy built for concurrent request handling. It fetches images from a configurable origin, transforms them with libvips, and serves results through a multi-tier cache.
 
 ## Request flow
 
@@ -50,47 +50,50 @@ Client Request
 ## Module map
 
 ```
-src/
-├── main.zig              Entry point. Initializes libvips, starts server.
-├── server.zig            HTTP server loop and request dispatch.
-├── router.zig            URL routing. Parses paths into a Route union.
-├── config.zig            ZIMGX_* env var loading and validation.
-├── allocator.zig         Per-request arena allocator.
+crates/
+├── imgx-vips/                     Hand-rolled libvips FFI — the crate's unsafe/audit boundary.
+│   └── src/
+│       ├── ffi.rs                 Raw extern "C" declarations for the libvips/glib C surface.
+│       ├── image.rs               Safe RAII VipsImage wrapper (load, resize, effects, encode).
+│       └── error.rs               VipsError (thiserror).
 │
-├── transform/
-│   ├── params.zig        TransformParams struct and query string parser.
-│   ├── negotiate.zig     Accept header parsing and format negotiation.
-│   └── pipeline.zig      Probe → decide → reload → resize → effects → encode.
-│
-├── http/
-│   ├── response.zig      Content-Type, ETag, Cache-Control, 304 logic.
-│   └── errors.zig        Structured HTTP errors with JSON serialization.
-│
-├── cache/
-│   ├── cache.zig         Cache vtable interface and cache key builder.
-│   ├── memory.zig        In-memory LRU cache (thread-safe).
-│   ├── noop.zig          No-op cache (used when caching is disabled).
-│   ├── r2.zig            R2/S3-backed cache (L2 persistent layer).
-│   └── tiered.zig        L1 plus L2 composition (memory → R2).
-│
-├── origin/
-│   ├── source.zig        URL builder for HTTP origin.
-│   ├── fetcher.zig       HTTP client for origin fetches.
-│   └── r2.zig            R2-backed origin fetcher.
-│
-├── s3/
-│   ├── signing.zig       AWS SigV4 signing (pure crypto, no I/O).
-│   └── client.zig        S3 HTTP client (GET/PUT/DELETE/HEAD).
-│
-└── vips/
-    └── bindings.zig      C interop wrappers for libvips functions.
+└── imgx/                          The binary. forbid(unsafe_code) -- everything unsafe lives in imgx-vips.
+    └── src/
+        ├── main.rs                Entry point. Loads config, initializes libvips, starts the server.
+        ├── server.rs              axum router, request dispatch, AppState (config/cache/origin/stats).
+        ├── router.rs              URL routing. Parses paths into a Route enum.
+        ├── config.rs              IMGX_* env var loading and validation.
+        │
+        ├── transform/
+        │   ├── params.rs          TransformParams struct and query string parser.
+        │   ├── negotiate.rs       Accept header parsing and format negotiation.
+        │   └── pipeline.rs        Probe → decide → reload → resize → effects → encode.
+        │
+        ├── http/
+        │   ├── response.rs        Content-Type, ETag, Cache-Control, 304 logic.
+        │   └── errors.rs          Structured HTTP errors with JSON serialization.
+        │
+        ├── cache/
+        │   ├── mod.rs             Cache trait (async, RPITIT) and cache key builder.
+        │   ├── memory.rs          In-memory LRU cache (parking_lot::RwLock).
+        │   ├── noop.rs            No-op cache (used when caching is disabled).
+        │   ├── r2.rs              R2/S3-backed cache (L2 persistent layer).
+        │   └── tiered.rs          L1 plus L2 composition (memory → R2), generic over both.
+        │
+        ├── origin/
+        │   ├── source.rs          URL builder for HTTP origin.
+        │   ├── fetcher.rs         HTTP client for origin fetches (reqwest).
+        │   └── r2.rs              R2-backed origin fetcher.
+        │
+        └── s3/
+            └── client.rs          S3 client (GET/PUT/DELETE/HEAD) via rusty-s3 presigned URLs + reqwest.
 ```
 
 ---
 
 ## Cache tiers
 
-zimgx uses a polymorphic `Cache` interface (vtable pattern) with multiple backends:
+imgx uses a `Cache` trait (async methods, `impl Future` return position) with multiple backends. The backend set is closed (Memory/Noop/R2/Tiered), so the server selects a concrete `AppCache` enum variant at startup based on config rather than using `dyn Cache` — no boxing, no object-safety cost:
 
 ```
 ┌─────────────────────────────────────────┐
@@ -109,39 +112,39 @@ zimgx uses a polymorphic `Cache` interface (vtable pattern) with multiple backen
 
 **Read path:** L1 hit → return. L1 miss → check L2 → promote to L1 → return.
 
-**Write path:** L1 is written synchronously (fast). L2 is written asynchronously on a background thread to keep the R2 upload off the response path.
+**Write path:** L1 is written synchronously (fast). L2 is written asynchronously via `tokio::spawn` to keep the R2 upload off the response path.
 
 **Write fallback:** If a cache write is skipped (for example, cache disabled or variant too large for L1), the image response is still returned uncached.
 
 **Delete path:** Delete from both L1 and L2.
 
-When `ZIMGX_CACHE_ENABLED=false`, a `NoopCache` replaces all cache operations with no-ops.
+When `IMGX_CACHE_ENABLED=false`, a `NoopCache` replaces all cache operations with no-ops.
 
-When `ZIMGX_ORIGIN_TYPE=http` (no R2 configured), only the L1 memory cache is active.
+When `IMGX_ORIGIN_TYPE=http` (no R2 configured), only the L1 memory cache is active.
 
 ---
 
 ## Origin backends
 
-### HTTP (`ZIMGX_ORIGIN_TYPE=http`)
+### HTTP (`IMGX_ORIGIN_TYPE=http`)
 
-Appends the request path to `ZIMGX_ORIGIN_BASE_URL`:
+Appends the request path to `IMGX_ORIGIN_BASE_URL`:
 
 ```
 Request:  GET /photos/cat.jpg/w=400
 Origin:   GET https://images.example.com/photos/cat.jpg
 ```
 
-### R2 (`ZIMGX_ORIGIN_TYPE=r2`)
+### R2 (`IMGX_ORIGIN_TYPE=r2`)
 
-Fetches from a Cloudflare R2 bucket using AWS SigV4 signed requests:
+Fetches from a Cloudflare R2 bucket using AWS SigV4-signed presigned URLs:
 
 ```
 Request:  GET /photos/cat.jpg/w=400
 Origin:   S3 GET from bucket "originals", key "photos/cat.jpg"
 ```
 
-With R2 origin, the tiered cache uses a second R2 bucket (`ZIMGX_R2_BUCKET_VARIANTS`) as the L2 persistent layer.
+With R2 origin, the tiered cache uses a second R2 bucket (`IMGX_R2_BUCKET_VARIANTS`) as the L2 persistent layer.
 
 ---
 
@@ -165,7 +168,7 @@ Determines whether to produce animated output based on: animation mode, frame ex
 
 ### 3. Reload
 
-For animated output: unrefs the probe image and reloads all frames stacked vertically. Clamps frame count to `max_frames`. For static output: no-op.
+For animated output: drops the probe image (Rust's ownership handles this automatically on reassignment) and reloads all frames stacked vertically. Clamps frame count to `max_frames`. For static output: no-op.
 
 ### 4. Resize
 
@@ -180,6 +183,8 @@ Uses `vips_thumbnail_image` with fit mode mapping:
 | `outside` | `VIPS_SIZE_UP` — scale up to cover dimensions |
 | `pad` | Resize like `contain`, then embed into target canvas using background color |
 
+For animated images with `fit=cover`, a two-step resize (scale without crop, then per-frame crop + reassemble) works around a libvips upstream bug that corrupts frame boundaries on stacked animated buffers — see `docs/INVARIANTS.md` INV-2.
+
 ### 5. Effects
 
 Applied in order: sharpen → blur → brightness/contrast → gamma → saturation.
@@ -193,6 +198,8 @@ Applied in order: sharpen → blur → brightness/contrast → gamma → saturat
 | WebP | `vips_webpsave_buffer` | 1–100 |
 | AVIF | `vips_heifsave_buffer` | 1–100 |
 | GIF | `vips_gifsave_buffer` | Palette-based |
+
+A pre-encode check on GIF output validates that `page-height` metadata evenly divides the total image height, resetting to single-frame if not — this avoids a libvips GIF-encoder crash on stale metadata after resize/effects (INV-3).
 
 ---
 
@@ -212,15 +219,22 @@ Errors serialize to JSON:
 | Origin server timed out | 504 Gateway Timeout |
 | Image exceeds size limit | 413 Payload Too Large |
 | Origin fetch failed | 502 Bad Gateway |
+| Server at connection or transform capacity | 503 Service Unavailable |
 
 ---
 
-## Threading model
+## Concurrency model
 
-zimgx uses a bounded thread pool to handle concurrent requests. Each accepted connection is handled by a worker thread, with capacity controlled by `ZIMGX_SERVER_MAX_CONNECTIONS` (default `256`). When active connections reach that limit, new connections are rejected until capacity frees up.
+imgx runs on axum/tokio rather than a fixed thread pool. Each incoming request is handled by an async task on the tokio runtime; CPU-bound libvips work is dispatched via `tokio::task::spawn_blocking`, gated by a `Semaphore` sized to `std::thread::available_parallelism()`.
 
-- **Thread-per-connection** — Each request runs on its own thread with stack-local buffers. No shared mutable state on the hot path.
-- **Thread-safe caches** — `MemoryCache` uses `std.Thread.RwLock`. `R2Cache` uses `std.Thread.Mutex`. Atomic operations protect server stats counters.
-- **Async L2 writes** — The persistent R2 cache layer is written asynchronously on the thread pool after the response is sent, keeping origin upload latency off the critical path.
-- **libvips threading** — libvips uses its own internal thread pool for image operations. Each request thread dispatches work to libvips, which parallelizes the heavy compute.
+Two independent backpressure mechanisms protect the server, each bounding a different resource:
+
+- **Connection-level (`IMGX_SERVER_MAX_CONNECTIONS`)** — A tower `concurrency_limit` + `load_shed` layer on the router bounds total concurrent in-flight requests. At capacity, new requests get `503` immediately rather than queueing. This is the direct equivalent of the prior Zig implementation's fixed 256-thread pool + atomic connection counter, expressed as router middleware instead of a hand-rolled accept-loop check.
+- **Transform-level (vips semaphore)** — When all `spawn_blocking` permits are held, a new *transform* request is separately rejected with `503` rather than queued unboundedly. A burst of cache-hit requests never touches this limiter at all, since it only gates the CPU-bound libvips work.
+
+Both mechanisms preserve the same invariant the Zig original had — "reject new work under saturation rather than queueing it unboundedly" — just split across the two resources (connections vs. CPU-bound transform work) that axum's async model actually needs to bound separately.
+- **Thread-safe caches** — `MemoryCache` uses `parking_lot::RwLock` (held only across synchronous in-memory operations, never across an `.await`). `R2Cache` performs its own async I/O per call, no shared mutable state to lock.
+- **Async L2 writes** — The persistent R2 cache layer is written via `tokio::spawn` after the L1 write completes, keeping origin upload latency off the critical path.
+- **libvips threading** — libvips uses its own internal thread pool for image operations within each `spawn_blocking` task.
 - **Horizontal scaling** — Run multiple instances behind a load balancer. Each instance maintains its own L1 cache. The shared R2 L2 cache provides cross-instance persistence.
+- **Graceful shutdown** — The server drains in-flight requests on `SIGTERM`/Ctrl+C before exiting, important for clean pod termination on Kubernetes/GKE.

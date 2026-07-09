@@ -1,0 +1,37 @@
+[package]
+name = "imgx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "imgx"
+path = "src/main.rs"
+
+[lib]
+name = "imgx"
+path = "src/lib.rs"
+
+[dependencies]
+imgx-vips = { path = "../imgx-vips" }
+tracing = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
+lru = "0.18"
+parking_lot = "0.12"
+rusty-s3 = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+url = "2"
+axum = "0.8"
+tower = { version = "0.5", features = ["util", "limit", "load-shed"] }
+tower-http = { version = "0.7", features = ["trace"] }
+tracing-subscriber = "0.3"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+serde_json = "1"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.7"
+
+[dev-dependencies]
+jiff = "0.2"
+

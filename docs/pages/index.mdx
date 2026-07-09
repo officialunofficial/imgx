@@ -1,14 +1,14 @@
-# zimgx
+# imgx
 
-An image proxy and transformation server. Written in Zig, powered by libvips.
+An image proxy and transformation server. Written in Rust, powered by libvips.
 
-zimgx sits in front of your existing image storage — any HTTP server or S3/R2 bucket — and handles resizing, format conversion, and caching on the fly. You do not upload images to zimgx. It reads them from wherever they already are.
+imgx sits in front of your existing image storage — any HTTP server or S3/R2 bucket — and handles resizing, format conversion, and caching on the fly. You do not upload images to imgx. It reads them from wherever they already are.
 
 ---
 
 ## How it works
 
-zimgx sits between your clients and your image storage:
+imgx sits between your clients and your image storage:
 
 ```
 Client (browser, app)
@@ -16,7 +16,7 @@ Client (browser, app)
   │  GET /photos/hero.jpg/w=800,f=auto,q=85
   ▼
 ┌──────────┐
-│  zimgx   │──▶ Cache hit? Serve immediately.
+│  imgx   │──▶ Cache hit? Serve immediately.
 │          │──▶ Cache miss? Fetch from origin.
 │          │──▶ Transform, cache, and serve.
 └──────────┘
@@ -25,7 +25,7 @@ Client (browser, app)
 Origin (S3, R2, any HTTP server)
 ```
 
-Your images stay where they already live. zimgx fetches, transforms, caches, and serves them.
+Your images stay where they already live. imgx fetches, transforms, caches, and serves them.
 
 ---
 

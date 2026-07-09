@@ -1,8 +1,8 @@
 #!/bin/bash
-# HTTP benchmark for zimgx
+# HTTP benchmark for imgx
 #
 # Prerequisites:
-#   1. zimgx running with an HTTP origin that has test images
+#   1. imgx running with an HTTP origin that has test images
 #   2. ab (ApacheBench) installed
 #
 # Usage:
@@ -16,10 +16,12 @@ set -euo pipefail
 HOST="${1:-localhost:8080}"
 IMAGE="${2:-test.jpg}"
 REQUESTS=500
-CONCURRENCY=1  # single-threaded server
+# imgx runs on axum/tokio (no fixed thread-per-connection cap, unlike the
+# prior Zig implementation), so a higher default concurrency is meaningful.
+CONCURRENCY=4
 
 echo ""
-echo "zimgx HTTP benchmark"
+echo "imgx HTTP benchmark"
 echo "===================="
 echo "Target: http://${HOST}"
 echo "Image:  ${IMAGE}"

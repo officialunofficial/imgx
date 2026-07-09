@@ -1,8 +1,8 @@
-# zimgx
+# imgx
 
 A fast, single-binary image proxy and transform server. Fetches images from an HTTP or Cloudflare R2 origin, applies real-time resizing/format conversion/effects via [libvips](https://www.libvips.org/), and serves the result with caching, ETag support, and automatic content negotiation.
 
-Built with [Zig](https://ziglang.org/) and libvips. Runs as a single static binary with no runtime dependencies beyond libvips.
+Built with [Rust](https://www.rust-lang.org/) and libvips. Runs as a single binary with no runtime dependencies beyond libvips.
 
 ## Quick Start
 
@@ -10,17 +10,17 @@ Built with [Zig](https://ziglang.org/) and libvips. Runs as a single static bina
 
 ```sh
 docker run -p 8080:8080 \
-  -e ZIMGX_ORIGIN_BASE_URL=https://your-image-origin.com \
-  ghcr.io/officialunofficial/zimgx:latest
+  -e IMGX_ORIGIN_BASE_URL=https://your-image-origin.com \
+  ghcr.io/officialunofficial/imgx:latest
 ```
 
 ### Build from source
 
-Requires Zig 0.15+ and libvips 8.18+.
+Requires Rust (stable) and libvips 8.14+.
 
 ```sh
-zig build -Doptimize=ReleaseSafe
-./zig-out/bin/zimgx
+cargo build --release -p imgx
+./target/release/imgx
 ```
 
 ## URL Format
@@ -81,17 +81,17 @@ See [docs/pages/transforms.mdx](docs/pages/transforms.mdx) for full details.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `ZIMGX_SERVER_PORT` | Listen port | `8080` |
-| `ZIMGX_SERVER_HOST` | Bind address | `0.0.0.0` |
-| `ZIMGX_ORIGIN_TYPE` | Origin backend | `http` |
-| `ZIMGX_ORIGIN_BASE_URL` | HTTP origin base URL | `http://localhost:9000` |
-| `ZIMGX_CACHE_ENABLED` | Enable in-memory cache | `true` |
-| `ZIMGX_CACHE_MAX_SIZE_BYTES` | Max cache size | `536870912` (512MB) |
-| `ZIMGX_R2_ENDPOINT` | R2/S3 endpoint URL | - |
-| `ZIMGX_R2_ACCESS_KEY_ID` | R2/S3 access key | - |
-| `ZIMGX_R2_SECRET_ACCESS_KEY` | R2/S3 secret key | - |
+| `IMGX_SERVER_PORT` | Listen port | `8080` |
+| `IMGX_SERVER_HOST` | Bind address | `0.0.0.0` |
+| `IMGX_ORIGIN_TYPE` | Origin backend | `http` |
+| `IMGX_ORIGIN_BASE_URL` | HTTP origin base URL | `http://localhost:9000` |
+| `IMGX_CACHE_ENABLED` | Enable in-memory cache | `true` |
+| `IMGX_CACHE_MAX_SIZE_BYTES` | Max cache size | `536870912` (512MB) |
+| `IMGX_R2_ENDPOINT` | R2/S3 endpoint URL | - |
+| `IMGX_R2_ACCESS_KEY_ID` | R2/S3 access key | - |
+| `IMGX_R2_SECRET_ACCESS_KEY` | R2/S3 secret key | - |
 
-See [docs/pages/configuration.mdx](docs/pages/configuration.mdx) for the full reference.
+The legacy `ZIMGX_` prefix is still read as a fallback for one release during the migration from zimgx (Zig) to imgx (Rust). See [docs/pages/configuration.mdx](docs/pages/configuration.mdx) for the full reference.
 
 ## Endpoints
 
@@ -148,30 +148,16 @@ See [docs/pages/architecture.mdx](docs/pages/architecture.mdx) for full details.
 
 ## Performance
 
-Transform pipeline throughput on Apple M-series, 2000x1500 PNG source, `ReleaseFast`:
-
-| Scenario | Ops/s | Latency | Output |
-|----------|------:|--------:|-------:|
-| Resize 800x600 JPEG | 175 | 5.7 ms | 17 KB |
-| Resize 800x600 WebP | 59 | 16.9 ms | 4 KB |
-| Resize 800x600 AVIF | 10 | 101 ms | 57 KB |
-| Resize 800x600 PNG | 86 | 11.6 ms | 216 KB |
-| Resize 400x300 WebP | 116 | 8.7 ms | 1 KB |
-| Thumbnail 200x150 WebP | 160 | 6.2 ms | <1 KB |
-| Cover crop 800x600 | 165 | 6.1 ms | 17 KB |
-| Resize + sharpen | 113 | 8.9 ms | 17 KB |
-| Resize + blur | 146 | 6.9 ms | 18 KB |
-
-Cache hits are served in sub-millisecond time (no transform, memory lookup only).
-
-Run benchmarks locally with `zig build bench`.
+imgx is built on tokio/axum with CPU-bound libvips work dispatched via `spawn_blocking`, gated by a semaphore sized to available parallelism. Benchmarks from the prior Zig implementation are not representative of the Rust rewrite's performance profile (different concurrency model, different encoder call overhead) and have been removed pending a fresh benchmark pass; see [docs/PARITY.md](docs/PARITY.md) for the correctness parity verification done as part of the rewrite.
 
 ## Documentation
 
-- [Configuration Reference](docs/pages/configuration.mdx) &mdash; all `ZIMGX_*` environment variables
+- [Configuration Reference](docs/pages/configuration.mdx) &mdash; all `IMGX_*` environment variables
 - [Transform Parameters](docs/pages/transforms.mdx) &mdash; resize, format, effects
 - [Deployment Guide](docs/pages/deployment.mdx) &mdash; Docker, Compose, health checks
 - [Architecture](docs/pages/architecture.mdx) &mdash; system design, module map, caching
+- [Invariants](docs/INVARIANTS.md) &mdash; behaviors that must survive any future changes
+- [Parity Verification](docs/PARITY.md) &mdash; zimgx (Zig) → imgx (Rust) rewrite parity pass
 
 ## License
 
