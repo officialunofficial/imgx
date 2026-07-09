@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 fn main() {
     let cfg = imgx::config::Config::load_from_env().expect("invalid configuration");
     cfg.validate().expect("invalid configuration");

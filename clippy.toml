@@ -1,0 +1,15 @@
+# Clippy configuration for the imgx workspace.
+# https://doc.rust-lang.org/clippy/lint_configuration.html
+
+msrv = "1.80"
+
+# imgx-vips's FFI layer is inherently pointer/arg-heavy (mirroring
+# libvips' own C signatures); keep the arity threshold a little looser
+# than the default rather than fighting the C API shape with wrapper structs.
+too-many-arguments-threshold = 8
+
+# Transform pipeline stages (src/transform/pipeline.rs) are intentionally
+# long, linear, and commented step-by-step to mirror the Zig original —
+# raise the complexity threshold rather than fragmenting a single
+# documented algorithm across helper functions.
+cognitive-complexity-threshold = 35
