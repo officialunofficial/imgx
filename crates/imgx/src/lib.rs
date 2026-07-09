@@ -9,4 +9,6 @@
 pub mod cache;
 pub mod config;
 pub mod http;
+pub mod origin;
+pub mod s3;
 pub mod transform;

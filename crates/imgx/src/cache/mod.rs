@@ -8,10 +8,12 @@ use std::future::Future;
 
 pub mod memory;
 pub mod noop;
+pub mod r2;
 pub mod tiered;
 
 pub use memory::MemoryCache;
 pub use noop::NoopCache;
+pub use r2::R2Cache;
 pub use tiered::TieredCache;
 
 /// A cached image blob together with metadata.
