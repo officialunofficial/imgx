@@ -1,7 +1,7 @@
 import { defineConfig } from "vocs";
 
 export default defineConfig({
-  title: "zimgx",
+  title: "imgx",
   description:
     "Fast, single-binary image proxy and transformation server. A self-hosted drop-in replacement for Cloudflare Images.",
   logoUrl: {

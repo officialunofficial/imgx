@@ -12,11 +12,13 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
+use axum::error_handling::HandleErrorLayer;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use tokio::sync::Semaphore;
+use tower::ServiceBuilder;
 
 use crate::cache::{self, Cache, CacheEntry, MemoryCache, NoopCache, R2Cache, TieredCache};
 use crate::config::{Config, OriginType};
@@ -183,8 +185,32 @@ impl AppState {
     }
 }
 
+/// Builds the app router with a connection-level concurrency cap
+/// (`IMGX_SERVER_MAX_CONNECTIONS`), rejecting with 503 at saturation
+/// rather than queueing unboundedly -- the direct equivalent of Zig's
+/// bounded-thread-pool + atomic connection counter, just expressed as a
+/// tower middleware instead of a hand-rolled accept-loop check.
 pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new().fallback(handle_request).with_state(state)
+    let max_connections = state.config.server.max_connections as usize;
+
+    Router::new()
+        .fallback(handle_request)
+        .with_state(state)
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(handle_overload))
+                .load_shed()
+                .concurrency_limit(max_connections),
+        )
+}
+
+/// Converts a `load_shed` rejection (raised when at the concurrency cap)
+/// into the same JSON error envelope used elsewhere.
+async fn handle_overload(_: tower::BoxError) -> Response {
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{\"error\":{\"status\":503,\"message\":\"Service Unavailable\",\"detail\":\"server at connection capacity, retry shortly\"}}",
+    )
 }
 
 async fn handle_request(
@@ -424,6 +450,21 @@ mod tests {
             .await
             .unwrap();
         (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// Confirms IMGX_SERVER_MAX_CONNECTIONS actually flows into the
+    /// router's concurrency limiter rather than being loaded/validated
+    /// and then silently ignored. max_connections=0 means the limiter
+    /// never has a free permit, so every request is immediately shed --
+    /// a deterministic way to prove the wiring works without needing to
+    /// race concurrent in-flight requests against each other.
+    #[tokio::test]
+    async fn requests_are_shed_with_503_when_max_connections_is_zero() {
+        let mut cfg = Config::defaults();
+        cfg.server.max_connections = 0;
+        let router = build_router(Arc::new(AppState::new(cfg)));
+        let (status, _) = get(router, "/health").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

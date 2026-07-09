@@ -1,6 +1,6 @@
 # Migrating from Cloudflare Images
 
-This page covers how to move from Cloudflare Images (imagedelivery.net) to zimgx. It maps Cloudflare's URL parameters to zimgx equivalents and outlines the differences between the two.
+This page covers how to move from Cloudflare Images (imagedelivery.net) to imgx. It maps Cloudflare's URL parameters to imgx equivalents and outlines the differences between the two.
 
 ---
 
@@ -11,18 +11,18 @@ This page covers how to move from Cloudflare Images (imagedelivery.net) to zimgx
 https://imagedelivery.net/<account-id>/<image-id>/<variant-or-options>
 ```
 
-**zimgx:**
+**imgx:**
 ```
 https://your-domain.com/<image-path>/<transforms>
 ```
 
-The zimgx URL scheme is compatible with Cloudflare's path structure. A request for `/<account-id>/<image-id>/<transforms>` works out of the box — zimgx treats everything before the last `=`-containing segment as the image path. Set `ZIMGX_ORIGIN_PATH_PREFIX` to your account ID so zimgx strips it when fetching from origin.
+The imgx URL scheme is compatible with Cloudflare's path structure. A request for `/<account-id>/<image-id>/<transforms>` works out of the box — imgx treats everything before the last `=`-containing segment as the image path. Set `IMGX_ORIGIN_PATH_PREFIX` to your account ID so imgx strips it when fetching from origin.
 
 ---
 
 ## Parameter translation
 
-| Cloudflare | zimgx | Notes |
+| Cloudflare | imgx | Notes |
 |-----------|-------|-------|
 | `width=400` | `w=400` | Shorter syntax |
 | `height=300` | `h=300` | |
@@ -38,7 +38,7 @@ The zimgx URL scheme is compatible with Cloudflare's path structure. A request f
 
 ## Feature comparison
 
-| Feature | Cloudflare Images | zimgx |
+| Feature | Cloudflare Images | imgx |
 |---------|-------------------|-------|
 | Image upload | Required (via API) | Not needed — reads from your origin |
 | Storage | Managed by Cloudflare | Your S3/R2 bucket or HTTP server |
@@ -56,35 +56,35 @@ The zimgx URL scheme is compatible with Cloudflare's path structure. A request f
 
 ### 1. Keep your images where they are
 
-If your images already live in R2 or S3, point zimgx at that bucket directly. You do not need to move anything.
+If your images already live in R2 or S3, point imgx at that bucket directly. You do not need to move anything.
 
-### 2. Deploy zimgx
+### 2. Deploy imgx
 
 ```bash
 docker run -p 8080:8080 \
-  -e ZIMGX_ORIGIN_TYPE=r2 \
-  -e ZIMGX_R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com \
-  -e ZIMGX_R2_ACCESS_KEY_ID=... \
-  -e ZIMGX_R2_SECRET_ACCESS_KEY=... \
-  -e ZIMGX_R2_BUCKET_ORIGINALS=my-images \
-  ghcr.io/officialunofficial/zimgx:latest
+  -e IMGX_ORIGIN_TYPE=r2 \
+  -e IMGX_R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com \
+  -e IMGX_R2_ACCESS_KEY_ID=... \
+  -e IMGX_R2_SECRET_ACCESS_KEY=... \
+  -e IMGX_R2_BUCKET_ORIGINALS=my-images \
+  ghcr.io/officialunofficial/imgx:latest
 ```
 
 ### 3. Strip the account ID prefix
 
 Cloudflare Images URLs include your account ID as the first path segment: `/<account-id>/<image-id>/<transforms>`. Your origin storage stores images by `<image-id>` alone.
 
-Set `ZIMGX_ORIGIN_PATH_PREFIX` to your Cloudflare account ID so zimgx strips it before fetching from origin:
+Set `IMGX_ORIGIN_PATH_PREFIX` to your Cloudflare account ID so imgx strips it before fetching from origin:
 
 ```bash
 docker run -p 8080:8080 \
-  -e ZIMGX_ORIGIN_TYPE=r2 \
-  -e ZIMGX_ORIGIN_PATH_PREFIX=abc123 \
-  -e ZIMGX_R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com \
-  -e ZIMGX_R2_ACCESS_KEY_ID=... \
-  -e ZIMGX_R2_SECRET_ACCESS_KEY=... \
-  -e ZIMGX_R2_BUCKET_ORIGINALS=my-images \
-  ghcr.io/officialunofficial/zimgx:latest
+  -e IMGX_ORIGIN_TYPE=r2 \
+  -e IMGX_ORIGIN_PATH_PREFIX=abc123 \
+  -e IMGX_R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com \
+  -e IMGX_R2_ACCESS_KEY_ID=... \
+  -e IMGX_R2_SECRET_ACCESS_KEY=... \
+  -e IMGX_R2_BUCKET_ORIGINALS=my-images \
+  ghcr.io/officialunofficial/imgx:latest
 ```
 
 With this setting, a request for `/abc123/photo-id/w=400` fetches origin key `photo-id` instead of `abc123/photo-id`.
@@ -97,21 +97,21 @@ Replace Cloudflare Image URLs in your app:
 # Before (Cloudflare)
 https://imagedelivery.net/abc123/photo-id/w=400,format=auto
 
-# After (with ZIMGX_ORIGIN_PATH_PREFIX=abc123, keep the same path)
-https://your-zimgx-host.com/abc123/photo-id/w=400
+# After (with IMGX_ORIGIN_PATH_PREFIX=abc123, keep the same path)
+https://your-imgx-host.com/abc123/photo-id/w=400
 
 # Or without the prefix
-https://your-zimgx-host.com/photo-id/w=400
+https://your-imgx-host.com/photo-id/w=400
 ```
 
 Format auto-negotiation is on by default. You do not need to specify `f=auto`.
 
 ### 5. Place a CDN in front
 
-For production, put a CDN or reverse proxy in front of zimgx:
+For production, put a CDN or reverse proxy in front of imgx:
 
 ```
-Client → CDN (Cloudflare, Fastly, nginx) → zimgx → R2/S3
+Client → CDN (Cloudflare, Fastly, nginx) → imgx → R2/S3
 ```
 
-zimgx sets `Cache-Control` and `ETag` headers automatically. The CDN caches responses at the edge. zimgx's internal cache handles the origin layer.
+imgx sets `Cache-Control` and `ETag` headers automatically. The CDN caches responses at the edge. imgx's internal cache handles the origin layer.

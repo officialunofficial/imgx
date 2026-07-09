@@ -1,6 +1,6 @@
 # Transform parameters
 
-Specify transforms as the last path segment in the URL. zimgx treats a segment as a transform string when it contains `=`. Separate multiple parameters with commas.
+Specify transforms as the last path segment in the URL. imgx treats a segment as a transform string when it contains `=`. Separate multiple parameters with commas.
 
 ```
 GET /<image-path>/<transforms>
@@ -33,7 +33,7 @@ Output height in pixels.
 /photo.jpg/w=400,h=300
 ```
 
-When you specify only one dimension, zimgx derives the other from the source aspect ratio.
+When you specify only one dimension, imgx derives the other from the source aspect ratio.
 
 ### `dpr`
 
@@ -65,7 +65,7 @@ Compression quality for lossy formats (JPEG, WebP, AVIF). Higher values produce 
 
 ### `f` / `fmt` / `format`
 
-Output format. When set to `auto` or omitted, zimgx negotiates the format from the client's `Accept` header.
+Output format. When set to `auto` or omitted, imgx negotiates the format from the client's `Accept` header.
 
 - **Values:** `jpeg`, `jpg`, `png`, `webp`, `avif`, `gif`, `auto`
 - **Default:** `auto`
@@ -251,11 +251,11 @@ Controls whether animated images (GIF, animated WebP) preserve animation in the 
 # Strip animation (Cloudflare-compatible syntax)
 /spinner.gif/anim=false
 
-# Strip animation (zimgx syntax)
+# Strip animation (imgx syntax)
 /spinner.gif/anim=static
 ```
 
-When `anim=auto` and no explicit format is set, zimgx negotiates an animated-capable format from the `Accept` header: **WebP > GIF**. If the client accepts neither, the output degrades to a static first frame in the best available format.
+When `anim=auto` and no explicit format is set, imgx negotiates an animated-capable format from the `Accept` header: **WebP > GIF**. If the client accepts neither, the output degrades to a static first frame in the best available format.
 
 ### `frame`
 
@@ -269,14 +269,14 @@ Extract a specific 0-indexed frame from an animated image and serve it as a stat
 /spinner.gif/frame=2
 ```
 
-If the index exceeds the number of frames, zimgx returns the last frame.
+If the index exceeds the number of frames, imgx returns the last frame.
 
 ### Animation safety limits
 
 | Limit | Default | Environment variable |
 |-------|---------|-------------|
-| Max frames | 100 | `ZIMGX_TRANSFORM_MAX_FRAMES` |
-| Max total pixels (width x height x frames) | 50,000,000 | `ZIMGX_TRANSFORM_MAX_ANIMATED_PIXELS` |
+| Max frames | 100 | `IMGX_TRANSFORM_MAX_FRAMES` |
+| Max total pixels (width x height x frames) | 50,000,000 | `IMGX_TRANSFORM_MAX_ANIMATED_PIXELS` |
 
 When the pixel budget is exceeded, the output falls back to a static first frame. When the frame count exceeds `max_frames`, only that many frames load.
 
@@ -284,7 +284,7 @@ When the pixel budget is exceeded, the output falls back to a static first frame
 
 ## Content negotiation
 
-When the output format is `auto` (the default), zimgx picks the best format from the client's `Accept` header.
+When the output format is `auto` (the default), imgx picks the best format from the client's `Accept` header.
 
 **Static images:** AVIF > WebP > JPEG > PNG
 
@@ -292,8 +292,8 @@ When the output format is `auto` (the default), zimgx picks the best format from
 
 The negotiation follows these rules:
 
-1. **Explicit format wins.** If you set `f=webp`, zimgx always outputs WebP regardless of `Accept`.
-2. **Animation preservation.** For animated sources, zimgx prefers animated-capable formats (WebP, GIF).
+1. **Explicit format wins.** If you set `f=webp`, imgx always outputs WebP regardless of `Accept`.
+2. **Animation preservation.** For animated sources, imgx prefers animated-capable formats (WebP, GIF).
 3. **Alpha channel handling.** When the source has transparency, JPEG is deprioritized because it cannot represent alpha.
 4. **Client support.** Only formats the client advertises in `Accept` are considered.
 5. **Fallback.** If no acceptable format matches, JPEG is the universal fallback.
@@ -304,7 +304,7 @@ The response includes a `Vary: Accept` header so CDNs cache different format var
 
 ## Caching behavior
 
-zimgx caches transform results using a deterministic key built from the image path, transform parameters, and resolved output format.
+imgx caches transform results using a deterministic key built from the image path, transform parameters, and resolved output format.
 
 **Key format:** `<image-path>|<transform-string>|<format>`
 

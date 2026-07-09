@@ -1,81 +1,78 @@
 # Performance
 
-zimgx is designed for low-latency image delivery. This page covers what to expect and how to tune for your workload.
+imgx is designed for low-latency image delivery. This page covers what to expect and how to tune for your workload.
+
+The specific latency numbers previously published on this page were measured against the prior Zig implementation and are not representative of the Rust rewrite (different concurrency model, different encoder call overhead). They've been removed pending a fresh benchmark pass. The qualitative guidance below (what affects cold vs. warm request time, caching strategy, CDN placement) still applies regardless of implementation language. See [docs/PARITY.md](/../PARITY.md) in the repo for the correctness parity verification done as part of the rewrite.
 
 ---
 
 ## Latency overview
 
-| Scenario | Typical latency | What happens |
-|----------|----------------|--------------|
-| **Cache hit (L1 memory)** | 50–100 ms | Served directly from in-memory LRU. No origin fetch, no transform. |
-| **Cache hit (L2 R2/S3)** | 150–300 ms | Fetched from persistent cache, promoted to L1 for subsequent requests. |
-| **Cache miss (cold)** | 400–800 ms | Full pipeline: origin fetch, transform, encode, cache write. |
-
-These numbers are from production on GKE Autopilot (2 vCPU, 1 GiB) with R2 origin and tiered caching enabled. Your results will vary based on origin latency, image size, and transform complexity.
+| Scenario | What happens |
+|----------|--------------|
+| **Cache hit (L1 memory)** | Served directly from in-memory LRU. No origin fetch, no transform. |
+| **Cache hit (L2 R2/S3)** | Fetched from persistent cache, promoted to L1 for subsequent requests. |
+| **Cache miss (cold)** | Full pipeline: origin fetch, transform, encode, cache write. |
 
 ### What affects cold request time
 
-- **Origin fetch** — Network round-trip to your image storage. R2 from the same region is typically 50–150 ms. HTTP origins depend on the server.
+- **Origin fetch** — Network round-trip to your image storage. R2 from the same region is typically fastest. HTTP origins depend on the server.
 - **Transform complexity** — Resize alone is fast. Adding blur, sharpen, or format conversion adds processing time. Animated GIFs with many frames are the most expensive.
 - **Image size** — A 10 MP JPEG takes longer to decode and resize than a 1 MP thumbnail.
 - **Output format** — AVIF encoding is slower than JPEG or WebP. PNG compression is moderate.
 
 ### What keeps warm requests fast
 
-Once an image variant is cached, subsequent requests skip the origin fetch and transform entirely. The L1 memory cache serves responses in under 100 ms. The L2 persistent cache (R2/S3) survives restarts and serves in 150–300 ms, promoting entries to L1 automatically.
+Once an image variant is cached, subsequent requests skip the origin fetch and transform entirely. The L1 memory cache serves responses fastest. The L2 persistent cache (R2/S3) survives restarts and promotes entries to L1 automatically.
 
 ---
 
 ## Concurrency
 
-zimgx handles concurrent requests using a thread pool. Each incoming connection is dispatched to a worker thread, while libvips uses its own internal thread pool for image processing.
+imgx runs on axum/tokio: each incoming request is an async task. Two independent limits protect the server from overload, matching the two different resources they bound:
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `ZIMGX_SERVER_MAX_CONNECTIONS` | `256` | Maximum concurrent connections (thread pool size) |
-
-The server can handle many concurrent requests without blocking. Under sustained load, once active connections hit the configured limit, new connections are rejected until capacity frees up.
+- **`IMGX_SERVER_MAX_CONNECTIONS`** (default `256`) bounds total concurrent in-flight requests via a tower concurrency-limit + load-shed layer on the router. At capacity, new requests receive `503 Service Unavailable` immediately rather than queueing — the direct equivalent of the prior Zig implementation's bounded thread pool + atomic connection counter, just expressed as router middleware instead of a hand-rolled accept-loop check.
+- CPU-bound libvips work is separately dispatched to `tokio::task::spawn_blocking`, gated by a semaphore sized to `std::thread::available_parallelism()` — this bounds concurrent *transform* work to roughly one per CPU core, which is the actual processing bottleneck, independent of how many connections are open (a burst of cache-hit requests doesn't touch this limiter at all).
 
 ### Scaling horizontally
 
-For higher throughput, run multiple zimgx instances behind a load balancer. Each instance maintains its own L1 memory cache. When R2/S3 caching is enabled, the L2 layer is shared across instances — a variant cached by one instance is available to all others.
+For higher throughput, run multiple imgx instances behind a load balancer. Each instance maintains its own L1 memory cache. When R2/S3 caching is enabled, the L2 layer is shared across instances — a variant cached by one instance is available to all others.
 
 ---
 
 ## Caching strategy
 
-zimgx uses a two-tier cache to balance speed and persistence:
+imgx uses a two-tier cache to balance speed and persistence:
 
 | Tier | Backend | Speed | Persistence | Shared across instances |
 |------|---------|-------|-------------|------------------------|
 | **L1** | In-memory LRU | Fastest | Lost on restart | No |
 | **L2** | R2 / S3 | Fast | Survives restarts | Yes |
 
-**Writes are best-effort and non-blocking.** On cache misses, zimgx still returns the response even when a cache backend skips a write (for example, cache disabled or entry too large). When L2 is enabled, its write happens asynchronously in the background, keeping the R2 upload off the response path.
+**Writes are best-effort and non-blocking.** On cache misses, imgx still returns the response even when a cache backend skips a write (for example, cache disabled or entry too large). When L2 is enabled, its write happens asynchronously via `tokio::spawn`, keeping the R2 upload off the response path.
 
 ### Tuning the L1 cache
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `ZIMGX_CACHE_MAX_SIZE_BYTES` | `536870912` (512 MiB) | Maximum L1 cache size |
-| `ZIMGX_CACHE_DEFAULT_TTL_SECONDS` | `3600` (1 hour) | Cache-Control max-age sent to clients |
+| `IMGX_CACHE_MAX_SIZE_BYTES` | `536870912` (512 MiB) | Maximum L1 cache size |
+| `IMGX_CACHE_DEFAULT_TTL_SECONDS` | `3600` (1 hour) | Cache-Control max-age sent to clients |
 
-Increase `ZIMGX_CACHE_MAX_SIZE_BYTES` if your working set is large and you have memory to spare. The LRU eviction policy keeps the most recently accessed variants in memory.
+Increase `IMGX_CACHE_MAX_SIZE_BYTES` if your working set is large and you have memory to spare. The LRU eviction policy keeps the most recently accessed variants in memory.
 
 ---
 
 ## Putting a CDN in front
 
-For production deployments, put a CDN (Cloudflare, CloudFront, Fastly) in front of zimgx. The CDN caches responses at the edge, so most requests never reach your origin server.
+For production deployments, put a CDN (Cloudflare, CloudFront, Fastly) in front of imgx. The CDN caches responses at the edge, so most requests never reach your origin server.
 
 ```
-Client → CDN (edge cache) → zimgx → Origin storage
+Client → CDN (edge cache) → imgx → Origin storage
 ```
 
-With a CDN, zimgx only handles cache misses — the first request for each unique variant. Subsequent requests for the same URL are served from the CDN edge with single-digit millisecond latency.
+With a CDN, imgx only handles cache misses — the first request for each unique variant. Subsequent requests for the same URL are served from the CDN edge with single-digit millisecond latency.
 
-zimgx sets the right headers for CDN caching out of the box:
+imgx sets the right headers for CDN caching out of the box:
 
 - `Cache-Control: public, max-age=<ttl>` — tells the CDN how long to cache
 - `ETag` — enables conditional requests (`304 Not Modified`)
@@ -85,12 +82,12 @@ zimgx sets the right headers for CDN caching out of the box:
 
 ## Benchmarking tips
 
-When testing zimgx performance:
+When testing imgx performance:
 
 1. **Warm the cache first.** Hit each URL once, then measure the second request. Cold requests include origin fetch and transform time that won't repeat.
 2. **Test with realistic images.** A 5 KB test image won't tell you much about production performance with 2 MB photos.
 3. **Vary the transforms.** Different widths, formats, and effects produce different variants. Each unique combination is a separate cache entry.
-4. **Use concurrent requests.** zimgx handles parallel requests well. Tools like `hey`, `wrk`, or `k6` can generate realistic concurrent load.
+4. **Use concurrent requests.** imgx handles parallel requests well. Tools like `hey`, `wrk`, or `k6` can generate realistic concurrent load.
 
 ```bash
 # Single request latency (cold)

@@ -6,35 +6,46 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          version: 0.15.2
+          components: rustfmt, clippy
+
+      - name: Install libvips
+        run: sudo apt-get update && sudo apt-get install -y libvips-dev
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: zig fmt --check src/ bench/
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install libvips
         run: sudo apt-get update && sudo apt-get install -y libvips-dev
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Run tests
-        run: zig build test
+        run: cargo test --workspace
 
   build:
     needs: [lint, test]
@@ -42,13 +53,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install libvips
         run: sudo apt-get update && sudo apt-get install -y libvips-dev
 
-      - name: Build (ReleaseSafe)
-        run: zig build -Doptimize=ReleaseSafe
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release -p imgx

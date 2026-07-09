@@ -1,22 +1,23 @@
 # --- Build stage ---
-FROM alpine:edge AS build
+FROM rust:alpine AS build
 
-RUN apk add --no-cache zig vips-dev
+RUN apk add --no-cache vips-dev musl-dev pkgconfig
 
 WORKDIR /app
-COPY build.zig build.zig.zon ./
-COPY src/ src/
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo/ .cargo/
+COPY crates/ crates/
 COPY test/ test/
 
-RUN zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+RUN cargo build --release -p imgx
 
 # --- Runtime stage ---
-FROM alpine:edge
+FROM alpine
 
 RUN apk add --no-cache vips
 
-COPY --from=build /app/zig-out/bin/zimgx /usr/local/bin/zimgx
+COPY --from=build /app/target/release/imgx /usr/local/bin/imgx
 
 EXPOSE 8080
 
-ENTRYPOINT ["zimgx"]
+ENTRYPOINT ["imgx"]

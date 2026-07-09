@@ -2,53 +2,53 @@
 
 ## Docker
 
-zimgx ships as a multi-arch Docker image (`linux/amd64`, `linux/arm64`) built on Alpine Linux.
+imgx ships as a multi-arch Docker image (`linux/amd64`, `linux/arm64`) built on Alpine Linux.
 
 ### Pull from GHCR
 
 ```sh
-docker pull ghcr.io/officialunofficial/zimgx:latest
+docker pull ghcr.io/officialunofficial/imgx:latest
 ```
 
 ### HTTP origin
 
 ```sh
 docker run -p 8080:8080 \
-  -e ZIMGX_ORIGIN_TYPE=http \
-  -e ZIMGX_ORIGIN_BASE_URL=https://images.example.com \
-  ghcr.io/officialunofficial/zimgx:latest
+  -e IMGX_ORIGIN_TYPE=http \
+  -e IMGX_ORIGIN_BASE_URL=https://images.example.com \
+  ghcr.io/officialunofficial/imgx:latest
 ```
 
 ### R2 origin
 
 ```sh
 docker run -p 8080:8080 \
-  -e ZIMGX_ORIGIN_TYPE=r2 \
-  -e ZIMGX_R2_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com \
-  -e ZIMGX_R2_ACCESS_KEY_ID=your-access-key \
-  -e ZIMGX_R2_SECRET_ACCESS_KEY=your-secret-key \
-  -e ZIMGX_R2_BUCKET_ORIGINALS=originals \
-  -e ZIMGX_R2_BUCKET_VARIANTS=variants \
-  ghcr.io/officialunofficial/zimgx:latest
+  -e IMGX_ORIGIN_TYPE=r2 \
+  -e IMGX_R2_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com \
+  -e IMGX_R2_ACCESS_KEY_ID=your-access-key \
+  -e IMGX_R2_SECRET_ACCESS_KEY=your-secret-key \
+  -e IMGX_R2_BUCKET_ORIGINALS=originals \
+  -e IMGX_R2_BUCKET_VARIANTS=variants \
+  ghcr.io/officialunofficial/imgx:latest
 ```
 
 ### Environment file
 
 ```sh
-docker run -p 8080:8080 --env-file .env ghcr.io/officialunofficial/zimgx:latest
+docker run -p 8080:8080 --env-file .env ghcr.io/officialunofficial/imgx:latest
 ```
 
 ### Build locally
 
 ```sh
-docker build -t zimgx .
-docker run -p 8080:8080 -e ZIMGX_ORIGIN_BASE_URL=https://images.example.com zimgx
+docker build -t imgx .
+docker run -p 8080:8080 -e IMGX_ORIGIN_BASE_URL=https://images.example.com imgx
 ```
 
 The Dockerfile uses a two-stage build:
 
-1. **Build stage** — Alpine with Zig and **vips-dev**, compiles with `ReleaseSafe`
-2. **Runtime stage** — Alpine with only the **vips** runtime library (approximately 50 MiB image)
+1. **Build stage** — `rust:alpine` with **vips-dev**, `cargo build --release`
+2. **Runtime stage** — Alpine with only the **vips** runtime library
 
 ---
 
@@ -56,16 +56,16 @@ The Dockerfile uses a two-stage build:
 
 ```yaml
 services:
-  zimgx:
-    image: ghcr.io/officialunofficial/zimgx:latest
+  imgx:
+    image: ghcr.io/officialunofficial/imgx:latest
     ports:
       - "8080:8080"
     environment:
-      ZIMGX_ORIGIN_TYPE: http
-      ZIMGX_ORIGIN_BASE_URL: https://images.example.com
-      ZIMGX_CACHE_ENABLED: "true"
-      ZIMGX_CACHE_MAX_SIZE_BYTES: "536870912"
-      ZIMGX_SERVER_PORT: "8080"
+      IMGX_ORIGIN_TYPE: http
+      IMGX_ORIGIN_BASE_URL: https://images.example.com
+      IMGX_CACHE_ENABLED: "true"
+      IMGX_CACHE_MAX_SIZE_BYTES: "536870912"
+      IMGX_SERVER_PORT: "8080"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
       interval: 10s
@@ -80,30 +80,30 @@ services:
 ## Build from source
 
 Requirements:
-- Zig 0.15.0 or later
-- libvips 8.18.0 or later (with development headers)
+- Rust (stable)
+- libvips 8.14.0 or later (with development headers)
 
 ### macOS
 
 ```sh
 brew install vips
-zig build -Doptimize=ReleaseSafe
-./zig-out/bin/zimgx
+cargo build --release -p imgx
+./target/release/imgx
 ```
 
 ### Alpine Linux
 
 ```sh
-apk add vips-dev
-zig build -Doptimize=ReleaseSafe
-./zig-out/bin/zimgx
+apk add vips-dev musl-dev pkgconfig
+cargo build --release -p imgx
+./target/release/imgx
 ```
 
 ---
 
 ## Health checks and probes
 
-zimgx exposes three endpoints for monitoring.
+imgx exposes three endpoints for monitoring.
 
 ### `/health`
 
@@ -153,26 +153,26 @@ Returns `200` with JSON statistics:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: zimgx
+  name: imgx
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: zimgx
+      app: imgx
   template:
     metadata:
       labels:
-        app: zimgx
+        app: imgx
     spec:
       containers:
-        - name: zimgx
-          image: ghcr.io/officialunofficial/zimgx:latest
+        - name: imgx
+          image: ghcr.io/officialunofficial/imgx:latest
           ports:
             - containerPort: 8080
           env:
-            - name: ZIMGX_ORIGIN_TYPE
+            - name: IMGX_ORIGIN_TYPE
               value: "http"
-            - name: ZIMGX_ORIGIN_BASE_URL
+            - name: IMGX_ORIGIN_BASE_URL
               value: "https://images.example.com"
           livenessProbe:
             httpGet:
@@ -199,9 +199,9 @@ spec:
 
 ## CDN
 
-zimgx is designed to sit behind a CDN. Image responses include:
+imgx is designed to sit behind a CDN. Image responses include:
 
-- `Cache-Control: public, max-age=<ttl>` — controlled by `ZIMGX_CACHE_DEFAULT_TTL_SECONDS`
+- `Cache-Control: public, max-age=<ttl>` — controlled by `IMGX_CACHE_DEFAULT_TTL_SECONDS`
 - `ETag` — content-based hash for conditional requests (`304 Not Modified`)
 - `Vary: Accept` — tells the CDN to cache separate variants per format negotiation
 

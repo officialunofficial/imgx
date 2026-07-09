@@ -3,23 +3,23 @@
 ## Build from source
 
 ```bash
-# Requires: Zig 0.15+, libvips, glib headers
-zig build -Doptimize=ReleaseSafe
+# Requires: Rust (stable), libvips, glib headers
+cargo build --release -p imgx
 ```
 
-This produces a binary at **zig-out/bin/zimgx**.
+This produces a binary at **target/release/imgx**.
 
 ## Configure an origin
 
-Tell zimgx where your images live. Pick one of the following options.
+Tell imgx where your images live. Pick one of the following options.
 
 ### HTTP origin
 
 Use this if your images are behind any web server, S3 presigned URLs, or an existing CDN:
 
 ```bash
-export ZIMGX_ORIGIN_TYPE=http
-export ZIMGX_ORIGIN_BASE_URL=https://my-bucket.s3.amazonaws.com
+export IMGX_ORIGIN_TYPE=http
+export IMGX_ORIGIN_BASE_URL=https://my-bucket.s3.amazonaws.com
 ```
 
 ### S3/R2 origin
@@ -27,17 +27,17 @@ export ZIMGX_ORIGIN_BASE_URL=https://my-bucket.s3.amazonaws.com
 Use this for direct bucket access with any S3-compatible storage — Cloudflare R2, AWS S3, DigitalOcean Spaces, MinIO, and others:
 
 ```bash
-export ZIMGX_ORIGIN_TYPE=r2
-export ZIMGX_R2_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
-export ZIMGX_R2_ACCESS_KEY_ID=your-access-key
-export ZIMGX_R2_SECRET_ACCESS_KEY=your-secret-key
-export ZIMGX_R2_BUCKET_ORIGINALS=my-images
+export IMGX_ORIGIN_TYPE=r2
+export IMGX_R2_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+export IMGX_R2_ACCESS_KEY_ID=your-access-key
+export IMGX_R2_SECRET_ACCESS_KEY=your-secret-key
+export IMGX_R2_BUCKET_ORIGINALS=my-images
 ```
 
 ## Start the server
 
 ```bash
-./zig-out/bin/zimgx
+./target/release/imgx
 # Listening on 0.0.0.0:8080
 ```
 
@@ -65,31 +65,31 @@ No upload API. No database. Your images stay where they are.
 Skip the build step entirely:
 
 ```bash
-docker pull ghcr.io/officialunofficial/zimgx:latest
+docker pull ghcr.io/officialunofficial/imgx:latest
 
 docker run -p 8080:8080 \
-  -e ZIMGX_ORIGIN_TYPE=http \
-  -e ZIMGX_ORIGIN_BASE_URL=https://images.example.com \
-  ghcr.io/officialunofficial/zimgx:latest
+  -e IMGX_ORIGIN_TYPE=http \
+  -e IMGX_ORIGIN_BASE_URL=https://images.example.com \
+  ghcr.io/officialunofficial/imgx:latest
 ```
 
 ---
 
 ## Caching
 
-zimgx caches transformed images automatically. Repeated requests skip the origin fetch and transformation step entirely.
+imgx caches transformed images automatically. Repeated requests skip the origin fetch and transformation step entirely.
 
 **In-memory (default):** A 512 MiB LRU cache with no setup required.
 
 **Tiered (memory plus R2):** A fast memory layer backed by persistent R2 storage.
 
 ```bash
-export ZIMGX_CACHE_ENABLED=true
-export ZIMGX_CACHE_MAX_SIZE_BYTES=536870912   # 512 MiB
-export ZIMGX_CACHE_DEFAULT_TTL_SECONDS=3600   # 1 hour Cache-Control
+export IMGX_CACHE_ENABLED=true
+export IMGX_CACHE_MAX_SIZE_BYTES=536870912   # 512 MiB
+export IMGX_CACHE_DEFAULT_TTL_SECONDS=3600   # 1 hour Cache-Control
 ```
 
-zimgx generates ETags automatically. Clients that send `If-None-Match` receive `304 Not Modified` responses, saving bandwidth.
+imgx generates ETags automatically. Clients that send `If-None-Match` receive `304 Not Modified` responses, saving bandwidth.
 
 ---
 
@@ -116,4 +116,4 @@ curl http://localhost:8080/metrics
 - [Transform parameters](/transforms) — Full reference for resize, format, and effect options
 - [Configuration](/configuration) — Complete environment variable reference
 - [Deployment](/deployment) — Docker, Kubernetes, and CDN setup
-- [Migrating from Cloudflare](/migrating-from-cloudflare) — Replace imagedelivery.net with zimgx
+- [Migrating from Cloudflare](/migrating-from-cloudflare) — Replace imagedelivery.net with imgx
