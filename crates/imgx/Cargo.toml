@@ -8,5 +8,12 @@ license.workspace = true
 name = "imgx"
 path = "src/main.rs"
 
+[lib]
+name = "imgx"
+path = "src/lib.rs"
+
 [dependencies]
 imgx-vips = { path = "../imgx-vips" }
+tracing = "0.1"
+thiserror = "2"
+

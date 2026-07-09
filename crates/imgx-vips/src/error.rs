@@ -1,5 +1,6 @@
 use std::ffi::CStr;
-use std::fmt;
+
+use thiserror::Error;
 
 use crate::ffi;
 
@@ -7,28 +8,19 @@ use crate::ffi;
 ///
 /// Mirrors `src/vips/bindings.zig`'s `VipsError` set. Every variant carries
 /// the last message from `vips_error_buffer()` at the point of failure.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum VipsError {
+    #[error("vips init failed: {0}")]
     InitFailed(String),
+    #[error("vips load failed: {0}")]
     LoadFailed(String),
+    #[error("vips save failed: {0}")]
     SaveFailed(String),
+    #[error("vips resize failed: {0}")]
     ResizeFailed(String),
+    #[error("vips operation failed: {0}")]
     OperationFailed(String),
 }
-
-impl fmt::Display for VipsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            VipsError::InitFailed(m) => write!(f, "vips init failed: {m}"),
-            VipsError::LoadFailed(m) => write!(f, "vips load failed: {m}"),
-            VipsError::SaveFailed(m) => write!(f, "vips save failed: {m}"),
-            VipsError::ResizeFailed(m) => write!(f, "vips resize failed: {m}"),
-            VipsError::OperationFailed(m) => write!(f, "vips operation failed: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for VipsError {}
 
 /// Read and clear the thread-local vips error buffer.
 pub(crate) fn last_vips_error() -> String {

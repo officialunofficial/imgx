@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 libc = "0.2"
+thiserror = "2"
 
 [build-dependencies]
 pkg-config = "0.3"
