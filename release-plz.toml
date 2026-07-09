@@ -1,0 +1,53 @@
+# release-plz configuration. imgx is a deployed application (Docker image
+# via .github/workflows/docker.yml), not a crates.io library, so
+# publish = false everywhere -- release-plz still handles version bumping,
+# CHANGELOG.md generation, and GitHub releases from Conventional Commits.
+# https://release-plz.dev/docs/config
+
+[workspace]
+publish = false
+changelog_update = true
+git_release_enable = true
+git_tag_enable = true
+pr_labels = ["release"]
+semver_check = false # binary application, no public API to check
+
+[[package]]
+name = "imgx"
+
+[[package]]
+name = "imgx-vips"
+
+# Mirrors cliff.toml's commit types/scopes (see CLAUDE.md's Commit
+# Convention section) so the generated CHANGELOG.md groups entries the
+# same way regardless of which tool produced them.
+[changelog]
+header = """
+# Changelog\n
+All notable changes to this project are documented in this file.\n
+"""
+body = """
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+  {{ commit.message | upper_first }}\
+  ({{ commit.id | truncate(length=7, end="") }})
+{%- endfor %}
+{% endfor %}\n
+"""
+trim = true
+sort_commits = "oldest"
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug Fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^refactor", group = "Refactoring" },
+  { message = "^test", group = "Testing" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^ci", group = "CI/CD" },
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore", group = "Miscellaneous" },
+  { message = ".*", group = "Other" },
+]

@@ -22,7 +22,7 @@ export default defineConfig({
     },
     {
       text: "GitHub",
-      link: "https://github.com/officialunofficial/zimgx",
+      link: "https://github.com/officialunofficial/imgx",
     },
   ],
   sidebar: [
@@ -56,7 +56,7 @@ export default defineConfig({
   socials: [
     {
       icon: "github",
-      link: "https://github.com/officialunofficial/zimgx",
+      link: "https://github.com/officialunofficial/imgx",
     },
   ],
   theme: {
