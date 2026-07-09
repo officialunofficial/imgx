@@ -40,6 +40,12 @@ For higher throughput, run multiple imgx instances behind a load balancer. Each 
 
 ---
 
+## Memory allocator
+
+imgx uses [jemalloc](https://jemalloc.net/) (via [`tikv-jemallocator`](https://github.com/tikv/jemallocator)) as the global allocator on all non-MSVC targets, instead of the system allocator. The workload is alloc-heavy and multi-threaded by nature — every transform allocates a fresh image buffer, and requests are served concurrently across tokio worker threads — which is exactly the pattern jemalloc's per-thread arenas are designed for. No configuration is needed; it's compiled in as the process-wide allocator.
+
+---
+
 ## Caching strategy
 
 imgx uses a two-tier cache to balance speed and persistence:
@@ -101,3 +107,22 @@ curl -w "time_total: %{time_total}s\n" -o /dev/null -s \
 # Concurrent load test (requires hey: https://github.com/rakyll/hey)
 hey -n 200 -c 20 http://localhost:8080/photos/hero.jpg/w=400,f=auto
 ```
+
+### Profiling with samply
+
+For CPU-level profiling (where time actually goes inside a transform, not just end-to-end latency), use [samply](https://github.com/mstange/samply), a sampling profiler that produces a [Firefox Profiler](https://profiler.firefox.com/)-compatible trace:
+
+```bash
+cargo install samply
+
+# Build with debug symbols but release-level optimizations, kept
+# separate from the `release` profile so production images aren't
+# bloated with debug sections.
+cargo build --profile profiling -p imgx
+
+samply record ./target/profiling/imgx
+# drive some load against it in another terminal, then Ctrl+C --
+# samply opens the trace in your browser automatically.
+```
+
+For a production-like build under the profiler, run it in a container matching the Dockerfile's build (`cargo build --profile profiling` inside `rust:alpine`, then copy the binary out) so libvips is linked the same way it is in production.

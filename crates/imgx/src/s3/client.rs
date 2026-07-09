@@ -218,11 +218,11 @@ mod tests {
     /// signing, not presigned URLs, so aren't directly portable).
     #[test]
     fn presigned_get_matches_known_aws_sigv4_vector() {
+        use jiff::Timestamp;
         use rusty_s3::actions::GetObject;
-        use time::OffsetDateTime;
 
         // Fri, 24 May 2013 00:00:00 GMT
-        let date = OffsetDateTime::from_unix_timestamp(1_369_353_600).unwrap();
+        let date = Timestamp::from_second(1_369_353_600).unwrap();
         let expires_in = Duration::from_secs(86400);
 
         let endpoint: url::Url = "https://s3.amazonaws.com".parse().unwrap();

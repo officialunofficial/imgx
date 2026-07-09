@@ -5,6 +5,15 @@ use std::sync::Arc;
 use imgx::config::Config;
 use imgx::server::{build_router, AppState};
 
+// jemalloc handles the cache/pipeline's alloc-heavy, multi-threaded churn
+// (frequent same-sized image-buffer alloc/free across tokio worker
+// threads) better than the system allocator on Linux. The unsafe global
+// allocator impl lives inside tikv-jemallocator, not here -- this crate
+// still forbids unsafe code itself.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();

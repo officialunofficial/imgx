@@ -7,6 +7,7 @@ Fast, single-binary image proxy and transformation server written in Rust, using
 ```bash
 cargo build                                              # debug build
 cargo build --release -p imgx                            # optimized build
+cargo build --profile profiling -p imgx                  # release opts + debug symbols, for samply
 cargo test --workspace                                   # run all unit/integration tests
 cargo fmt --all                                           # format
 cargo fmt --all -- --check                                # format check (CI enforced)

@@ -10,3 +10,12 @@ license = "MIT"
 [profile.release]
 lto = true
 codegen-units = 1
+
+# For profiling with samply (`cargo build --profile profiling -p imgx`,
+# then `samply record ./target/profiling/imgx`): same optimizations as
+# release, but with full debug info for symbolication. Kept separate from
+# `release` so the shipped Docker image isn't bloated with debug sections.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

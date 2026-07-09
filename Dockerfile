@@ -1,7 +1,7 @@
 # --- Build stage ---
 FROM rust:alpine AS build
 
-RUN apk add --no-cache vips-dev musl-dev pkgconfig
+RUN apk add --no-cache vips-dev musl-dev pkgconfig cmake make g++
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
