@@ -13,6 +13,16 @@ pub struct VipsImage {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+pub struct VipsArrayDouble {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct VipsArea {
+    _private: [u8; 0],
+}
+
 pub type GQuark = u32;
 
 unsafe extern "C" {
@@ -161,6 +171,10 @@ unsafe extern "C" {
         len: *mut size_t,
         ...
     ) -> c_int;
+
+    // -- background color arrays (for flatten/embed) --
+    pub fn vips_array_double_new(array: *const c_double, n: c_int) -> *mut VipsArrayDouble;
+    pub fn vips_area_unref(area: *mut VipsArea);
 }
 
 // VipsAngle (resample.h / conversion enums)
