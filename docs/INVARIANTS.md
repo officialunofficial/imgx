@@ -1,0 +1,85 @@
+# Invariants
+
+> Properties that must ALWAYS hold. A violation is a bug, by definition.
+> Scope: behavior that must survive the zimgx (Zig) → imgx (Rust) rewrite. These are the
+> spec for TDD during the port — see /Users/christopherw/.claude/plans/recursive-meandering-crescent.md.
+> Each invariant names the Zig source it's captured from; the Rust port must have a test
+> at the same granularity, not just a manual read-through.
+
+## System invariants
+
+### INV-1: A transform-params cache key is a pure, deterministic function of the parsed parameters, independent of input order
+
+- **Always:** For any two parameter strings that parse to the same `TransformParams` value (regardless of key order in the input string), `toCacheKey` produces byte-identical output. Fields are written in a fixed order: `w, h, q, f, fit, g, sharpen, blur, dpr, rotate, flip, brightness, contrast, saturation, gamma, bg, metadata, trim, anim, frame`. Optional fields at their default/unset value are omitted entirely, not written with a default value.
+- **Because:** `src/transform/params.zig:359-383` (`writeCacheKey`) always visits fields in this literal order regardless of parse order, and guards optional fields with `if (x) |v|` / `if (x != default)`.
+- **If violated:** Two functionally-identical requests get different cache keys → cache poisoning/duplication. Worse, an existing R2-cached variant (written by the old Zig binary) becomes unreachable under the Rust binary because the key it would compute differs — a silent full cache invalidation of the L2 tier in production.
+
+### INV-2: Animated-image resize with `fit=cover` never corrupts frame boundaries
+
+- **Always:** When resizing a multi-frame (animated) image with `fit=cover` and both `w` and `h` set, every output frame has identical height (`resized_height`), and `page-height` metadata on the output stack always evenly divides the total stack height. The number of frames in the output never exceeds `min(source_frames, max_frames, 256)`.
+- **Because:** `vips_thumbnail_image`'s built-in crop corrupts frame boundaries on vertically-stacked animated buffers (upstream libvips bug #2668). `src/transform/pipeline.zig:212-260+` (resize-without-crop, then either one `extract_area` for horizontal-only crop, or a per-frame crop+`arrayjoin(across=1)` loop capped at 256 frames for vertical crop) is a deliberate, hard-won workaround. Skipping it reintroduces the bug.
+- **If violated:** Encoded animated output has visibly wrong/sheared frames, or the GIF/WebP encoder reads past a frame boundary — this exact class of bug previously caused a SIGSEGV (see INV-3).
+
+### INV-3: GIF encoding never receives inconsistent page-height/n-pages metadata
+
+- **Always:** Before `vips_gifsave_buffer` is called on an image carrying `n-pages > 1`, `page-height` metadata evenly divides the image's total height. If it does not, `page-height` is reset to the full image height and `n-pages` is reset to 1 (degrade to a single-frame GIF) before encoding.
+- **Because:** `src/transform/pipeline.zig` GIF encode path — a documented regression test reproduces a real prior SIGSEGV in libvips' GIF encoder caused by stale/inconsistent page metadata after cropping.
+- **If violated:** Process crash (SIGSEGV) serving a specific animated-GIF transform request — a live availability incident, not just a wrong-output bug.
+
+### INV-4: A request path can never resolve to a filesystem/origin path outside the intended root
+
+- **Always:** `resolve(path)` returns `.not_found` for any path containing a null byte, a literal `..` traversal segment, a percent-encoded traversal/null-byte sequence (`%2e`, `%2E`, `%2f`, `%2F`, `%00`), or an embedded absolute path (`//...`). This holds both for `sanitizePath` called directly and transitively through `resolve`.
+- **Because:** `src/router.zig:107-189` (`sanitizePath`, `containsTraversal`, `containsEncodedTraversal`) is the only gate between an untrusted client-supplied path and the origin fetch key / R2 object key.
+- **If violated:** Path traversal — the proxy could be tricked into fetching or exposing origin content outside the intended prefix (SSRF-adjacent / origin data exposure).
+
+### INV-5: The last `/`-delimited path segment is a transform string if and only if it contains `=`; only the last such segment counts
+
+- **Always:** For a cleaned path with segment `S` after the final `/`: if `S` contains `=`, `S` is the transform string and everything before it is the image path (unless that prefix is empty, which is `.not_found`); otherwise the entire cleaned path is the image path with no transform string. A path like `a=1/b=2` yields image path `a=1`, transform `b=2` — never treats `a=1` as a transform.
+- **Because:** `src/router.zig:57-97` and its 17 router tests, notably "multiple transform-like segments — only last is treated as transform".
+- **If violated:** URLs with literal `=` in a filename (rare but real, e.g. legacy CDN paths) get misrouted, or transform strings silently apply to the wrong path segment.
+
+### INV-6: Every `TransformParams` field with numeric or float bounds rejects out-of-range, NaN, and Inf values at parse/validate time — vips never sees an invalid value
+
+- **Always:** `width`/`height` ∈ [1,8192]; `quality` ∈ [1,100]; `dpr` ∈ [1.0,5.0]; `sharpen` ∈ [0.0,10.0]; `blur` ∈ [0.1,250.0]; `brightness`/`contrast`/`saturation` ∈ [0.0,2.0]; `gamma` ∈ [0.1,10.0]; `trim` ∈ [1.0,100.0]; `frame` ≤ 999. Any float parse of `nan`/`inf`/`-inf` is rejected before it can reach `validate()`.
+- **Because:** `src/transform/params.zig:314-347` (`validate`) plus `parseF32`'s explicit `isNan`/`isInf` guard at line 471-475. This is the sole gate before values are handed to libvips C calls that do not themselves validate ranges (e.g. a NaN sigma into `vips_gaussblur` is undefined behavior territory).
+- **If violated:** Malformed/malicious query strings reach libvips FFI calls with unchecked values — crash or undefined behavior risk at the FFI boundary, not just a bad HTTP response.
+
+### INV-7: Format negotiation priority is fixed and total — it always resolves to a concrete format, never leaves it ambiguous
+
+- **Always (static):** explicit non-auto format always wins outright. Otherwise: alpha-present source → avif > webp > png > jpeg(last resort); no-alpha source → avif > webp > jpeg > png. Empty/absent Accept header → jpeg. **Always (animated):** explicit animation-capable format (webp/gif) wins; explicit non-animation-capable format → `null` (caller must degrade to static); auto-negotiate → webp > gif > `null`.
+- **Because:** `src/transform/negotiate.zig:108-185`, 30 tests covering wildcard, q=0 disabling, alpha/no-alpha branches, malformed headers.
+- **If violated:** Either a format the client didn't ask for and can't render (broken image in browser), or non-deterministic format selection breaking cache-key/response consistency for identical requests.
+
+### INV-8: The server refuses to start with an invalid configuration rather than running with a partially-bad config
+
+- **Always:** `validate()` rejects (does not clamp or silently ignore): port 0; either timeout = 0; `max_width`/`max_height` = 0; `default_quality` outside [1,100]; HTTP origin with a `base_url` that doesn't start with `http://` or `https://`; R2 origin with any of endpoint/access_key_id/secret_access_key/bucket_originals/bucket_variants empty.
+- **Because:** `src/config.zig:203-233`. Config is loaded once at startup and validated before the server binds a listener.
+- **If violated:** Server starts in a broken state (e.g. no valid origin configured) and fails every request at runtime instead of failing fast at deploy time — much harder to diagnose in production (looks like an outage, not a config error).
+
+### INV-9: HTTP error responses always carry the documented status code and JSON envelope shape
+
+- **Always:** Every domain error maps to exactly one of {400, 404, 413, 422, 500, 502, 504} via the named constructors, and serializes to `{"error":{"status":N,"message":"...","detail":"..."}}` with the `detail` key entirely absent (not `null`) when no detail was given.
+- **Because:** `src/http/errors.zig` — status codes are fixed per constructor (`badRequest`→400, `notFound`→404, `payloadTooLarge`→413, `unprocessableEntity`→422, `internalError`→500, `badGateway`→502, `gatewayTimeout`→504), and `toJsonResponse` branches on `self.detail` being null to omit the field.
+- **If violated:** Callers/clients that pattern-match on the error envelope shape (e.g. checking for absence of `detail` vs. `detail: null`) break; monitoring/alerting keyed on status codes miscounts error classes.
+
+## Enforceable invariants
+
+Each maps to a concrete check that must exist in the Rust port with equivalent coverage.
+
+- [x] **INV-1 (cache key determinism/order-independence):** enforced by `params.zig` tests `"cache key is deterministic"`, `"cache key order is canonical regardless of parse order"`, `"cache key differs when params differ"`, `"cache key omits default metadata"`, `"cache key includes non-default metadata"`, `"cache key omits anim when auto"`, `"cache key includes anim when not default"`, `"cache key includes frame when set"`. Port all of these verbatim in `transform/params.rs`, plus add a table of literal expected key strings for a handful of param combos (byte-for-byte parity check against the Zig implementation, not just internal self-consistency).
+- [x] **INV-2 (animated cover-resize frame integrity):** enforced only implicitly today via manual/fixture testing against `test/fixtures/loading.gif` (12 frames, 128×128) — **GAP-adjacent**: no explicit Zig test asserts "every output frame has identical height" as a property. Rust port: add a property/golden test that decodes the output stack and asserts `total_height % n_pages == 0` and (if per-frame decoding is feasible with the chosen output codec) that frame boundaries land where expected.
+- [x] **INV-3 (GIF page-height safety check):** enforced by the page-height-corruption regression test in `pipeline.zig` (explicitly reproduces the prior SIGSEGV scenario). Port verbatim in `transform/pipeline.rs`.
+- [x] **INV-4 (path traversal rejection):** enforced by `router.zig` tests — `"path traversal is rejected by sanitizePath"`, `"null byte is rejected..."`, `"sanitizePath rejects embedded absolute path"`, `"sanitizePath rejects dot-dot at start/end"`, `"sanitizePath rejects percent-encoded dot traversal"` (upper+lowercase), `"sanitizePath rejects encoded null byte"`, `"sanitizePath rejects encoded slash"`. Port every one verbatim in `router.rs`.
+- [x] **INV-5 (last-segment transform detection):** enforced by `router.zig` tests `"image with transforms"`, `"image without transforms"`, `"nested path with transforms"`, `"multiple transform-like segments — only last is treated as transform"`, `"path with only transforms and no image path returns not_found"`, `"transform detection — segment with/without ="`. Port verbatim.
+- [x] **INV-6 (parameter bounds + NaN/Inf rejection):** enforced by ~20 boundary tests in `params.zig` (`"width boundary values"`, `"*_bounds_validation"` for sharpen/blur/dpr/brightness/contrast/saturation/gamma/trim, `"parse rejects nan values"`, `"parse rejects inf values"`, `"frame validation rejects large values"`). Port verbatim; this set is the primary FFI-safety gate so treat any gap here as high-severity.
+- [x] **INV-7 (negotiation priority):** enforced by 30 tests in `negotiate.zig` covering static and animated paths, alpha/no-alpha, wildcards, q=0, malformed headers. Port verbatim.
+- [x] **INV-8 (config validation is a hard gate):** enforced by `config.zig` tests `"validate rejects port 0"`, `"...empty base_url"`, `"...base_url without http scheme"`, `"...base_url with file scheme"`, `"...quality 0/101"`, `"...zero request_timeout_ms/origin timeout_ms"`, `"...zero max_width/max_height"`. Port verbatim; also port `"loadFromEnv with no env vars returns defaults"` since env-var-prefix renaming (`ZIMGX_`→`IMGX_` with fallback, per the approved plan) is exactly the kind of change that silently breaks this invariant if done carelessly.
+- [x] **INV-9 (error status/envelope shape):** enforced by `errors.zig` tests for every constructor plus `"toJsonResponse with detail"` / `"...without detail omits detail field"`. Port verbatim — in Rust this likely becomes a `Serialize` impl or `serde_json::json!` builder; add a test asserting the `detail` field is skipped (`#[serde(skip_serializing_if = "Option::is_none")]`) rather than emitted as `null`, since that's an easy accidental regression when moving from hand-rolled `bufPrint` to `serde`.
+- [ ] **INV-10 (R2 cache key sanitization prevents traversal into arbitrary R2 objects):** `src/cache/r2.zig`'s `sanitizeKey` (`|`→`/`, collapse `//`, reject `..`) returns an **empty string on violation, and callers don't check this** — noted by the explore pass as a latent bug in the current Zig code. **GAP in the original**, not just in test coverage. The Rust port must not reproduce this: return a `Result`/`Option` from key sanitization and have every caller handle the rejection case (e.g. treat as cache-miss, never issue an R2 request with a malformed key). Add a new test for this that doesn't exist in Zig today.
+
+## Assumptions & non-invariants
+
+- **Encoded output bytes are NOT invariant across the rewrite.** libvips encoder versions differ, and Wyhash→xxh3 changes the ETag. Parity testing (plan phase 8) compares status codes, headers, cache keys, and image *dimensions* — never raw output bytes.
+- **The 256-thread-pool / atomic-connection-counter backpressure mechanism is NOT preserved as-is.** The approved plan deliberately replaces it with an async `tokio`/`axum` model using a `Semaphore` gated on `spawn_blocking` permits. The *invariant* that survives is "the server rejects new work under saturation rather than unbounded-queueing it," not the specific mechanism.
+- **`allocator.zig`'s `RequestArena`, R2Cache's "last-fetched-buffer" ownership hack, and threadlocal error-formatting buffers are Zig-specific workarounds, not invariants.** They exist because of Zig's manual memory management; Rust's ownership model makes them unnecessary. Do not port them — porting a workaround whose underlying problem no longer exists is itself a bug (unnecessary complexity, and a plausible source of new bugs).
+- **Cache-key byte-for-byte preservation (INV-1) is a policy choice, not a law of nature** — the approved plan chose to preserve it so existing R2-cached variants remain valid across the binary swap. If that decision is ever revisited (e.g. deliberate cache-busting rewrite), INV-1 is the invariant to explicitly relax, and it should be a conscious, documented decision, not a side effect of a refactor.
