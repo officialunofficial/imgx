@@ -87,10 +87,10 @@ pub fn negotiate_format(
     source_has_alpha: bool,
     requested_format: Option<OutputFormat>,
 ) -> OutputFormat {
-    if let Some(fmt) = requested_format {
-        if fmt != OutputFormat::Auto {
-            return fmt;
-        }
+    if let Some(fmt) = requested_format
+        && fmt != OutputFormat::Auto
+    {
+        return fmt;
     }
 
     let accept = accept_header.map(parse_accept_header).unwrap_or_default();
@@ -130,14 +130,14 @@ pub fn negotiate_animated_format(
     accept_header: Option<&str>,
     requested_format: Option<OutputFormat>,
 ) -> Option<OutputFormat> {
-    if let Some(fmt) = requested_format {
-        if fmt != OutputFormat::Auto {
-            return if fmt.supports_animation() {
-                Some(fmt)
-            } else {
-                None
-            };
-        }
+    if let Some(fmt) = requested_format
+        && fmt != OutputFormat::Auto
+    {
+        return if fmt.supports_animation() {
+            Some(fmt)
+        } else {
+            None
+        };
     }
 
     let accept = accept_header.map(parse_accept_header).unwrap_or_default();

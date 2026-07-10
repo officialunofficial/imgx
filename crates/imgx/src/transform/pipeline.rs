@@ -6,7 +6,7 @@
 
 use thiserror::Error;
 
-use imgx_vips::{consts, ThumbnailOptions, VipsError, VipsImage};
+use imgx_vips::{ThumbnailOptions, VipsError, VipsImage, consts};
 
 use super::negotiate;
 use super::params::{
@@ -158,12 +158,12 @@ pub fn transform(
     }
 
     // -- TRIM -- (skipped for animated output: operates on the whole stack)
-    if let Some(threshold) = tp.trim {
-        if !animated_output {
-            let (left, top, width, height) = current.find_trim(threshold as f64)?;
-            if width > 0 && height > 0 {
-                current = current.crop(left, top, width, height)?;
-            }
+    if let Some(threshold) = tp.trim
+        && !animated_output
+    {
+        let (left, top, width, height) = current.find_trim(threshold as f64)?;
+        if width > 0 && height > 0 {
+            current = current.crop(left, top, width, height)?;
         }
     }
 
@@ -459,7 +459,7 @@ fn encode_gif(image: &VipsImage) -> Result<Vec<u8>, VipsError> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::params::{parse, AnimMode};
+    use super::super::params::{AnimMode, parse};
     use super::*;
     use std::fs;
     use std::path::Path;

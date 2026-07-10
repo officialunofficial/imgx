@@ -107,9 +107,10 @@ mod tests {
     fn generate_etag_returns_16_character_hex_string() {
         let etag = generate_etag(b"test data");
         assert_eq!(etag.len(), 16);
-        assert!(etag
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            etag.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]

@@ -8,6 +8,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # sccache and incremental compilation are incompatible ("incremental
+  # compilation is prohibited: Unset CARGO_INCREMENTAL to continue").
+  CARGO_INCREMENTAL: "0"
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   lint:
@@ -23,6 +28,7 @@ jobs:
       - name: Install libvips
         run: sudo apt-get update && sudo apt-get install -y libvips-dev
 
+      - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
@@ -46,10 +52,33 @@ jobs:
         # tests fail here while passing on any dev machine with recommends on.
         run: sudo apt-get update && sudo apt-get install -y libvips-dev libheif-plugin-aomenc
 
+      - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
         run: cargo test --workspace
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (MSRV)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Keep in sync with rust-version in Cargo.toml and msrv in
+          # clippy.toml. `stable` in the other jobs floats forward and
+          # would never catch a genuine MSRV regression on its own.
+          toolchain: "1.96"
+
+      - name: Install libvips
+        run: sudo apt-get update && sudo apt-get install -y libvips-dev
+
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check on MSRV
+        run: cargo check --workspace --all-targets
 
   coverage:
     runs-on: ubuntu-latest
@@ -65,13 +94,21 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libvips-dev libheif-plugin-aomenc
 
       - uses: taiki-e/install-action@cargo-llvm-cov
-
+      - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
 
       # Visibility only for now, no --fail-under-* threshold -- this
       # establishes a baseline before turning it into a hard gate.
       - name: Generate coverage summary
         run: cargo llvm-cov --workspace --summary-only >> "$GITHUB_STEP_SUMMARY"
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
 
   build:
     needs: [lint, test]
@@ -85,6 +122,7 @@ jobs:
       - name: Install libvips
         run: sudo apt-get update && sudo apt-get install -y libvips-dev
 
+      - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
 
       - name: Build (release)
