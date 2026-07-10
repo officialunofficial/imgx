@@ -6,8 +6,7 @@ on:
       - main
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   # Runs when a release-plz PR is merged into main: tags the release and
@@ -18,14 +17,26 @@ jobs:
     name: Release-plz release
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       pull-requests: read
     steps:
+      # The default GITHUB_TOKEN can't create/approve PRs on this org
+      # (locked at the Enterprise level), so we mint a short-lived
+      # installation token from the dedicated offuno-release-plz GitHub
+      # App instead, which isn't subject to that restriction.
+      - name: Generate a token from the offuno-release-plz App
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: 3962886
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -35,7 +46,7 @@ jobs:
         with:
           command: release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
   # Opens/updates a PR bumping versions and CHANGELOG.md based on commits
   # since the last release, following Conventional Commits (see
@@ -44,17 +55,25 @@ jobs:
     name: Release-plz PR
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       pull-requests: write
     concurrency:
       group: release-plz-${{ github.ref }}
       cancel-in-progress: false
     steps:
+      - name: Generate a token from the offuno-release-plz App
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: 3962886
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -64,4 +83,4 @@ jobs:
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
