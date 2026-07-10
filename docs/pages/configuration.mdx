@@ -64,6 +64,15 @@ imgx validates configuration at startup and refuses to start if:
 - `IMGX_ORIGIN_TYPE=http` and `IMGX_ORIGIN_BASE_URL` is empty
 - `IMGX_ORIGIN_TYPE=r2` and any R2 field is empty
 
+## Logging
+
+Read directly from the environment at startup (not part of `Config`, so there's no `IMGX_` prefix):
+
+| Variable | Description |
+|----------|-------------|
+| `RUST_LOG` | Standard `tracing`/`env_logger`-style filter, e.g. `RUST_LOG=debug` or `RUST_LOG=info,imgx=debug`. Defaults to `info` if unset. |
+| `IMGX_LOG_FORMAT=json` | Structured JSON log lines instead of human-readable text — useful for log-shipping pipelines (Cloud Logging, Loki, etc.) that parse structured fields. Any other value (or unset) keeps the default text format. |
+
 ## Example **.env** file
 
 ```sh

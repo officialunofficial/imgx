@@ -16,7 +16,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    init_tracing();
 
     let cfg = Config::load_from_env().unwrap_or_else(|e| {
         tracing::error!(error = %e, "failed to load configuration from environment");
@@ -51,6 +51,27 @@ async fn main() {
         .expect("server error");
 
     imgx_vips::shutdown();
+}
+
+/// `tracing_subscriber::fmt::init()` (the previous setup) builds a
+/// subscriber with no `EnvFilter` layer at all -- `env-filter` isn't in
+/// tracing-subscriber's default feature set, so `RUST_LOG` silently had
+/// no effect regardless of what an operator set it to. `IMGX_LOG_FORMAT
+/// =json` switches to structured JSON output for log-shipping pipelines
+/// that parse it (e.g. Cloud Logging, Loki); anything else (including
+/// unset) keeps the human-readable default.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    if std::env::var("IMGX_LOG_FORMAT").as_deref() == Ok("json") {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 }
 
 /// Wait for Ctrl+C or SIGTERM (the signal Kubernetes sends on pod
