@@ -101,6 +101,8 @@ jobs:
           git worktree add /tmp/last-release "$last_tag"
 
       - name: Run release-plz
-        run: release-plz release-pr --registry-manifest-path /tmp/last-release/Cargo.toml
+        # Unlike release-plz/action, the bare CLI doesn't read GITHUB_TOKEN
+        # automatically -- it needs --git-token explicitly.
+        run: release-plz release-pr --registry-manifest-path /tmp/last-release/Cargo.toml --git-token "$GITHUB_TOKEN"
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
