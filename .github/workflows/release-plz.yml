@@ -78,9 +78,29 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run release-plz
-        uses: release-plz/action@v0.5
+      - name: Install release-plz
+        uses: taiki-e/install-action@v2
         with:
-          command: release-pr
+          tool: release-plz@0.3.159
+
+      # release-plz normally determines "next version" by diffing against
+      # the crate as published on crates.io -- but imgx/imgx-vips are
+      # publish=false deployed applications that have never been (and
+      # never will be) published there. That registry lookup always
+      # comes back "not found", and release-plz silently treats that as
+      # "nothing new to release" instead of falling back to git tags
+      # (confirmed both in production -- 6 merged fix/feat commits since
+      # v0.1.0 produced zero proposed bump -- and via a local
+      # `release-plz update` repro). Point --registry-manifest-path at a
+      # checkout of the last release tag instead, which release-plz
+      # *does* correctly diff the working tree against.
+      - name: Checkout last release tag as the comparison baseline
+        run: |
+          last_tag=$(git tag -l 'imgx-v*' | sort -V | tail -1)
+          echo "Comparing against $last_tag"
+          git worktree add /tmp/last-release "$last_tag"
+
+      - name: Run release-plz
+        run: release-plz release-pr --registry-manifest-path /tmp/last-release/Cargo.toml
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
