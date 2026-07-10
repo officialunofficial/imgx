@@ -17,6 +17,8 @@ use super::params::{
 pub enum TransformError {
     #[error(transparent)]
     Vips(#[from] VipsError),
+    #[error("source image exceeds the configured pixel budget ({0} > {1})")]
+    ExceedsMaxPixels(u64, u64),
 }
 
 /// Result of a transform pipeline execution.
@@ -30,16 +32,20 @@ pub struct TransformResult {
     pub frame_count: Option<u32>,
 }
 
-/// Safety limits for animated image processing.
+/// Safety limits enforced during transform execution -- a general
+/// decompression-bomb guard on any source image (`max_pixels`) plus the
+/// animated-specific budget (`max_frames`, `max_animated_pixels`).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct AnimConfig {
+pub struct TransformLimits {
+    pub max_pixels: u64,
     pub max_frames: u32,
     pub max_animated_pixels: u64,
 }
 
-impl Default for AnimConfig {
+impl Default for TransformLimits {
     fn default() -> Self {
         Self {
+            max_pixels: 71_000_000,
             max_frames: 100,
             max_animated_pixels: 50_000_000,
         }
@@ -55,13 +61,27 @@ pub fn transform(
     input_data: &[u8],
     tp: &TransformParams,
     accept_header: Option<&str>,
-    anim_config: Option<AnimConfig>,
+    limits: Option<TransformLimits>,
 ) -> Result<TransformResult, TransformError> {
-    let anim_cfg = anim_config.unwrap_or_default();
+    let limits = limits.unwrap_or_default();
 
     // -- PROBE --
     // Load first frame only (cheap) to detect animation metadata.
     let mut current = VipsImage::from_buffer(input_data)?;
+
+    // Decompression-bomb guard: reject before any resize/effect/encode work
+    // touches full pixel data if the *first frame's* pixel count alone
+    // already exceeds the configured budget. This is intentionally
+    // independent of the animated total-frames budget below (a single
+    // frame can be dangerous on its own even if max_animated_pixels is
+    // never reached because the source turns out not to be animated).
+    let first_frame_pixels = current.width() as u64 * current.height() as u64;
+    if first_frame_pixels > limits.max_pixels {
+        return Err(TransformError::ExceedsMaxPixels(
+            first_frame_pixels,
+            limits.max_pixels,
+        ));
+    }
 
     let n_pages = n_pages_of(&current);
     let is_animated = n_pages.is_some_and(|n| n > 1);
@@ -73,14 +93,18 @@ pub fn transform(
         let frame_w = current.width() as u64;
         let page_h = page_height_of(&current).unwrap_or_else(|| current.height()) as u64;
         let frame_count = n_pages.unwrap_or(1) as u64;
-        (frame_w * page_h * frame_count) > anim_cfg.max_animated_pixels
+        (frame_w * page_h * frame_count) > limits.max_animated_pixels
     } else {
         false
     };
 
     // Effective frame count after clamping to max_frames.
     let effective_pages: Option<i32> = if is_animated && !over_budget {
-        Some(n_pages.unwrap().min(anim_cfg.max_frames as i32))
+        Some(
+            n_pages
+                .expect("invariant: is_animated is only true when n_pages_of() returned Some")
+                .min(limits.max_frames as i32),
+        )
     } else {
         n_pages
     };
@@ -101,8 +125,13 @@ pub fn transform(
     // If producing animated output, reload with all frames stacked,
     // clamped to max_frames if the source exceeds it.
     if animated_output {
-        current = if effective_pages.unwrap() < n_pages.unwrap() {
-            VipsImage::from_buffer_animated(input_data, effective_pages.unwrap())?
+        // invariant: animated_format (and thus animated_output) is only
+        // Some when is_animated && !over_budget, which is exactly the
+        // condition under which effective_pages/n_pages above are Some.
+        let effective_pages = effective_pages.expect("invariant: animated_output implies Some");
+        let n_pages = n_pages.expect("invariant: animated_output implies Some");
+        current = if effective_pages < n_pages {
+            VipsImage::from_buffer_animated(input_data, effective_pages)?
         } else {
             VipsImage::from_buffer_animated(input_data, -1)?
         };
@@ -176,7 +205,9 @@ pub fn transform(
         let thumb_width: i32 = match eff_w {
             Some(w) => w,
             None => {
-                let h = eff_h.unwrap();
+                // invariant: the outer `if eff_w.is_some() || eff_h.is_some()`
+                // guarantees eff_h is Some whenever eff_w is None.
+                let h = eff_h.expect("invariant: eff_w.is_none() implies eff_h.is_some()");
                 let ratio = source_w as f64 / source_h as f64;
                 let derived = h as f64 * ratio;
                 (derived.min(8192.0) as i32).max(1)
@@ -464,6 +495,30 @@ mod tests {
         assert!(!result.data.is_empty());
         assert_eq!(result.width, 4);
         assert_eq!(result.height, 4);
+    }
+
+    #[test]
+    fn transform_rejects_source_exceeding_max_pixels() {
+        init();
+        let data = static_fixture(); // test_4x4.png = 16 pixels
+        let limits = TransformLimits {
+            max_pixels: 10,
+            ..Default::default()
+        };
+        let err = transform(&data, &TransformParams::default(), None, Some(limits))
+            .expect_err("16-pixel source must be rejected under a 10-pixel budget");
+        assert!(matches!(err, TransformError::ExceedsMaxPixels(16, 10)));
+    }
+
+    #[test]
+    fn transform_accepts_source_within_max_pixels() {
+        init();
+        let data = static_fixture(); // test_4x4.png = 16 pixels
+        let limits = TransformLimits {
+            max_pixels: 16,
+            ..Default::default()
+        };
+        assert!(transform(&data, &TransformParams::default(), None, Some(limits)).is_ok());
     }
 
     #[test]
@@ -862,9 +917,10 @@ mod tests {
             format: Some(OutputFormat::Gif),
             ..Default::default()
         };
-        let cfg = AnimConfig {
+        let cfg = TransformLimits {
             max_animated_pixels: 1000,
             max_frames: 100,
+            ..Default::default()
         };
         let result = transform(&data, &p, Some("image/gif"), Some(cfg)).unwrap();
         assert!(!result.data.is_empty());
@@ -882,9 +938,10 @@ mod tests {
             format: Some(OutputFormat::Gif),
             ..Default::default()
         };
-        let cfg = AnimConfig {
+        let cfg = TransformLimits {
             max_frames: 3,
             max_animated_pixels: 50_000_000,
+            ..Default::default()
         };
         let result = transform(&data, &p, Some("image/gif"), Some(cfg)).unwrap();
         assert!(!result.data.is_empty());
