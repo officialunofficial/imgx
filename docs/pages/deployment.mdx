@@ -125,25 +125,37 @@ curl http://localhost:8080/ready
 
 ### `/metrics`
 
-Returns `200` with JSON statistics:
+Returns `200` with `text/plain; version=0.0.4` — standard [Prometheus exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/), scrapeable directly by Prometheus, Grafana Agent, the Datadog agent's OpenMetrics check, or any compatible collector:
 
-```json
-{
-  "requests_total": 1042,
-  "cache_hits": 891,
-  "cache_misses": 151,
-  "cache_entries": 148,
-  "uptime_seconds": 3600
-}
+```
+# HELP imgx_requests_total Total number of HTTP requests handled.
+# TYPE imgx_requests_total counter
+imgx_requests_total 1042
+
+# HELP imgx_cache_hits_total Total number of image-transform cache hits.
+# TYPE imgx_cache_hits_total counter
+imgx_cache_hits_total 891
+
+# HELP imgx_cache_misses_total Total number of image-transform cache misses.
+# TYPE imgx_cache_misses_total counter
+imgx_cache_misses_total 151
+
+# HELP imgx_cache_entries Current number of entries in the cache (0 for backends that don't track this).
+# TYPE imgx_cache_entries gauge
+imgx_cache_entries 148
+
+# HELP imgx_uptime_seconds Seconds since the server started.
+# TYPE imgx_uptime_seconds gauge
+imgx_uptime_seconds 3600
 ```
 
-| Field | Description |
-|-------|-------------|
-| `requests_total` | Total HTTP requests served since startup |
-| `cache_hits` | Requests served from cache |
-| `cache_misses` | Requests that required an origin fetch |
-| `cache_entries` | Current entries in the L1 memory cache |
-| `uptime_seconds` | Seconds since server startup |
+| Metric | Type | Description |
+|--------|------|-------------|
+| `imgx_requests_total` | counter | Total HTTP requests served since startup |
+| `imgx_cache_hits_total` | counter | Requests served from cache |
+| `imgx_cache_misses_total` | counter | Requests that required an origin fetch |
+| `imgx_cache_entries` | gauge | Current entries in the L1 memory cache (0 for the R2/Noop backends, which don't track this) |
+| `imgx_uptime_seconds` | gauge | Seconds since server startup |
 
 ---
 

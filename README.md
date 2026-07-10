@@ -99,7 +99,7 @@ The legacy `ZIMGX_` prefix is still read as a fallback for one release during th
 |------|-------------|
 | `GET /health` | Health check &mdash; `{"status":"ok"}` |
 | `GET /ready` | Readiness probe &mdash; `{"ready":true}` |
-| `GET /metrics` | Server stats (requests, cache hits/misses, uptime) |
+| `GET /metrics` | Prometheus exposition format (requests, cache hits/misses, uptime) |
 | `GET /<path>` | Image request (with optional transforms) |
 
 ## Architecture

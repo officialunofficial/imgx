@@ -29,6 +29,12 @@ tower-http = { version = "0.7", features = ["trace"] }
 tracing-subscriber = "0.3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 serde_json = "1"
+metrics = { version = "0.24.6", default-features = false }
+# Default features pull in an http-listener that spins up its own
+# scrape server on a second port -- unwanted, /metrics is served
+# through our existing axum router below. `default-features = false`
+# leaves just PrometheusBuilder/PrometheusHandle::render().
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.7"
