@@ -120,12 +120,78 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use wiremock::matchers::method as wm_method;
+    use wiremock::matchers::path as wm_path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn fetch_returns_not_found_on_real_404() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/missing.jpg"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let origin = OriginSource {
+            base_url: server.uri(),
+        };
+        let fetcher = Fetcher::new(origin, 5000, 10 * 1024 * 1024);
+        assert!(matches!(
+            fetcher.fetch("missing.jpg").await,
+            Err(FetchError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_returns_server_error_on_real_5xx() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/broken.jpg"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let origin = OriginSource {
+            base_url: server.uri(),
+        };
+        let fetcher = Fetcher::new(origin, 5000, 10 * 1024 * 1024);
+        assert!(matches!(
+            fetcher.fetch("broken.jpg").await,
+            Err(FetchError::ServerError(503))
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_extracts_content_type_from_real_response_header() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/photo.webp"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"webpdata".to_vec())
+                    .insert_header("content-type", "image/webp"),
+            )
+            .mount(&server)
+            .await;
+
+        let origin = OriginSource {
+            base_url: server.uri(),
+        };
+        let fetcher = Fetcher::new(origin, 5000, 10 * 1024 * 1024);
+        let result = fetcher.fetch("photo.webp").await.unwrap();
+        assert_eq!(result.content_type, "image/webp");
+        assert_eq!(result.data, b"webpdata");
+    }
 
     /// Spawns a bare-bones single-request HTTP/1.1 server on an ephemeral
     /// port that writes `response` verbatim to the first connection it
-    /// accepts, then returns its base URL. Used to exercise real
-    /// Content-Length/body-size behavior without a full mocking crate
-    /// (Phase 2 replaces this with wiremock for the fuller test suite).
+    /// accepts, then returns its base URL. Kept alongside the wiremock
+    /// tests above deliberately: wiremock's `ResponseTemplate` always
+    /// derives a correct Content-Length from the body it's given, so it
+    /// can't express "no Content-Length header at all" (chunked) or a
+    /// declared length that doesn't match the real body -- exactly the
+    /// wire-level cases the tests below need.
     async fn serve_once(response: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

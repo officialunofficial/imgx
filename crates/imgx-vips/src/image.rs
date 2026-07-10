@@ -644,6 +644,66 @@ mod tests {
     }
 
     #[test]
+    fn load_and_reencode_jpeg_source_as_png_round_trips() {
+        init().expect("vips init");
+        let data = fixture("cmyk.jpg"); // any real JPEG source; also exercises CMYK below
+        let img = VipsImage::from_buffer(&data).expect("load jpeg");
+        let png = img.save_png(6, true).expect("encode png");
+        assert!(!png.is_empty());
+        // PNG magic bytes
+        assert_eq!(
+            &png[0..8],
+            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        );
+    }
+
+    #[test]
+    fn load_and_reencode_webp_source_as_jpeg_round_trips() {
+        init().expect("vips init");
+        let data = fixture("static.webp");
+        let img = VipsImage::from_buffer(&data).expect("load webp");
+        assert_eq!(img.width(), 8);
+        assert_eq!(img.height(), 8);
+        let jpeg = img.save_jpeg(80, true).expect("encode jpeg");
+        assert!(!jpeg.is_empty());
+        assert_eq!(&jpeg[0..2], &[0xFF, 0xD8]);
+    }
+
+    #[test]
+    fn load_cmyk_source_reports_four_bands() {
+        init().expect("vips init");
+        let data = fixture("cmyk.jpg");
+        let img = VipsImage::from_buffer(&data).expect("load cmyk jpeg");
+        assert_eq!(img.bands(), 4);
+    }
+
+    #[test]
+    fn load_source_with_exif_orientation_exposes_the_raw_tag() {
+        init().expect("vips init");
+        let data = fixture("exif_orientation.jpg");
+        let img = VipsImage::from_buffer(&data).expect("load exif-oriented jpeg");
+        // Characterization test, not a correctness claim: from_buffer's
+        // width/height are the raw pre-rotation pixel dimensions (8x4),
+        // not the visually-upright dimensions EXIF orientation 6 implies
+        // (4x8). The orientation tag itself is readable via get_int, but
+        // nothing in the pipeline currently applies it before computing
+        // resize/crop targets -- see the Phase 1 code-quality audit note
+        // in docs/INVARIANTS.md and pipeline.rs, a pre-existing limitation
+        // inherited unchanged from the original Zig implementation, not a
+        // regression from this port.
+        assert_eq!(img.width(), 8);
+        assert_eq!(img.height(), 4);
+        assert_eq!(img.get_int("orientation"), Some(6));
+    }
+
+    #[test]
+    fn load_corrupt_truncated_source_returns_an_error() {
+        init().expect("vips init");
+        let data = fixture("corrupt_truncated.png");
+        assert!(VipsImage::from_buffer(&data).is_err());
+    }
+
+    #[test]
     fn probe_loads_only_first_frame_of_animated_gif() {
         init().expect("vips init");
         let data = fixture("loading.gif");

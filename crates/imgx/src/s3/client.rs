@@ -188,6 +188,180 @@ fn check_status(status: u16, success1: u16, success2: u16) -> Result<bool, S3Err
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn mock_client(server: &MockServer) -> S3Client {
+        S3Client::new(&server.uri(), "test-bucket", "auto", "key", "secret").unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_object_200_returns_data_and_content_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-bucket/photo.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"pngdata".to_vec())
+                    .insert_header("content-type", "image/png"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let resp = client.get_object("photo.png").await.unwrap().unwrap();
+        assert_eq!(resp.data, b"pngdata");
+        assert_eq!(resp.content_type, "image/png");
+        assert_eq!(resp.status, 200);
+    }
+
+    #[tokio::test]
+    async fn get_object_404_returns_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-bucket/missing.png"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        assert!(client.get_object("missing.png").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_object_403_returns_access_denied() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-bucket/forbidden.png"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        assert!(matches!(
+            client.get_object("forbidden.png").await,
+            Err(S3Error::AccessDenied)
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_object_5xx_returns_server_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-bucket/broken.png"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        assert!(matches!(
+            client.get_object("broken.png").await,
+            Err(S3Error::ServerError(503))
+        ));
+    }
+
+    #[tokio::test]
+    async fn put_object_200_returns_true() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/test-bucket/upload.png"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let result = client
+            .put_object("upload.png", b"data".to_vec(), "image/png")
+            .await;
+        assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn put_object_403_returns_access_denied() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/test-bucket/upload.png"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let result = client
+            .put_object("upload.png", b"data".to_vec(), "image/png")
+            .await;
+        assert!(matches!(result, Err(S3Error::AccessDenied)));
+    }
+
+    #[tokio::test]
+    async fn put_object_5xx_returns_server_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/test-bucket/upload.png"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let result = client
+            .put_object("upload.png", b"data".to_vec(), "image/png")
+            .await;
+        assert!(matches!(result, Err(S3Error::ServerError(500))));
+    }
+
+    #[tokio::test]
+    async fn delete_object_204_returns_true() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/test-bucket/gone.png"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        assert!(client.delete_object("gone.png").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_object_403_returns_access_denied() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/test-bucket/gone.png"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        assert!(matches!(
+            client.delete_object("gone.png").await,
+            Err(S3Error::AccessDenied)
+        ));
+    }
+
+    #[tokio::test]
+    async fn head_object_200_returns_true() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/test-bucket/exists.png"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        assert!(client.head_object("exists.png").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn head_object_404_returns_false() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/test-bucket/missing.png"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        assert!(!client.head_object("missing.png").await.unwrap());
+    }
 
     #[test]
     fn s3client_new_stores_configuration() {

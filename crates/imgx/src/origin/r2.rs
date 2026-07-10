@@ -46,6 +46,8 @@ impl<'a> R2Fetcher<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_client() -> S3Client {
         S3Client::new(
@@ -58,6 +60,10 @@ mod tests {
         .unwrap()
     }
 
+    async fn mock_client(server: &MockServer) -> S3Client {
+        S3Client::new(&server.uri(), "test-bucket", "auto", "test", "test").unwrap()
+    }
+
     #[tokio::test]
     async fn r2fetcher_fetch_with_empty_path_returns_invalid_url() {
         let client = test_client();
@@ -67,21 +73,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn r2fetcher_strips_leading_slash_and_attempts_connection() {
-        let client = test_client();
-        let r2 = R2Fetcher::new(&client);
-        // No real S3 server at localhost:1234, so this fails with
-        // ConnectionFailed -- proving the slash-stripping logic ran (an
-        // InvalidUrl or panic would indicate it didn't).
-        let result = r2.fetch("/test.jpg").await;
-        assert!(matches!(result, Err(FetchError::ConnectionFailed(_))));
-    }
-
-    #[tokio::test]
     async fn r2fetcher_fetch_non_empty_path_returns_connection_failed() {
         let client = test_client();
         let r2 = R2Fetcher::new(&client);
         let result = r2.fetch("images/photo.jpg").await;
         assert!(matches!(result, Err(FetchError::ConnectionFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn r2fetcher_strips_leading_slash_before_requesting_the_key() {
+        let server = MockServer::start().await;
+        // If the leading slash weren't stripped, the presigned URL would
+        // request "/test-bucket//test.jpg" (double slash) instead, and
+        // this mock (registered without the extra slash) wouldn't match.
+        Mock::given(method("GET"))
+            .and(path("/test-bucket/test.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data".to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let r2 = R2Fetcher::new(&client);
+        let result = r2.fetch("/test.jpg").await.unwrap();
+        assert_eq!(result.data, b"data");
+    }
+
+    #[tokio::test]
+    async fn r2fetcher_fetch_200_returns_result() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-bucket/photo.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"jpegdata".to_vec())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let r2 = R2Fetcher::new(&client);
+        let result = r2.fetch("photo.jpg").await.unwrap();
+        assert_eq!(result.data, b"jpegdata");
+        assert_eq!(result.content_type, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn r2fetcher_maps_s3_404_to_fetch_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-bucket/missing.jpg"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let r2 = R2Fetcher::new(&client);
+        assert!(matches!(
+            r2.fetch("missing.jpg").await,
+            Err(FetchError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn r2fetcher_maps_s3_access_denied_to_fetch_server_error_403() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-bucket/forbidden.jpg"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let r2 = R2Fetcher::new(&client);
+        assert!(matches!(
+            r2.fetch("forbidden.jpg").await,
+            Err(FetchError::ServerError(403))
+        ));
+    }
+
+    #[tokio::test]
+    async fn r2fetcher_maps_s3_5xx_to_fetch_server_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-bucket/broken.jpg"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let r2 = R2Fetcher::new(&client);
+        assert!(matches!(
+            r2.fetch("broken.jpg").await,
+            Err(FetchError::ServerError(503))
+        ));
     }
 }

@@ -174,6 +174,8 @@ fn sanitize_key(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_client() -> Arc<S3Client> {
         Arc::new(
@@ -188,10 +190,111 @@ mod tests {
         )
     }
 
+    async fn mock_r2cache(server: &MockServer) -> R2Cache {
+        R2Cache::new(Arc::new(
+            S3Client::new(&server.uri(), "test-bucket", "auto", "test", "test").unwrap(),
+        ))
+    }
+
     #[tokio::test]
     async fn get_returns_none_when_s3_is_unreachable() {
         let rc = R2Cache::new(test_client());
         assert!(rc.get("some-key").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_returns_entry_on_real_200() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-bucket/photo.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"pngdata".to_vec())
+                    .insert_header("content-type", "image/png"),
+            )
+            .mount(&server)
+            .await;
+
+        let rc = mock_r2cache(&server).await;
+        let entry = rc.get("photo.png").await.unwrap();
+        assert_eq!(entry.data, b"pngdata");
+        assert_eq!(entry.content_type, "image/png");
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_on_real_404_without_logging_as_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-bucket/missing.png"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let rc = mock_r2cache(&server).await;
+        assert!(rc.get("missing.png").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_on_real_server_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-bucket/broken.png"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let rc = mock_r2cache(&server).await;
+        assert!(rc.get("broken.png").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn put_succeeds_on_real_200() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/test-bucket/photo.png"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let rc = mock_r2cache(&server).await;
+        rc.put(
+            "photo.png",
+            CacheEntry {
+                data: b"data".to_vec(),
+                content_type: "image/png".to_string(),
+                created_at: 0,
+            },
+        )
+        .await;
+        // No panic and the mock's expectation (registered without
+        // .expect(1..)) is satisfied implicitly by the request landing --
+        // put() is fire-and-forget by design (see doc comment above).
+    }
+
+    #[tokio::test]
+    async fn delete_returns_true_on_real_204() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/test-bucket/photo.png"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let rc = mock_r2cache(&server).await;
+        assert!(rc.delete("photo.png").await);
+    }
+
+    #[tokio::test]
+    async fn delete_returns_false_on_real_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/test-bucket/photo.png"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let rc = mock_r2cache(&server).await;
+        assert!(!rc.delete("photo.png").await);
     }
 
     #[test]
