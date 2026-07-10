@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "imgx"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "imgx-vips",
@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "imgx-vips"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "pkg-config",
