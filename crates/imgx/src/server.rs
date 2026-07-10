@@ -8,7 +8,6 @@
 //! not the specific mechanism.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -17,6 +16,7 @@ use axum::error_handling::HandleErrorLayer;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusRecorder};
 use tokio::sync::Semaphore;
 use tower::ServiceBuilder;
 
@@ -95,32 +95,18 @@ impl AppOrigin {
     }
 }
 
-/// Statistics about the running server, exposed via /metrics.
-#[derive(Default)]
-pub struct ServerStats {
-    pub requests_total: AtomicU64,
-    pub cache_hits: AtomicU64,
-    pub cache_misses: AtomicU64,
-}
-
-impl ServerStats {
-    fn to_json(&self, cache_entries: usize, uptime_seconds: i64) -> String {
-        format!(
-            "{{\"requests_total\":{},\"cache_hits\":{},\"cache_misses\":{},\"cache_entries\":{},\"uptime_seconds\":{}}}",
-            self.requests_total.load(Ordering::Relaxed),
-            self.cache_hits.load(Ordering::Relaxed),
-            self.cache_misses.load(Ordering::Relaxed),
-            cache_entries,
-            uptime_seconds,
-        )
-    }
-}
-
 pub struct AppState {
     pub config: Config,
     pub cache: AppCache,
     pub origin: AppOrigin,
-    pub stats: ServerStats,
+    /// A recorder scoped to this `AppState` instance, not the process-wide
+    /// global one `metrics::set_global_recorder` would install. Each
+    /// `AppState` (and therefore each test) gets its own isolated metric
+    /// registry -- a global recorder would make counter values a shared,
+    /// racy resource across every test in the binary (they run in
+    /// parallel by default), since metric names aren't otherwise scoped
+    /// per-instance. Emit through it via `metrics::with_local_recorder`.
+    pub metrics_recorder: PrometheusRecorder,
     pub start_time: Instant,
     pub vips_semaphore: Arc<Semaphore>,
 }
@@ -174,11 +160,32 @@ impl AppState {
             .map(|n| n.get())
             .unwrap_or(4);
 
+        let metrics_recorder = PrometheusBuilder::new().build_recorder();
+        metrics::with_local_recorder(&metrics_recorder, || {
+            metrics::describe_counter!(
+                "imgx_requests_total",
+                "Total number of HTTP requests handled."
+            );
+            metrics::describe_counter!(
+                "imgx_cache_hits_total",
+                "Total number of image-transform cache hits."
+            );
+            metrics::describe_counter!(
+                "imgx_cache_misses_total",
+                "Total number of image-transform cache misses."
+            );
+            metrics::describe_gauge!(
+                "imgx_cache_entries",
+                "Current number of entries in the cache (0 for backends that don't track this)."
+            );
+            metrics::describe_gauge!("imgx_uptime_seconds", "Seconds since the server started.");
+        });
+
         Self {
             config: cfg,
             cache,
             origin,
-            stats: ServerStats::default(),
+            metrics_recorder,
             start_time: Instant::now(),
             vips_semaphore: Arc::new(Semaphore::new(permits)),
         }
@@ -218,7 +225,9 @@ async fn handle_request(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
+    metrics::with_local_recorder(&state.metrics_recorder, || {
+        metrics::counter!("imgx_requests_total").increment(1);
+    });
 
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
@@ -230,9 +239,18 @@ async fn handle_request(
         Route::Ready => json_response(StatusCode::OK, "{\"ready\":true}"),
         Route::Metrics => {
             let cache_entries = state.cache.size().await;
-            let uptime_seconds = state.start_time.elapsed().as_secs() as i64;
-            let json = state.stats.to_json(cache_entries, uptime_seconds);
-            json_response(StatusCode::OK, &json)
+            let uptime_seconds = state.start_time.elapsed().as_secs();
+            metrics::with_local_recorder(&state.metrics_recorder, || {
+                metrics::gauge!("imgx_cache_entries").set(cache_entries as f64);
+                metrics::gauge!("imgx_uptime_seconds").set(uptime_seconds as f64);
+            });
+            let body = state.metrics_recorder.handle().render();
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+                body,
+            )
+                .into_response()
         }
         Route::NotFound => error_response(HttpError::not_found(None)),
         Route::ImageRequest(req) => {
@@ -281,10 +299,14 @@ async fn handle_image_request(
     let cache_key = cache::compute_cache_key(&req.image_path, transform_string, format_str);
 
     if let Some(entry) = state.cache.get(&cache_key).await {
-        state.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+        metrics::with_local_recorder(&state.metrics_recorder, || {
+            metrics::counter!("imgx_cache_hits_total").increment(1);
+        });
         return build_image_response(state, entry.data, entry.content_type, if_none_match);
     }
-    state.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
+    metrics::with_local_recorder(&state.metrics_recorder, || {
+        metrics::counter!("imgx_cache_misses_total").increment(1);
+    });
 
     let effective_path = strip_path_prefix(&state.config.origin.path_prefix, &req.image_path);
     let fetch_result = match state.origin.fetch(effective_path).await {
@@ -504,6 +526,21 @@ mod tests {
         (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
+    /// Reads a single metric's current value out of `state`'s own
+    /// (per-instance, not global) Prometheus recorder. Parses the
+    /// rendered exposition text rather than tracking a parallel
+    /// AtomicU64, so tests exercise the exact same code path
+    /// production scraping does. A counter that has never been
+    /// incremented isn't rendered at all (Prometheus registries only
+    /// emit touched metrics) -- treated as 0, matching counter semantics.
+    fn metric_value(state: &AppState, name: &str) -> f64 {
+        let rendered = state.metrics_recorder.handle().render();
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
     /// Confirms IMGX_SERVER_MAX_CONNECTIONS actually flows into the
     /// router's concurrency limiter rather than being loaded/validated
     /// and then silently ignored. max_connections=0 means the limiter
@@ -536,14 +573,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_endpoint_returns_200_with_json_stats() {
+    async fn metrics_endpoint_returns_200_with_prometheus_exposition_format() {
         let state = test_state();
         let router = build_router(Arc::clone(&state));
         let _ = get(router.clone(), "/health").await;
         let _ = get(router.clone(), "/ready").await;
         let (status, body) = get(router, "/metrics").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("\"requests_total\":3"));
+        // Every route (including /metrics itself, once it's served) counts
+        // as a request, so by the time this response body was rendered,
+        // three earlier requests (health, ready, and this one's own count
+        // at the top of handle_request) had already been recorded.
+        assert!(body.contains("# TYPE imgx_requests_total counter"));
+        assert!(body.contains("imgx_requests_total 3"));
+        assert!(body.contains("# TYPE imgx_cache_entries gauge"));
+        assert!(body.contains("# TYPE imgx_uptime_seconds gauge"));
+    }
+
+    #[tokio::test]
+    async fn metrics_content_type_is_prometheus_text_format() {
+        let router = build_router(test_state());
+        let req = axum::http::Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(content_type.starts_with("text/plain"));
     }
 
     #[tokio::test]
@@ -612,8 +673,8 @@ mod tests {
         let (status, body) = get(router.clone(), "/photo.jpg/w=100").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "not an image");
-        assert_eq!(state.stats.cache_misses.load(Ordering::Relaxed), 1);
-        assert_eq!(state.stats.cache_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(metric_value(&state, "imgx_cache_misses_total"), 1.0);
+        assert_eq!(metric_value(&state, "imgx_cache_hits_total"), 0.0);
 
         // Second, identical request: if the failed transform had been
         // cached under the transform's cache key, this would be a cache
@@ -621,8 +682,8 @@ mod tests {
         let (status, body) = get(router, "/photo.jpg/w=100").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "not an image");
-        assert_eq!(state.stats.cache_misses.load(Ordering::Relaxed), 2);
-        assert_eq!(state.stats.cache_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(metric_value(&state, "imgx_cache_misses_total"), 2.0);
+        assert_eq!(metric_value(&state, "imgx_cache_hits_total"), 0.0);
     }
 
     #[tokio::test]
@@ -633,7 +694,7 @@ mod tests {
         // listening there, so this fails at fetch -- but cache_misses
         // must still have been counted before the fetch was attempted.
         let _ = get(router, "/test.jpg").await;
-        assert_eq!(state.stats.cache_misses.load(Ordering::Relaxed), 1);
+        assert_eq!(metric_value(&state, "imgx_cache_misses_total"), 1.0);
     }
 
     #[tokio::test]
