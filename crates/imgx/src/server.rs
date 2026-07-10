@@ -339,8 +339,32 @@ async fn handle_image_request(
         }
         // Transform failed (unsupported/corrupt source, vips error, or the
         // blocking task panicked): fall back to caching/serving the raw
-        // fetched bytes rather than a 500, matching the Zig original.
-        Ok(Err(_)) | Err(_) => {
+        // fetched bytes rather than a 500, matching the Zig original. Always
+        // logged -- a silently-swallowed transform failure here previously
+        // meant every request negotiating to an unsupported format (e.g.
+        // AVIF on a runtime image missing vips-heif) served the untouched
+        // original with no visible signal anything was wrong.
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, path = %req.image_path, transform = %transform_string, "image transform failed, serving raw origin bytes");
+            let ct = tp
+                .format
+                .map(|f| f.content_type().to_string())
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            state
+                .cache
+                .put(
+                    &cache_key,
+                    CacheEntry {
+                        data: fetch_result.data.clone(),
+                        content_type: ct.clone(),
+                        created_at: now_unix(),
+                    },
+                )
+                .await;
+            build_image_response(state, fetch_result.data, ct, if_none_match)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %req.image_path, transform = %transform_string, "image transform task panicked, serving raw origin bytes");
             let ct = tp
                 .format
                 .map(|f| f.content_type().to_string())

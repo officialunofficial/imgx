@@ -216,7 +216,14 @@ impl VipsImage {
     }
 
     /// Encode to AVIF (via the HEIF encoder). `quality` is 1-100.
+    ///
+    /// `compression` must be passed explicitly: vips_heifsave_buffer
+    /// defaults to VIPS_FOREIGN_HEIF_COMPRESSION_HEVC (x265) when it's
+    /// omitted, not AV1, silently producing HEVC-in-a-heif-container
+    /// output mislabeled as AVIF (and erroring outright on runtimes,
+    /// like Alpine's, that only ship an AV1 encoder plugin).
     pub fn save_avif(&self, quality: i32, strip: bool) -> Result<Vec<u8>, VipsError> {
+        const VIPS_FOREIGN_HEIF_COMPRESSION_AV1: i32 = 4;
         let mut buf: *mut c_void = ptr::null_mut();
         let mut len: size_t = 0;
         let rc = unsafe {
@@ -226,6 +233,8 @@ impl VipsImage {
                 &mut len,
                 c"Q".as_ptr(),
                 quality,
+                c"compression".as_ptr(),
+                VIPS_FOREIGN_HEIF_COMPRESSION_AV1,
                 c"strip".as_ptr(),
                 bool_to_int(strip),
                 ptr::null::<c_char>(),
@@ -617,6 +626,21 @@ mod tests {
         assert!(!jpeg.is_empty());
         // JPEG magic bytes
         assert_eq!(&jpeg[0..2], &[0xFF, 0xD8]);
+    }
+
+    #[test]
+    fn load_and_reencode_static_png_as_avif_round_trips() {
+        init().expect("vips init");
+        let data = fixture("test_4x4.png");
+        let img = VipsImage::from_buffer(&data).expect("load png");
+        let avif = img.save_avif(80, true).expect("encode avif");
+        assert!(!avif.is_empty());
+        // ISO BMFF ftyp box: the major brand must be "avif", confirming
+        // AV1 compression was actually selected. Omitting `compression`
+        // in the vips_heifsave_buffer call defaults to HEVC, which would
+        // instead produce a "heic"/"mif1" brand here.
+        assert_eq!(&avif[4..8], b"ftyp");
+        assert_eq!(&avif[8..12], b"avif");
     }
 
     #[test]
