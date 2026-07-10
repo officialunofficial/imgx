@@ -28,7 +28,20 @@ impl R2Cache {
 impl Cache for R2Cache {
     async fn get(&self, key: &str) -> Option<CacheEntry> {
         let s3_key = sanitize_key(key)?;
-        let resp = self.client.get_object(&s3_key).await.ok().flatten()?;
+        // Ok(None) is a legitimate cache miss and stays quiet; Err is a
+        // real R2/S3 failure (bad credentials, unreachable endpoint, etc)
+        // and must be visible -- silently treating it the same as a miss
+        // previously meant a broken R2 config degraded to a permanent,
+        // undiagnosable silent cache-miss (same failure class as the AVIF
+        // bug: a fallback substituting different behavior with no signal).
+        let resp = match self.client.get_object(&s3_key).await {
+            Ok(Some(resp)) => resp,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(error = %e, key = %s3_key, "R2 cache get failed");
+                return None;
+            }
+        };
 
         // Real S3/R2 responses carry a real Content-Type header (unlike
         // Zig's std.http.Client, which didn't expose response headers at
@@ -51,18 +64,29 @@ impl Cache for R2Cache {
         let Some(s3_key) = sanitize_key(key) else {
             return;
         };
-        // Best-effort write; errors are silently ignored (matches Zig).
-        let _ = self
+        // Best-effort write (a failed cache write must not fail the
+        // request), but the failure itself is no longer silent -- see the
+        // comment on `get` above.
+        if let Err(e) = self
             .client
             .put_object(&s3_key, entry.data, &entry.content_type)
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, key = %s3_key, "R2 cache put failed");
+        }
     }
 
     async fn delete(&self, key: &str) -> bool {
         let Some(s3_key) = sanitize_key(key) else {
             return false;
         };
-        self.client.delete_object(&s3_key).await.unwrap_or(false)
+        match self.client.delete_object(&s3_key).await {
+            Ok(deleted) => deleted,
+            Err(e) => {
+                tracing::warn!(error = %e, key = %s3_key, "R2 cache delete failed");
+                false
+            }
+        }
     }
 
     async fn clear(&self) {

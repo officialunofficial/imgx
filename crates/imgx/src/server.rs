@@ -261,6 +261,21 @@ async fn handle_image_request(
             "transform parameters out of range".to_string(),
         )));
     }
+    // params::validate()'s 1..=8192 bound is a hard FFI-safety ceiling
+    // (INV-6), not operator policy. IMGX_TRANSFORM_MAX_WIDTH/MAX_HEIGHT
+    // let an operator configure a *tighter* limit on top of it -- enforce
+    // that here, where config is actually in scope.
+    if tp
+        .width
+        .is_some_and(|w| w > state.config.transform.max_width)
+        || tp
+            .height
+            .is_some_and(|h| h > state.config.transform.max_height)
+    {
+        return error_response(HttpError::unprocessable_entity(Some(
+            "transform parameters out of range".to_string(),
+        )));
+    }
 
     let format_str = tp.format.map(|f| f.as_str()).unwrap_or("auto");
     let cache_key = cache::compute_cache_key(&req.image_path, transform_string, format_str);
@@ -296,7 +311,8 @@ async fn handle_image_request(
         }
     };
 
-    let anim_cfg = pipeline::AnimConfig {
+    let transform_limits = pipeline::TransformLimits {
+        max_pixels: state.config.transform.max_pixels,
         max_frames: state.config.transform.max_frames,
         max_animated_pixels: state.config.transform.max_animated_pixels,
     };
@@ -317,7 +333,7 @@ async fn handle_image_request(
             &transform_input,
             &tp,
             accept_owned.as_deref(),
-            Some(anim_cfg),
+            Some(transform_limits),
         )
     });
 
@@ -338,29 +354,26 @@ async fn handle_image_request(
             build_image_response(state, result.data, content_type, if_none_match)
         }
         // Transform failed (unsupported/corrupt source, vips error, or the
-        // blocking task panicked): fall back to caching/serving the raw
-        // fetched bytes rather than a 500, matching the Zig original. Always
+        // blocking task panicked): fall back to serving the raw fetched
+        // bytes rather than a 500, matching the Zig original. Always
         // logged -- a silently-swallowed transform failure here previously
         // meant every request negotiating to an unsupported format (e.g.
         // AVIF on a runtime image missing vips-heif) served the untouched
         // original with no visible signal anything was wrong.
+        //
+        // Deliberately NOT cached under `cache_key`: that key is also what
+        // a successful transform of the same request writes to, so caching
+        // the passthrough fallback here would poison it for
+        // `default_ttl_seconds` -- a transient failure (e.g. brief OOM)
+        // would keep serving the wrong (untransformed) bytes long after
+        // the underlying problem recovered, for every future identical
+        // request within the TTL window.
         Ok(Err(e)) => {
             tracing::warn!(error = %e, path = %req.image_path, transform = %transform_string, "image transform failed, serving raw origin bytes");
             let ct = tp
                 .format
                 .map(|f| f.content_type().to_string())
                 .unwrap_or_else(|| "application/octet-stream".to_string());
-            state
-                .cache
-                .put(
-                    &cache_key,
-                    CacheEntry {
-                        data: fetch_result.data.clone(),
-                        content_type: ct.clone(),
-                        created_at: now_unix(),
-                    },
-                )
-                .await;
             build_image_response(state, fetch_result.data, ct, if_none_match)
         }
         Err(e) => {
@@ -369,17 +382,6 @@ async fn handle_image_request(
                 .format
                 .map(|f| f.content_type().to_string())
                 .unwrap_or_else(|| "application/octet-stream".to_string());
-            state
-                .cache
-                .put(
-                    &cache_key,
-                    CacheEntry {
-                        data: fetch_result.data.clone(),
-                        content_type: ct.clone(),
-                        created_at: now_unix(),
-                    },
-                )
-                .await;
             build_image_response(state, fetch_result.data, ct, if_none_match)
         }
     }
@@ -463,6 +465,32 @@ mod tests {
         Arc::new(AppState::new(Config::defaults()))
     }
 
+    /// Spawns an HTTP/1.1 server that answers every request on `addr`
+    /// with `response` verbatim, for the lifetime of the test. Used to
+    /// serve deliberately-corrupt "image" bytes so a real transform
+    /// failure (not a fetch failure) can be exercised end-to-end.
+    async fn serve_repeatedly(response: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
     async fn get(router: Router, path: &str) -> (StatusCode, String) {
         let req = axum::http::Request::builder()
             .uri(path)
@@ -543,6 +571,58 @@ mod tests {
         let (status, body) = get(router, "/test.jpg/w=0").await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(body.contains("out of range"));
+    }
+
+    #[tokio::test]
+    async fn image_request_width_over_configured_max_returns_422_without_hitting_origin() {
+        let mut cfg = Config::defaults();
+        cfg.transform.max_width = 100;
+        let router = build_router(Arc::new(AppState::new(cfg)));
+        // w=200 is within params.rs's hard 1..=8192 FFI-safety ceiling but
+        // over this deployment's configured max_width -- must be rejected
+        // before an origin fetch is ever attempted (origin is unreachable
+        // by default; a 502/504 here would mean the check didn't fire).
+        let (status, body) = get(router, "/test.jpg/w=200").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("out of range"));
+    }
+
+    #[tokio::test]
+    async fn image_request_width_at_configured_max_is_accepted() {
+        let mut cfg = Config::defaults();
+        cfg.transform.max_width = 100;
+        let router = build_router(Arc::new(AppState::new(cfg)));
+        let (status, _) = get(router, "/test.jpg/w=100").await;
+        assert_ne!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn transform_failure_fallback_is_never_cached() {
+        let base_url = serve_repeatedly(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 12\r\n\r\nnot an image",
+        )
+        .await;
+        let mut cfg = Config::defaults();
+        cfg.origin.base_url = base_url;
+        let state = Arc::new(AppState::new(cfg));
+        let router = build_router(Arc::clone(&state));
+
+        // First request: origin returns garbage, vips fails to decode it,
+        // falls back to serving the raw bytes -- a cache miss either way.
+        let (status, body) = get(router.clone(), "/photo.jpg/w=100").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "not an image");
+        assert_eq!(state.stats.cache_misses.load(Ordering::Relaxed), 1);
+        assert_eq!(state.stats.cache_hits.load(Ordering::Relaxed), 0);
+
+        // Second, identical request: if the failed transform had been
+        // cached under the transform's cache key, this would be a cache
+        // hit. It must still be a miss -- the fallback is never cached.
+        let (status, body) = get(router, "/photo.jpg/w=100").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "not an image");
+        assert_eq!(state.stats.cache_misses.load(Ordering::Relaxed), 2);
+        assert_eq!(state.stats.cache_hits.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

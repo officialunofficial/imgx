@@ -61,7 +61,7 @@ impl Fetcher {
     pub async fn fetch(&self, image_path: &str) -> Result<FetchResult, FetchError> {
         let url = self.origin.build_url(image_path)?;
 
-        let resp = self.http.get(&url).send().await.map_err(|e| {
+        let mut resp = self.http.get(&url).send().await.map_err(|e| {
             if e.is_timeout() {
                 FetchError::Timeout
             } else {
@@ -84,16 +84,31 @@ impl Fetcher {
             .unwrap_or("application/octet-stream")
             .to_string();
 
-        let data = resp
-            .bytes()
-            .await
-            .map_err(|e| FetchError::ConnectionFailed(e.to_string()))?;
-        if data.len() > self.max_size {
+        // Reject on a declared Content-Length before reading any body, and
+        // cap accumulated bytes while streaming for origins that omit it
+        // (or lie about it) -- `.bytes().await` would otherwise buffer an
+        // unbounded/oversized body in full before the size check ever ran.
+        if resp
+            .content_length()
+            .is_some_and(|len| len as usize > self.max_size)
+        {
             return Err(FetchError::ResponseTooLarge);
         }
 
+        let mut data = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| FetchError::ConnectionFailed(e.to_string()))?
+        {
+            data.extend_from_slice(&chunk);
+            if data.len() > self.max_size {
+                return Err(FetchError::ResponseTooLarge);
+            }
+        }
+
         Ok(FetchResult {
-            data: data.to_vec(),
+            data,
             content_type,
             status_code,
         })
@@ -103,6 +118,65 @@ impl Fetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Spawns a bare-bones single-request HTTP/1.1 server on an ephemeral
+    /// port that writes `response` verbatim to the first connection it
+    /// accepts, then returns its base URL. Used to exercise real
+    /// Content-Length/body-size behavior without a full mocking crate
+    /// (Phase 2 replaces this with wiremock for the fuller test suite).
+    async fn serve_once(response: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_declared_content_length_over_max_size_without_reading_body() {
+        let base_url = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 1000\r\n\r\n",
+        )
+        .await;
+        let origin = OriginSource { base_url };
+        let fetcher = Fetcher::new(origin, 5000, 10);
+        let result = fetcher.fetch("photo.png").await;
+        assert!(matches!(result, Err(FetchError::ResponseTooLarge)));
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_streamed_body_over_max_size_even_without_content_length() {
+        // Chunked transfer with no Content-Length header -- the only way
+        // to catch this is capping the accumulated body while streaming.
+        let base_url = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nTransfer-Encoding: chunked\r\n\r\n\
+             a\r\n0123456789\r\n0\r\n\r\n",
+        )
+        .await;
+        let origin = OriginSource { base_url };
+        let fetcher = Fetcher::new(origin, 5000, 5);
+        let result = fetcher.fetch("photo.png").await;
+        assert!(matches!(result, Err(FetchError::ResponseTooLarge)));
+    }
+
+    #[tokio::test]
+    async fn fetch_accepts_body_within_max_size() {
+        let base_url = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 5\r\n\r\nhello",
+        )
+        .await;
+        let origin = OriginSource { base_url };
+        let fetcher = Fetcher::new(origin, 5000, 10);
+        let result = fetcher.fetch("photo.png").await.unwrap();
+        assert_eq!(result.data, b"hello");
+    }
 
     #[test]
     fn fetcher_new_stores_configuration() {

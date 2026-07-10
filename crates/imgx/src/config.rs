@@ -25,6 +25,14 @@ pub enum ConfigError {
     InvalidValue,
     #[error("R2 origin requires endpoint, access_key_id, secret_access_key, and both bucket names to be set")]
     MissingR2Config,
+    #[error("server max_connections and max_request_size must not be 0")]
+    InvalidServerLimit,
+    #[error(
+        "cache max_size_bytes and default_ttl_seconds must not be 0 when the cache is enabled"
+    )]
+    InvalidCacheLimit,
+    #[error("transform max_frames and max_animated_pixels must not be 0")]
+    InvalidAnimationLimit,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -271,6 +279,17 @@ impl Config {
         if self.transform.default_quality < 1 || self.transform.default_quality > 100 {
             return Err(ConfigError::InvalidQuality);
         }
+        if self.server.max_connections == 0 || self.server.max_request_size == 0 {
+            return Err(ConfigError::InvalidServerLimit);
+        }
+        if self.cache.enabled
+            && (self.cache.max_size_bytes == 0 || self.cache.default_ttl_seconds == 0)
+        {
+            return Err(ConfigError::InvalidCacheLimit);
+        }
+        if self.transform.max_frames == 0 || self.transform.max_animated_pixels == 0 {
+            return Err(ConfigError::InvalidAnimationLimit);
+        }
         if self.origin.origin_type == OriginType::Http && !has_http_scheme(&self.origin.base_url) {
             return Err(ConfigError::InvalidUrl);
         }
@@ -446,6 +465,59 @@ mod tests {
         let mut cfg = Config::defaults();
         cfg.transform.max_height = 0;
         assert_eq!(cfg.validate(), Err(ConfigError::InvalidDimension));
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_connections() {
+        let mut cfg = Config::defaults();
+        cfg.server.max_connections = 0;
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidServerLimit));
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_request_size() {
+        let mut cfg = Config::defaults();
+        cfg.server.max_request_size = 0;
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidServerLimit));
+    }
+
+    #[test]
+    fn validate_rejects_zero_cache_max_size_bytes_when_cache_enabled() {
+        let mut cfg = Config::defaults();
+        cfg.cache.enabled = true;
+        cfg.cache.max_size_bytes = 0;
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidCacheLimit));
+    }
+
+    #[test]
+    fn validate_rejects_zero_cache_ttl_when_cache_enabled() {
+        let mut cfg = Config::defaults();
+        cfg.cache.enabled = true;
+        cfg.cache.default_ttl_seconds = 0;
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidCacheLimit));
+    }
+
+    #[test]
+    fn validate_accepts_zero_cache_limits_when_cache_disabled() {
+        let mut cfg = Config::defaults();
+        cfg.cache.enabled = false;
+        cfg.cache.max_size_bytes = 0;
+        cfg.cache.default_ttl_seconds = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_frames() {
+        let mut cfg = Config::defaults();
+        cfg.transform.max_frames = 0;
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidAnimationLimit));
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_animated_pixels() {
+        let mut cfg = Config::defaults();
+        cfg.transform.max_animated_pixels = 0;
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidAnimationLimit));
     }
 
     #[test]
