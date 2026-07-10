@@ -1,22 +1,24 @@
-# release-plz configuration. imgx is a deployed application (Docker image
-# via .github/workflows/docker.yml), not a crates.io library, so
-# publish = false everywhere -- release-plz still handles version bumping,
-# CHANGELOG.md generation, and GitHub releases from Conventional Commits.
+# release-plz configuration. Handles version bumping, CHANGELOG.md
+# generation, GitHub releases, and crates.io publishing from Conventional
+# Commits. imgx is also shipped as a Docker image (.github/workflows/docker.yml)
+# independent of the crates.io release.
 # https://release-plz.dev/docs/config
 
 [workspace]
-publish = false
 changelog_update = true
 git_release_enable = true
 git_tag_enable = true
 pr_labels = ["release"]
+
+# imgx-vips must publish before imgx (imgx depends on it) -- release-plz
+# orders publishes by the dependency graph automatically.
+[[package]]
+name = "imgx"
 semver_check = false # binary application, no public API to check
 
 [[package]]
-name = "imgx"
-
-[[package]]
 name = "imgx-vips"
+semver_check = true # published library -- catch breaking FFI/API changes
 
 # Mirrors cliff.toml's commit types/scopes (see CLAUDE.md's Commit
 # Convention section) so the generated CHANGELOG.md groups entries the

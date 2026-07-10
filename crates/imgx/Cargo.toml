@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+description = "Fast, single-binary image proxy and transformation server built on libvips"
+readme = "../../README.md"
+keywords = ["image", "proxy", "libvips", "transform", "http"]
+categories = ["multimedia::images", "web-programming::http-server"]
 
 [[bin]]
 name = "imgx"
@@ -14,7 +19,7 @@ name = "imgx"
 path = "src/lib.rs"
 
 [dependencies]
-imgx-vips = { path = "../imgx-vips" }
+imgx-vips = { path = "../imgx-vips", version = "0.1.1" }
 tracing = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+description = "Hand-rolled libvips FFI bindings and RAII wrapper used internally by imgx"
+keywords = ["libvips", "vips", "ffi", "image"]
+categories = ["multimedia::images", "external-ffi-bindings"]
 
 [dependencies]
 libc = "0.2"
