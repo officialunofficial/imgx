@@ -40,7 +40,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install libvips
-        run: sudo apt-get update && sudo apt-get install -y libvips-dev
+        # libheif-plugin-aomenc (the AV1 encoder AVIF output needs) is a
+        # Recommends-only dependency of libheif-dev, and GHA runners disable
+        # auto-installing recommends -- install it explicitly or AVIF-saving
+        # tests fail here while passing on any dev machine with recommends on.
+        run: sudo apt-get update && sudo apt-get install -y libvips-dev libheif-plugin-aomenc
 
       - uses: Swatinem/rust-cache@v2
 
