@@ -1,7 +1,7 @@
 # Clippy configuration for the imgx workspace.
 # https://doc.rust-lang.org/clippy/lint_configuration.html
 
-msrv = "1.80"
+msrv = "1.96"
 
 # imgx-vips's FFI layer is inherently pointer/arg-heavy (mirroring
 # libvips' own C signatures); keep the arity threshold a little looser

@@ -164,11 +164,7 @@ fn sanitize_key(key: &str) -> Option<String> {
         out.push(ch);
         prev_slash = ch == '/';
     }
-    if out.contains("..") {
-        None
-    } else {
-        Some(out)
-    }
+    if out.contains("..") { None } else { Some(out) }
 }
 
 #[cfg(test)]

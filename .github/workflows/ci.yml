@@ -8,6 +8,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # sccache and incremental compilation are incompatible ("incremental
+  # compilation is prohibited: Unset CARGO_INCREMENTAL to continue").
+  CARGO_INCREMENTAL: "0"
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   lint:
@@ -20,9 +25,14 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install libvips
-        run: sudo apt-get update && sudo apt-get install -y libvips-dev
+      - name: Install libvips (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libvips-dev
+          version: "1.0"
+          execute_install_scripts: true
 
+      - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
@@ -39,17 +49,48 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install libvips
-        # libheif-plugin-aomenc (the AV1 encoder AVIF output needs) is a
-        # Recommends-only dependency of libheif-dev, and GHA runners disable
-        # auto-installing recommends -- install it explicitly or AVIF-saving
-        # tests fail here while passing on any dev machine with recommends on.
-        run: sudo apt-get update && sudo apt-get install -y libvips-dev libheif-plugin-aomenc
+      # libheif-plugin-aomenc (the AV1 encoder AVIF output needs) is a
+      # Recommends-only dependency of libheif-dev, and GHA runners disable
+      # auto-installing recommends -- install it explicitly or AVIF-saving
+      # tests fail here while passing on any dev machine with recommends on.
+      - name: Install libvips (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libvips-dev libheif-plugin-aomenc
+          version: "1.0"
+          execute_install_scripts: true
 
+      - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
         run: cargo test --workspace
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (MSRV)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Keep in sync with rust-version in Cargo.toml and msrv in
+          # clippy.toml. `stable` in the other jobs floats forward and
+          # would never catch a genuine MSRV regression on its own.
+          toolchain: "1.96"
+
+      - name: Install libvips (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libvips-dev
+          version: "1.0"
+          execute_install_scripts: true
+
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check on MSRV
+        run: cargo check --workspace --all-targets
 
   coverage:
     runs-on: ubuntu-latest
@@ -61,17 +102,38 @@ jobs:
         with:
           components: llvm-tools-preview
 
-      - name: Install libvips
-        run: sudo apt-get update && sudo apt-get install -y libvips-dev libheif-plugin-aomenc
+      - name: Install libvips (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libvips-dev libheif-plugin-aomenc
+          version: "1.0"
+          execute_install_scripts: true
 
       - uses: taiki-e/install-action@cargo-llvm-cov
-
+      - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
 
       # Visibility only for now, no --fail-under-* threshold -- this
       # establishes a baseline before turning it into a hard gate.
       - name: Generate coverage summary
         run: cargo llvm-cov --workspace --summary-only >> "$GITHUB_STEP_SUMMARY"
+
+  deny:
+    runs-on: ubuntu-latest
+    # cargo-deny-action runs cargo inside its own Docker container, which
+    # doesn't have sccache installed -- the workflow-level RUSTC_WRAPPER
+    # env leaking in here makes every rustc invocation fail immediately
+    # ("could not execute process `sccache ...`"). This job doesn't
+    # compile anything itself, so there's nothing sccache would help with
+    # anyway; just unset it.
+    env:
+      RUSTC_WRAPPER: ""
+      SCCACHE_GHA_ENABLED: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
 
   build:
     needs: [lint, test]
@@ -82,9 +144,14 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install libvips
-        run: sudo apt-get update && sudo apt-get install -y libvips-dev
+      - name: Install libvips (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libvips-dev
+          version: "1.0"
+          execute_install_scripts: true
 
+      - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
 
       - name: Build (release)

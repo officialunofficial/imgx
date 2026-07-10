@@ -1,6 +1,8 @@
 # --- Build stage ---
 FROM rust:alpine AS build
 
+ARG TARGETARCH
+
 RUN apk add --no-cache vips-dev musl-dev pkgconfig cmake make g++
 
 WORKDIR /app
@@ -9,7 +11,18 @@ COPY .cargo/ .cargo/
 COPY crates/ crates/
 COPY test/ test/
 
-RUN cargo build --release -p imgx
+# Cache mounts persist independently of layer invalidation (unlike a
+# plain COPY+RUN layer, which invalidates on almost every commit since
+# crates/ changes constantly) -- id is scoped per architecture since
+# docker.yml builds amd64/arm64 concurrently and the mounts would
+# otherwise corrupt each other. The compiled binary is copied out to a
+# non-cache-mounted path before the mount unmounts: anything left inside
+# a cache mount is invisible to the later `COPY --from=build`.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETARCH} \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-${TARGETARCH} \
+    --mount=type=cache,target=/app/target,id=cargo-target-${TARGETARCH} \
+    cargo build --release -p imgx && \
+    cp target/release/imgx /usr/local/bin/imgx
 
 # --- Runtime stage ---
 FROM alpine
@@ -23,7 +36,7 @@ FROM alpine
 # container support with no usable encoder).
 RUN apk add --no-cache vips vips-heif libheif-aom
 
-COPY --from=build /app/target/release/imgx /usr/local/bin/imgx
+COPY --from=build /usr/local/bin/imgx /usr/local/bin/imgx
 
 EXPOSE 8080
 

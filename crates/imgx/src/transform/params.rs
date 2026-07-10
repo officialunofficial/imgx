@@ -380,15 +380,15 @@ impl TransformParams {
     /// See docs/INVARIANTS.md INV-6 — this is the sole gate before values
     /// reach libvips FFI calls that do not themselves validate ranges.
     pub fn validate(&self) -> Result<(), ParseError> {
-        if let Some(w) = self.width {
-            if !(1..=8192).contains(&w) {
-                return Err(ParseError::InvalidWidth);
-            }
+        if let Some(w) = self.width
+            && !(1..=8192).contains(&w)
+        {
+            return Err(ParseError::InvalidWidth);
         }
-        if let Some(h) = self.height {
-            if !(1..=8192).contains(&h) {
-                return Err(ParseError::InvalidHeight);
-            }
+        if let Some(h) = self.height
+            && !(1..=8192).contains(&h)
+        {
+            return Err(ParseError::InvalidHeight);
         }
         if !(1..=100).contains(&self.quality) {
             return Err(ParseError::InvalidQuality);
@@ -396,45 +396,45 @@ impl TransformParams {
         if !(1.0..=5.0).contains(&self.dpr) {
             return Err(ParseError::InvalidDpr);
         }
-        if let Some(v) = self.sharpen {
-            if !(0.0..=10.0).contains(&v) {
-                return Err(ParseError::InvalidSharpen);
-            }
+        if let Some(v) = self.sharpen
+            && !(0.0..=10.0).contains(&v)
+        {
+            return Err(ParseError::InvalidSharpen);
         }
-        if let Some(v) = self.blur {
-            if !(0.1..=250.0).contains(&v) {
-                return Err(ParseError::InvalidBlur);
-            }
+        if let Some(v) = self.blur
+            && !(0.1..=250.0).contains(&v)
+        {
+            return Err(ParseError::InvalidBlur);
         }
-        if let Some(v) = self.brightness {
-            if !(0.0..=2.0).contains(&v) {
-                return Err(ParseError::InvalidBrightness);
-            }
+        if let Some(v) = self.brightness
+            && !(0.0..=2.0).contains(&v)
+        {
+            return Err(ParseError::InvalidBrightness);
         }
-        if let Some(v) = self.contrast {
-            if !(0.0..=2.0).contains(&v) {
-                return Err(ParseError::InvalidContrast);
-            }
+        if let Some(v) = self.contrast
+            && !(0.0..=2.0).contains(&v)
+        {
+            return Err(ParseError::InvalidContrast);
         }
-        if let Some(v) = self.saturation {
-            if !(0.0..=2.0).contains(&v) {
-                return Err(ParseError::InvalidSaturation);
-            }
+        if let Some(v) = self.saturation
+            && !(0.0..=2.0).contains(&v)
+        {
+            return Err(ParseError::InvalidSaturation);
         }
-        if let Some(v) = self.gamma {
-            if !(0.1..=10.0).contains(&v) {
-                return Err(ParseError::InvalidGamma);
-            }
+        if let Some(v) = self.gamma
+            && !(0.1..=10.0).contains(&v)
+        {
+            return Err(ParseError::InvalidGamma);
         }
-        if let Some(v) = self.trim {
-            if !(1.0..=100.0).contains(&v) {
-                return Err(ParseError::InvalidTrim);
-            }
+        if let Some(v) = self.trim
+            && !(1.0..=100.0).contains(&v)
+        {
+            return Err(ParseError::InvalidTrim);
         }
-        if let Some(f) = self.frame {
-            if f > 999 {
-                return Err(ParseError::InvalidFrame);
-            }
+        if let Some(f) = self.frame
+            && f > 999
+        {
+            return Err(ParseError::InvalidFrame);
         }
         Ok(())
     }
@@ -764,12 +764,14 @@ mod tests {
 
     #[test]
     fn sharpen_bounds_validation() {
-        assert!(TransformParams {
-            sharpen: Some(5.0),
-            ..Default::default()
-        }
-        .validate()
-        .is_ok());
+        assert!(
+            TransformParams {
+                sharpen: Some(5.0),
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
         assert_eq!(
             TransformParams {
                 sharpen: Some(11.0),
@@ -790,12 +792,14 @@ mod tests {
 
     #[test]
     fn blur_bounds_validation() {
-        assert!(TransformParams {
-            blur: Some(1.0),
-            ..Default::default()
-        }
-        .validate()
-        .is_ok());
+        assert!(
+            TransformParams {
+                blur: Some(1.0),
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
         assert_eq!(
             TransformParams {
                 blur: Some(300.0),
@@ -816,12 +820,14 @@ mod tests {
 
     #[test]
     fn dpr_bounds_validation() {
-        assert!(TransformParams {
-            dpr: 2.5,
-            ..Default::default()
-        }
-        .validate()
-        .is_ok());
+        assert!(
+            TransformParams {
+                dpr: 2.5,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
         assert_eq!(
             TransformParams {
                 dpr: 0.5,
@@ -881,18 +887,22 @@ mod tests {
 
     #[test]
     fn width_boundary_values() {
-        assert!(TransformParams {
-            width: Some(1),
-            ..Default::default()
-        }
-        .validate()
-        .is_ok());
-        assert!(TransformParams {
-            width: Some(8192),
-            ..Default::default()
-        }
-        .validate()
-        .is_ok());
+        assert!(
+            TransformParams {
+                width: Some(1),
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            TransformParams {
+                width: Some(8192),
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
         assert_eq!(
             TransformParams {
                 width: Some(8193),
@@ -979,12 +989,14 @@ mod tests {
 
     #[test]
     fn brightness_bounds_validation() {
-        assert!(TransformParams {
-            brightness: Some(1.0),
-            ..Default::default()
-        }
-        .validate()
-        .is_ok());
+        assert!(
+            TransformParams {
+                brightness: Some(1.0),
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
         assert_eq!(
             TransformParams {
                 brightness: Some(2.1),
@@ -997,12 +1009,14 @@ mod tests {
 
     #[test]
     fn contrast_bounds_validation() {
-        assert!(TransformParams {
-            contrast: Some(0.0),
-            ..Default::default()
-        }
-        .validate()
-        .is_ok());
+        assert!(
+            TransformParams {
+                contrast: Some(0.0),
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
         assert_eq!(
             TransformParams {
                 contrast: Some(2.1),
@@ -1015,12 +1029,14 @@ mod tests {
 
     #[test]
     fn saturation_bounds_validation() {
-        assert!(TransformParams {
-            saturation: Some(1.5),
-            ..Default::default()
-        }
-        .validate()
-        .is_ok());
+        assert!(
+            TransformParams {
+                saturation: Some(1.5),
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
         assert_eq!(
             TransformParams {
                 saturation: Some(2.1),
@@ -1033,12 +1049,14 @@ mod tests {
 
     #[test]
     fn gamma_bounds_validation() {
-        assert!(TransformParams {
-            gamma: Some(2.2),
-            ..Default::default()
-        }
-        .validate()
-        .is_ok());
+        assert!(
+            TransformParams {
+                gamma: Some(2.2),
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
         assert_eq!(
             TransformParams {
                 gamma: Some(0.05),
@@ -1101,12 +1119,14 @@ mod tests {
 
     #[test]
     fn trim_bounds_validation() {
-        assert!(TransformParams {
-            trim: Some(50.0),
-            ..Default::default()
-        }
-        .validate()
-        .is_ok());
+        assert!(
+            TransformParams {
+                trim: Some(50.0),
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
         assert_eq!(
             TransformParams {
                 trim: Some(0.5),

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use imgx::config::Config;
-use imgx::server::{build_router, AppState};
+use imgx::server::{AppState, build_router};
 
 // jemalloc handles the cache/pipeline's alloc-heavy, multi-threaded churn
 // (frequent same-sized image-buffer alloc/free across tokio worker

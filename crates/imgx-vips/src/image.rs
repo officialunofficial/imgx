@@ -1,11 +1,11 @@
-use std::ffi::{c_void, CString};
+use std::ffi::{CString, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use libc::{c_char, size_t};
 
-use crate::error::{last_vips_error, VipsError};
+use crate::error::{VipsError, last_vips_error};
 use crate::ffi;
 
 static VIPS_INIT: Once = Once::new();
@@ -561,11 +561,7 @@ pub fn arrayjoin_vertical(images: &[VipsImage]) -> Result<VipsImage, VipsError> 
 }
 
 fn bool_to_int(v: bool) -> i32 {
-    if v {
-        1
-    } else {
-        0
-    }
+    if v { 1 } else { 0 }
 }
 
 fn op_result(

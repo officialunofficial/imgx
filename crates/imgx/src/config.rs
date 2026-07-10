@@ -23,13 +23,13 @@ pub enum ConfigError {
     InvalidUrl,
     #[error("invalid configuration value")]
     InvalidValue,
-    #[error("R2 origin requires endpoint, access_key_id, secret_access_key, and both bucket names to be set")]
+    #[error(
+        "R2 origin requires endpoint, access_key_id, secret_access_key, and both bucket names to be set"
+    )]
     MissingR2Config,
     #[error("server max_connections and max_request_size must not be 0")]
     InvalidServerLimit,
-    #[error(
-        "cache max_size_bytes and default_ttl_seconds must not be 0 when the cache is enabled"
-    )]
+    #[error("cache max_size_bytes and default_ttl_seconds must not be 0 when the cache is enabled")]
     InvalidCacheLimit,
     #[error("transform max_frames and max_animated_pixels must not be 0")]
     InvalidAnimationLimit,

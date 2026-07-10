@@ -7,16 +7,16 @@
 //! "reject new work under saturation rather than queueing it unboundedly,"
 //! not the specific mechanism.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use axum::Router;
 use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode, Uri};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::Router;
 use tokio::sync::Semaphore;
 use tower::ServiceBuilder;
 
@@ -253,7 +253,7 @@ async fn handle_image_request(
         Err(_) => {
             return error_response(HttpError::bad_request(Some(
                 "invalid transform parameters".to_string(),
-            )))
+            )));
         }
     };
     if tp.validate().is_err() {
@@ -292,22 +292,22 @@ async fn handle_image_request(
         Err(FetchError::NotFound) => {
             return error_response(HttpError::not_found(Some(
                 "image not found at origin".to_string(),
-            )))
+            )));
         }
         Err(FetchError::Timeout) => {
             return error_response(HttpError::gateway_timeout(Some(
                 "origin server timed out".to_string(),
-            )))
+            )));
         }
         Err(FetchError::ResponseTooLarge) => {
             return error_response(HttpError::payload_too_large(Some(
                 "image exceeds size limit".to_string(),
-            )))
+            )));
         }
         Err(_) => {
             return error_response(HttpError::bad_gateway(Some(
                 "failed to fetch from origin".to_string(),
-            )))
+            )));
         }
     };
 
