@@ -104,6 +104,15 @@ jobs:
 
   deny:
     runs-on: ubuntu-latest
+    # cargo-deny-action runs cargo inside its own Docker container, which
+    # doesn't have sccache installed -- the workflow-level RUSTC_WRAPPER
+    # env leaking in here makes every rustc invocation fail immediately
+    # ("could not execute process `sccache ...`"). This job doesn't
+    # compile anything itself, so there's nothing sccache would help with
+    # anyway; just unset it.
+    env:
+      RUSTC_WRAPPER: ""
+      SCCACHE_GHA_ENABLED: ""
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
