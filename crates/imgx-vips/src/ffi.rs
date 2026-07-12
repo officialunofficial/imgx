@@ -139,6 +139,16 @@ unsafe extern "C" {
         out: *mut *mut VipsImage,
         ...
     ) -> c_int;
+    // Verified against /usr/include/vips/conversion.h (installed libvips
+    // 8.15.1): `int vips_composite2(VipsImage *base, VipsImage *overlay,
+    // VipsImage **out, VipsBlendMode mode, ...)`.
+    pub fn vips_composite2(
+        base: *mut VipsImage,
+        overlay: *mut VipsImage,
+        out: *mut *mut VipsImage,
+        mode: c_int,
+        ...
+    ) -> c_int;
 
     // -- save --
     pub fn vips_jpegsave_buffer(
@@ -213,3 +223,6 @@ pub const VIPS_EXTEND_REPEAT: c_int = 2;
 pub const VIPS_EXTEND_MIRROR: c_int = 3;
 pub const VIPS_EXTEND_WHITE: c_int = 4;
 pub const VIPS_EXTEND_BACKGROUND: c_int = 5;
+
+// VipsBlendMode (subset used by the pipeline)
+pub const VIPS_BLEND_MODE_OVER: c_int = 2;

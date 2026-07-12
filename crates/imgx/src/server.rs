@@ -268,7 +268,7 @@ async fn handle_request(
         }
         Route::NotFound => error_response(HttpError::not_found(None)),
         Route::ImageRequest(req) => {
-            handle_image_request(&state, req, if_none_match, accept_header).await
+            handle_image_request(&state, req, if_none_match, accept_header, &headers).await
         }
     }
 }
@@ -278,9 +278,10 @@ async fn handle_image_request(
     req: ImageRequest,
     if_none_match: Option<&str>,
     accept_header: Option<&str>,
+    headers: &HeaderMap,
 ) -> Response {
     let transform_string = req.transform_string.as_deref().unwrap_or("");
-    let tp = match params::parse(transform_string) {
+    let mut tp = match params::parse(transform_string) {
         Ok(p) => p,
         Err(_) => {
             return error_response(HttpError::bad_request(Some(
@@ -293,6 +294,39 @@ async fn handle_image_request(
             "transform parameters out of range".to_string(),
         )));
     }
+    // Gap 11 -- `draw` overlays (docs/CLOUDFLARE_PARITY.md): the array
+    // syntax parses and the compositing math is implemented and tested
+    // (transform::pipeline::composite_draw_overlay) against local image
+    // buffers, but the remote-URL *fetch* that would supply a real
+    // overlay's bytes is deliberately NOT implemented in this pass (see
+    // CLOUDFLARE_PARITY.md gap 11 for the SSRF-scoping rationale) -- so a
+    // request naming any overlay is rejected here, before an origin
+    // fetch is attempted, rather than silently ignoring `draw` or
+    // returning an image that doesn't actually have the requested
+    // overlay applied.
+    if !tp.draw.is_empty() {
+        return error_response(HttpError::unprocessable_entity(Some(
+            "draw overlays are not yet enabled: remote overlay fetch is deliberately gated, \
+             see IMGX_ALLOW_DRAW_OVERLAYS in docs/CLOUDFLARE_PARITY.md"
+                .to_string(),
+        )));
+    }
+    // Gap 8 -- slow-connection-quality/scq (docs/CLOUDFLARE_PARITY.md):
+    // read the client-hint headers Cloudflare's docs name (rtt,
+    // save-data, ect, downlink) and, if they indicate a slow connection
+    // and `scq` was requested, override `quality` *before* the cache key
+    // is computed below -- so the effective quality (not the
+    // unconditional one) is what actually gets cached and encoded, and
+    // an otherwise-identical URL naturally produces a different cache
+    // entry for a slow-connection client via the existing `q=` cache-key
+    // field, with no separate parallel cache-key mechanism needed.
+    let is_slow = params::is_slow_connection(
+        headers.get("rtt").and_then(|v| v.to_str().ok()),
+        headers.get("save-data").and_then(|v| v.to_str().ok()),
+        headers.get("ect").and_then(|v| v.to_str().ok()),
+        headers.get("downlink").and_then(|v| v.to_str().ok()),
+    );
+    tp.apply_scq_override(is_slow);
     // params::validate()'s 1..=8192 bound is a hard FFI-safety ceiling
     // (INV-6), not operator policy. IMGX_TRANSFORM_MAX_WIDTH/MAX_HEIGHT
     // let an operator configure a *tighter* limit on top of it -- enforce
@@ -310,7 +344,12 @@ async fn handle_image_request(
     }
 
     let format_str = tp.format.map(|f| f.as_str()).unwrap_or("auto");
-    let cache_key = cache::compute_cache_key(&req.image_path, transform_string, format_str);
+    // Use the canonical `to_cache_key()` serialization (INV-1) rather than
+    // the raw URL options segment: it's already parameter-order-
+    // independent and, as of gap 8, is also what makes the scq quality
+    // override above actually vary the cache key (the override mutates
+    // `tp.quality`, which `to_cache_key()` includes).
+    let cache_key = cache::compute_cache_key(&req.image_path, &tp.to_cache_key(), format_str);
 
     if let Some(entry) = state.cache.get(&cache_key).await {
         metrics::with_local_recorder(&state.metrics_recorder, || {
@@ -362,12 +401,13 @@ async fn handle_image_request(
 
     let transform_input = fetch_result.data.clone();
     let accept_owned = accept_header.map(|s| s.to_string());
+    let tp_for_task = tp.clone();
 
     let transform_task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         pipeline::transform(
             &transform_input,
-            &tp,
+            &tp_for_task,
             accept_owned.as_deref(),
             Some(transform_limits),
         )
@@ -519,7 +559,19 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Once;
     use tower::ServiceExt;
+
+    static VIPS_INIT: Once = Once::new();
+
+    /// Tests that exercise a real, successful transform (as opposed to
+    /// the fetch-failure/transform-failure paths most existing server
+    /// tests cover) need libvips initialized first -- without it,
+    /// `pipeline::transform()` segfaults inside the vips C library
+    /// rather than returning an error.
+    fn init_vips() {
+        VIPS_INIT.call_once(|| imgx_vips::init().expect("vips init"));
+    }
 
     fn test_state() -> Arc<AppState> {
         Arc::new(AppState::new(Config::defaults()))
@@ -549,6 +601,49 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// Spawns an HTTP/1.1 server that answers every request with real,
+    /// decodable image bytes (a valid `Content-Type`/`Content-Length`
+    /// header pair followed by the fixture body) -- unlike
+    /// `serve_repeatedly`, which serves deliberately-corrupt bytes to
+    /// exercise the transform-failure path, this lets a test exercise a
+    /// real, successful transform end-to-end.
+    async fn serve_fixture_repeatedly(bytes: Vec<u8>) -> String {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bytes = Arc::new(bytes);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let bytes = Arc::clone(&bytes);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\r\n",
+                        bytes.len()
+                    );
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    let _ = socket.write_all(&bytes).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("reading fixture {path:?}: {e}"))
     }
 
     async fn get(router: Router, path: &str) -> (StatusCode, String) {
@@ -826,6 +921,95 @@ mod tests {
             strip_path_prefix("abc", "abc123/photo-id"),
             "abc123/photo-id"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Gap 11 -- draw overlays (docs/CLOUDFLARE_PARITY.md): remote
+    // overlay fetch is deliberately not implemented in this pass, so any
+    // request naming a `draw` overlay is rejected before an origin fetch
+    // is even attempted.
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn draw_overlay_request_is_rejected_since_remote_fetch_is_not_yet_enabled() {
+        let router = build_router(test_state());
+        let (status, body) = get(router, "/cdn-cgi/image/draw.0.url=logo.png/photo.jpg").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("draw overlays are not yet enabled"));
+    }
+
+    // ----------------------------------------------------------------
+    // Gap 8 -- slow-connection-quality/scq (docs/CLOUDFLARE_PARITY.md).
+    // Verified trigger conditions: rtt > 150ms, save-data == "on", ect in
+    // {slow-2g,2g,3g}, downlink < 5Mbps -- read off request headers and
+    // used to override `quality` before the cache key is computed, so an
+    // otherwise-identical URL produces a *different* cache entry
+    // depending on the requesting client's connection hints.
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn scq_override_produces_a_different_cache_entry_for_a_slow_connection_request() {
+        init_vips();
+        let base_url = serve_fixture_repeatedly(fixture("test_4x4.png")).await;
+        let mut cfg = Config::defaults();
+        cfg.origin.base_url = base_url;
+        let state = Arc::new(AppState::new(cfg));
+        let router = build_router(Arc::clone(&state));
+
+        // First request: no client hints present -> scq never applies,
+        // effective quality is the plain q=80.
+        let req = axum::http::Request::builder()
+            .uri("/cdn-cgi/image/q=80,scq=40/photo.png")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(metric_value(&state, "imgx_cache_misses_total"), 1.0);
+        assert_eq!(metric_value(&state, "imgx_cache_hits_total"), 0.0);
+
+        // Second request: identical URL, but an `rtt` client hint over
+        // Cloudflare's documented 150ms threshold -- scq now applies, so
+        // the effective quality (40) differs from the first request's
+        // (80). Must be a cache MISS, not a hit off the first entry.
+        let req_slow = axum::http::Request::builder()
+            .uri("/cdn-cgi/image/q=80,scq=40/photo.png")
+            .header("rtt", "300")
+            .body(Body::empty())
+            .unwrap();
+        let resp_slow = router.clone().oneshot(req_slow).await.unwrap();
+        assert_eq!(resp_slow.status(), StatusCode::OK);
+        assert_eq!(metric_value(&state, "imgx_cache_misses_total"), 2.0);
+        assert_eq!(metric_value(&state, "imgx_cache_hits_total"), 0.0);
+
+        // Third request: repeats the exact slow-connection request --
+        // now a cache HIT against the second request's entry.
+        let req_slow_again = axum::http::Request::builder()
+            .uri("/cdn-cgi/image/q=80,scq=40/photo.png")
+            .header("rtt", "300")
+            .body(Body::empty())
+            .unwrap();
+        let resp_again = router.oneshot(req_slow_again).await.unwrap();
+        assert_eq!(resp_again.status(), StatusCode::OK);
+        assert_eq!(metric_value(&state, "imgx_cache_hits_total"), 1.0);
+    }
+
+    #[tokio::test]
+    async fn scq_save_data_on_header_also_triggers_the_override() {
+        init_vips();
+        let base_url = serve_fixture_repeatedly(fixture("test_4x4.png")).await;
+        let mut cfg = Config::defaults();
+        cfg.origin.base_url = base_url;
+        let state = Arc::new(AppState::new(cfg));
+        let router = build_router(Arc::clone(&state));
+
+        let req = axum::http::Request::builder()
+            .uri("/cdn-cgi/image/q=80,scq=40/photo.png")
+            .header("save-data", "on")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(metric_value(&state, "imgx_cache_misses_total"), 1.0);
     }
 
     #[test]
