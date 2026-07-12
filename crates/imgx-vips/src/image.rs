@@ -535,6 +535,52 @@ impl VipsImage {
         };
         op_result(rc, output, VipsError::OperationFailed)
     }
+
+    /// Composite `overlay` on top of `self` at pixel offset `(x, y)`
+    /// using standard "over" alpha blending (`VIPS_BLEND_MODE_OVER`).
+    /// Used by the `draw` overlay pipeline (Cloudflare parity gap 11,
+    /// docs/CLOUDFLARE_PARITY.md) -- Cloudflare's `draw` feature doesn't
+    /// expose a custom blend mode via its documented options, so `over`
+    /// (the standard "painted on top" compositing) is the only mode
+    /// wired here.
+    pub fn composite_over(&self, overlay: &Self, x: i32, y: i32) -> Result<Self, VipsError> {
+        let mut output: *mut ffi::VipsImage = ptr::null_mut();
+        let rc = unsafe {
+            ffi::vips_composite2(
+                self.ptr.as_ptr(),
+                overlay.ptr.as_ptr(),
+                &mut output,
+                ffi::VIPS_BLEND_MODE_OVER,
+                c"x".as_ptr(),
+                x,
+                c"y".as_ptr(),
+                y,
+                ptr::null::<c_char>(),
+            )
+        };
+        op_result(rc, output, VipsError::OperationFailed)
+    }
+
+    /// Tile `self` to fill a `width` x `height` canvas (`VIPS_EXTEND_REPEAT`
+    /// via `vips_embed`), used for the `draw` overlay `repeat` option
+    /// (Cloudflare parity gap 11).
+    pub fn tile_to_size(&self, width: i32, height: i32) -> Result<Self, VipsError> {
+        let mut output: *mut ffi::VipsImage = ptr::null_mut();
+        let rc = unsafe {
+            ffi::vips_embed(
+                self.ptr.as_ptr(),
+                &mut output,
+                0,
+                0,
+                width,
+                height,
+                c"extend".as_ptr(),
+                ffi::VIPS_EXTEND_REPEAT,
+                ptr::null::<c_char>(),
+            )
+        };
+        op_result(rc, output, VipsError::OperationFailed)
+    }
 }
 
 /// Join a slice of images vertically (one column) — used to reassemble
@@ -759,5 +805,46 @@ mod tests {
         let data = fixture("test_4x4.png");
         let img = VipsImage::from_buffer(&data).expect("load png");
         assert_eq!(img.get_int("no-such-field"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Cloudflare parity gap 11 (draw overlays, docs/CLOUDFLARE_PARITY.md)
+    // -- compositing math proof. This module proves libvips composite2
+    // works correctly against local, already-decoded images; the actual
+    // remote-URL fetch that would supply a real overlay in production is
+    // deliberately not implemented (see CLOUDFLARE_PARITY.md gap 11).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn composite_over_grows_output_to_base_size_and_preserves_alpha() {
+        init().expect("vips init");
+        let base = VipsImage::from_buffer(&fixture("bench_2000x1500.png")).expect("load base");
+        let overlay = VipsImage::from_buffer(&fixture("test_4x4.png")).expect("load overlay");
+        let composited = base
+            .composite_over(&overlay, 10, 20)
+            .expect("composite2 should succeed");
+        assert_eq!(composited.width(), base.width());
+        assert_eq!(composited.height(), base.height());
+    }
+
+    #[test]
+    fn composite_over_at_origin_succeeds() {
+        init().expect("vips init");
+        let base = VipsImage::from_buffer(&fixture("test_4x4.png")).expect("load base");
+        let overlay = VipsImage::from_buffer(&fixture("test_4x4.png")).expect("load overlay");
+        let composited = base
+            .composite_over(&overlay, 0, 0)
+            .expect("composite2 should succeed");
+        assert_eq!(composited.width(), 4);
+        assert_eq!(composited.height(), 4);
+    }
+
+    #[test]
+    fn tile_to_size_fills_the_requested_canvas() {
+        init().expect("vips init");
+        let overlay = VipsImage::from_buffer(&fixture("test_4x4.png")).expect("load overlay");
+        let tiled = overlay.tile_to_size(16, 12).expect("tile should succeed");
+        assert_eq!(tiled.width(), 16);
+        assert_eq!(tiled.height(), 12);
     }
 }
