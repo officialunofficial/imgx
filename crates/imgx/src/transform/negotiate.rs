@@ -23,7 +23,14 @@ impl AcceptResult {
             OutputFormat::Jpeg => self.supports_jpeg || self.wildcard,
             OutputFormat::Png => self.supports_png || self.wildcard,
             OutputFormat::Gif => self.supports_gif || self.wildcard,
+            OutputFormat::BaselineJpeg => self.supports_jpeg || self.wildcard,
             OutputFormat::Auto => true,
+            // Never reached via negotiate_format/negotiate_animated_format:
+            // both short-circuit on any explicit non-Auto format before
+            // calling supports(), and Json is never itself negotiated
+            // against (pipeline.rs negotiates a real codec for the JSON
+            // response's "transformed" stats separately).
+            OutputFormat::Json => true,
         }
     }
 }
