@@ -730,9 +730,7 @@ impl TransformParams {
     /// `to_cache_key`/`transform` so the effective quality -- not the
     /// unconditional one -- is what actually gets cached and encoded.
     pub fn apply_scq_override(&mut self, is_slow: bool) {
-        if is_slow
-            && let Some(v) = self.scq
-        {
+        if is_slow && let Some(v) = self.scq {
             self.quality = v;
         }
     }
@@ -820,7 +818,10 @@ impl TransformParams {
             parts.push(format!("border={v}"));
         }
         if let Some(bg) = self.border_color {
-            parts.push(format!("border.color={:02X}{:02X}{:02X}", bg[0], bg[1], bg[2]));
+            parts.push(format!(
+                "border.color={:02X}{:02X}{:02X}",
+                bg[0], bg[1], bg[2]
+            ));
         }
         if let Some(v) = self.border_top {
             parts.push(format!("border.top={v}"));
@@ -963,8 +964,7 @@ pub fn parse(input: &str) -> Result<TransformParams, ParseError> {
                 params.border_width = Some(parse_u32(value).ok_or(ParseError::InvalidBorder)?)
             }
             "border.color" => {
-                params.border_color =
-                    Some(parse_hex_color(value).ok_or(ParseError::InvalidBorder)?)
+                params.border_color = Some(parse_hex_color(value).ok_or(ParseError::InvalidBorder)?)
             }
             "border.top" => {
                 params.border_top = Some(parse_u32(value).ok_or(ParseError::InvalidBorder)?)
@@ -1025,7 +1025,11 @@ fn parse_f32(s: &str) -> Option<f32> {
 /// Parse one `draw.<N>.<field>` key/value pair into `draw[N]`, growing the
 /// vec with default entries as needed. Capped at 64 entries -- a sane
 /// bound against a pathological URL trying to grow an unbounded `Vec`.
-fn parse_draw_field(draw: &mut Vec<DrawOverlay>, rest: &str, value: &str) -> Result<(), ParseError> {
+fn parse_draw_field(
+    draw: &mut Vec<DrawOverlay>,
+    rest: &str,
+    value: &str,
+) -> Result<(), ParseError> {
     let mut parts = rest.splitn(2, '.');
     let idx_str = parts.next().ok_or(ParseError::InvalidParameter)?;
     let field = parts.next().ok_or(ParseError::InvalidParameter)?;
@@ -2019,10 +2023,7 @@ mod tests {
 
     #[test]
     fn parse_scq_alias_slow_connection_quality() {
-        assert_eq!(
-            parse("slow-connection-quality=50").unwrap().scq,
-            Some(50)
-        );
+        assert_eq!(parse("slow-connection-quality=50").unwrap().scq, Some(50));
     }
 
     #[test]
@@ -2181,9 +2182,14 @@ mod tests {
     /// a verified byte-for-byte match of any real Cloudflare URL form.
     #[test]
     fn parse_draw_single_overlay() {
-        let p = parse("draw.0.url=https://example.com/logo.png,draw.0.width=100,draw.0.opacity=0.5").unwrap();
+        let p =
+            parse("draw.0.url=https://example.com/logo.png,draw.0.width=100,draw.0.opacity=0.5")
+                .unwrap();
         assert_eq!(p.draw.len(), 1);
-        assert_eq!(p.draw[0].url.as_deref(), Some("https://example.com/logo.png"));
+        assert_eq!(
+            p.draw[0].url.as_deref(),
+            Some("https://example.com/logo.png")
+        );
         assert_eq!(p.draw[0].width, Some(100.0));
         assert_eq!(p.draw[0].opacity, Some(0.5));
     }
@@ -2231,8 +2237,7 @@ mod tests {
 
     #[test]
     fn draw_both_left_and_right_returns_error_on_validate() {
-        let p =
-            parse("draw.0.url=https://example.com/a.png,draw.0.left=5,draw.0.right=5").unwrap();
+        let p = parse("draw.0.url=https://example.com/a.png,draw.0.left=5,draw.0.right=5").unwrap();
         assert_eq!(p.validate(), Err(ParseError::InvalidDraw));
     }
 
