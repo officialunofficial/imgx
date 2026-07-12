@@ -22,7 +22,7 @@ Every claim below is marked as one of:
 | # | Gap | Status | Note |
 |---|---|---|---|
 | 1 | URL shape | done | `/cdn-cgi/image/<OPTIONS>/<SOURCE>` — shipped in the prior URL migration (INV-5). |
-| 2 | Arbitrary remote-URL source | not-planned (this pass) | Explicitly out of scope — SSRF/allowlist design needs its own pass (PRD OQ-2). |
+| 2 | Arbitrary remote-URL source | done | Opt-in via `IMGX_ALLOW_REMOTE_SOURCES` (default off), SSRF-safe fetcher. See "Gap 2 — arbitrary remote-URL sources" below. |
 | 3 | `fit` vocabulary | done | See "Gap 3 — fit" below. |
 | 4 | `quality`/`q` perceptual strings | done (spec-derived mapping) | See "Gap 4 — quality" below. |
 | 5 | `format`/`f`: `baseline-jpeg`, `json` | done | See "Gap 5 — format" below. |
@@ -31,7 +31,7 @@ Every claim below is marked as one of:
 | 8 | `slow-connection-quality`/`scq` | done | See "Gap 8 — slow-connection-quality" below. |
 | 9 | `trim` per-side keys | partial | Per-side pixel/fraction crop (`trim.top`/`.right`/`.bottom`/`.left`) implemented; legacy numeric `trim=<threshold>` preserved unchanged. `trim.height`/`trim.width` and the single combined `top;right;bottom;left` syntax are NOT implemented — see "Gap 9 — trim" below. |
 | 10 | `border` | done (spec-derived URL syntax) | See "Gap 10 — border" below. |
-| 11 | `draw` (overlays) | partial (parsing + compositing done, remote fetch deliberately gated) | See "Gap 11 — draw" below. |
+| 11 | `draw` (overlays) | done | Parsing, compositing, and remote overlay fetch (opt-in via `IMGX_ALLOW_DRAW_OVERLAYS`, default off) all shipped. See "Gap 11 — draw" below. |
 | 12 | `gravity`/`g` | partial | Verified side/auto aliases implemented; `face` and `XxY` focal-point coordinates NOT implemented — see "Gap 12 — gravity" below. |
 | 13 | `rotate` ordering | done (verified, already correct) | See "Gap 13 — rotate ordering" below. |
 
@@ -420,22 +420,15 @@ be consistent with imgx's existing dotted-key conventions
 any real Cloudflare URL form — that detail isn't confidently verifiable
 since Cloudflare has never published one.
 
-**Scope decision — option (b) from the task, not option (a)**: implement
-the `draw` array parsing and the libvips compositing pipeline in full,
-proven against local/already-fetched image buffers, but do **not** build
-the actual remote-URL fetch this pass. Reasoning: a correct, safe SSRF-gated
-fetcher (non-http(s) scheme rejection, DNS resolution with private/
-loopback/link-local IP-range rejection, redirect-count capping, response-size
-capping) is a substantial, security-sensitive undertaking in its own right —
-essentially the same shape of problem as gap 2's arbitrary remote-source
-fetch, which this task explicitly keeps out of scope as a separate
-owner-facing decision (PRD OQ-2). Building a second, narrower SSRF-gated
-fetcher just for overlay URLs, correctly, within an already-large multi-gap
-pass, was judged more likely to ship a subtly-wrong security boundary than
-to build it right. Splitting gap 11 into "prove the parsing and compositing
-math work" (done, tested) vs. "fetch arbitrary attacker-influenced URLs
-safely" (deferred, alongside gap 2) keeps the security-sensitive surface
-area unimplemented rather than half-implemented.
+**Updated**: this gap was originally split into "prove the parsing and
+compositing math work" (done in an earlier pass) vs. "fetch arbitrary
+attacker-influenced URLs safely" (deferred alongside gap 2's general
+remote-source fetch, since both need the same SSRF-gated fetcher design).
+That fetcher now exists (`origin::RemoteFetcher`, see "Gap 2 — arbitrary
+remote-URL sources" below) and this gap's remote-fetch half is wired up
+through it, gated on its own `IMGX_ALLOW_DRAW_OVERLAYS` flag (default
+`false`, independent of gap 2's `IMGX_ALLOW_REMOTE_SOURCES` — an operator
+may want overlays without arbitrary main-image sources, or vice versa).
 
 What's implemented and tested:
 
@@ -474,14 +467,109 @@ What's implemented and tested:
   Cloudflare's June 2026 changelog is a distinct, newer feature not covered
   by the docs indexed during this pass, and is out of scope here).
 
-What's deliberately **not** implemented: the remote-URL fetch itself.
-`crates/imgx/src/server.rs`'s `handle_image_request` rejects any request
-naming a `draw` overlay with a `422` before attempting an origin fetch, with
-a message pointing at `IMGX_ALLOW_DRAW_OVERLAYS` — **a reserved name for
-future work, not a config flag that exists in `config.rs` today**. There is
-no fetch code path for such a flag to gate yet in this pass; the name is
-recorded here so that whoever eventually builds gap 2's general SSRF-safe
-remote-source fetcher has a documented, narrower sibling use case to wire
-this feature's `Some(url)` fields into once that fetcher exists, per the
-task's instruction to note this in
-`docs/PRD-workspace-upgrade-and-cloudflare-parity.md`'s open questions.
+**Remote-URL fetch (now implemented)**: `crates/imgx/src/server.rs`'s
+`handle_image_request` checks `IMGX_ALLOW_DRAW_OVERLAYS` before attempting
+any origin fetch — a request naming a `draw` overlay while the flag is
+off is rejected with `403 Forbidden`, no network call attempted. When
+enabled, every `draw[].url` is fetched through `state.remote_fetcher`
+(the same `origin::RemoteFetcher` instance gap 2 uses) after the main
+image fetch and before the transform runs; a failure fetching any
+overlay fails the whole request (mapped through the same
+`remote_fetch_error_to_http` as gap 2, so a disallowed/private-address
+overlay URL also gets `403`). `transform::pipeline::apply_draw_overlays`
+composites the fetched bytes onto the already-transformed base image and
+re-encodes, run inside the same `spawn_blocking` task as the main
+transform (real libvips FFI work, kept off the async runtime thread).
+Skipped (returns the base result unchanged) for animated output — the
+same INV-2-adjacent reasoning the `BORDER` stage already documents, an
+`embed`/composite on a vertically-stacked animated frame buffer would
+corrupt frame boundaries — and for `format=json` (no image bytes to
+composite onto). Tested in `crates/imgx/src/transform/pipeline.rs`
+(`apply_draw_overlays_*`) and `crates/imgx/src/server.rs`
+(`draw_overlay_request_is_rejected_by_default_with_403`,
+`draw_overlay_request_reaches_the_shared_fetcher_when_allowed`,
+`draw_overlay_url_resolving_to_a_private_address_is_rejected_even_when_allowed`).
+
+## Gap 2 — arbitrary remote-URL sources
+
+**Verified** (feature existence) against
+`developers.cloudflare.com/images/optimization/features/` (the URL-format
+section) via the Cloudflare docs MCP tool — Cloudflare's own docs state
+the `<SOURCE-IMAGE>` segment of `/cdn-cgi/image/<OPTIONS>/<SOURCE-IMAGE>`
+"can be a relative path... or an absolute URL." **Not verified from
+published docs**: Cloudflare doesn't publish the SSRF-mitigation details
+of its own remote-fetch implementation (it runs inside Cloudflare's own
+network, a fundamentally different trust boundary than a self-hosted
+imgx deployment) — so the guard design below is imgx's own, spec-derived
+for this self-hosted context, not a claim of matching Cloudflare's
+internals.
+
+Previously deferred twice (the original URL migration, and gap 11's draw
+overlay work), both times because an unguarded arbitrary-URL fetch is a
+textbook SSRF vector and needed its own dedicated design pass (PRD
+OQ-2). Implemented now as `origin::RemoteFetcher`
+(`crates/imgx/src/origin/remote.rs`), gated behind `IMGX_ALLOW_REMOTE_SOURCES`
+(default `false` — every existing deployment is unaffected until an
+operator opts in) and shared with gap 11's draw-overlay fetch.
+
+**Detection**: `router::is_absolute_url_source` (`crates/imgx/src/router.rs`)
+recognizes a source segment starting with `http://`/`https://`
+(case-insensitive), distinct from the router's existing relative-path
+tests. When the flag is off (default) or a URL fails validation, the
+request is rejected (`403 Forbidden`, via `HttpError::forbidden`) before
+any network call — never silently treated as a relative path against the
+configured origin.
+
+**Guards** (each independently tested — see `crates/imgx/src/origin/remote.rs`):
+
+- **Scheme allowlist**: only `http`/`https`; `file://`, `ftp://`,
+  `gopher://`, etc. rejected, both on the initial URL and every redirect
+  target.
+- **DNS-resolution-time private-address rejection**: a custom
+  `reqwest::dns::Resolve` (`SafeResolver`) performs real resolution via
+  `tokio::net::lookup_host`, then rejects the request if every resolved
+  address is non-globally-routable (RFC1918 private ranges, loopback,
+  link-local, RFC 6598 CGNAT `100.64.0.0/10`, `0.0.0.0/8`, multicast,
+  broadcast, IPv6 equivalents including IPv4-mapped IPv6 literals). Since
+  this check runs *after* resolution, a hostname that resolves to
+  `127.0.0.1` (DNS rebinding) is still caught.
+- **Literal-IP-address host check**: found during implementation —
+  hyper's connector skips DNS resolution entirely when a URL's host is
+  already an IP literal (e.g. a URL pointed directly at
+  `169.254.169.254`, a classic cloud-metadata SSRF target), so
+  `SafeResolver` above would never even be consulted for that case.
+  `literal_ip_host_is_private` checks this directly, both on the initial
+  URL and on every redirect target.
+- **Redirect cap**: capped at 3 hops via a custom `redirect::Policy`,
+  which re-validates scheme and (for literal-IP redirect targets)
+  private-address status on every hop — a redirect chain is a classic
+  SSRF bypass if only the initial URL is checked.
+- **Size cap**: reuses `origin.max_size`/`IMGX_SERVER_MAX_REQUEST_SIZE`
+  and the same streaming-cap discipline as `origin::Fetcher` (INV-12) —
+  a declared `Content-Length` over the limit is rejected before reading
+  any body, and a response streamed without (or lying about)
+  `Content-Length` is capped per-chunk.
+- **Timeout**: reuses `origin.timeout_ms`/`IMGX_ORIGIN_TIMEOUT_MS`.
+
+**Test provenance**: the private-address guard is covered by pure unit
+tests against synthetic `IpAddr` values (`rejects_ipv4_*`,
+`rejects_ipv6_*`, `rejects_ipv4_mapped_ipv6_private_address`,
+`accepts_public_ipv4_and_ipv6_addresses`) plus one end-to-end test using
+the real production constructor against a real loopback server
+(`fetch_rejects_url_resolving_to_loopback`,
+`fetch_rejects_a_redirect_to_a_private_address_when_guard_is_enabled`).
+The rest of the fetch mechanics (size cap, content-type extraction,
+redirect-count/scheme re-validation, status handling) use a test-only
+constructor that skips the private-address guard, since a real wiremock
+server necessarily binds to loopback — which the production guard
+would, correctly, always reject. Server-level wiring is covered by
+`crates/imgx/src/server.rs`'s
+`remote_source_request_is_rejected_by_default_with_403_and_no_network_call`
+and `remote_source_request_reaches_the_shared_fetcher_when_allowed`.
+
+`onerror=redirect` (gap 7) redirects straight to the remote source URL
+itself for this case, rather than through `AppOrigin::redirect_url` (which
+has no meaning for a source that isn't on the configured origin at all).
+
+See docs/INVARIANTS.md INV-14 for the invariant this section's guards
+are pinned to.

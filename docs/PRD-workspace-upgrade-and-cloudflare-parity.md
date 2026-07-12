@@ -39,7 +39,7 @@ Priority key — **P0**: blocks any honest "1:1 parity" claim. **P1**: parameter
 | # | Gap | Cloudflare behavior | imgx today | Priority |
 |---|---|---|---|---|
 | 1 | URL shape | options-first, fixed prefix | **DONE** — matches exactly | — |
-| 2 | Arbitrary source URL | any absolute http(s) URL | Only configured-origin paths | P0 (deferred — SSRF surface, needs its own design pass) |
+| 2 | Arbitrary source URL | any absolute http(s) URL | **DONE** — behind `IMGX_ALLOW_REMOTE_SOURCES` (default off), SSRF-safe fetcher — see `docs/CLOUDFLARE_PARITY.md` gap 2 | — |
 | 3 | `fit` vocabulary | 8 values incl. `scale-down` (default), `crop`, `aspect-crop`, `scale-up` | 6 values, `contain` default | P0 |
 | 4 | `quality`/`q` | 1–100 + perceptual strings; default 85 | 1–100 only; default 80 | P1 |
 | 5 | `format`/`f` | adds `baseline-jpeg`, `json` | neither | P1 |
@@ -48,7 +48,7 @@ Priority key — **P0**: blocks any honest "1:1 parity" claim. **P1**: parameter
 | 8 | `slow-connection-quality`/`scq` | client-hint quality override | **DONE** — see `docs/CLOUDFLARE_PARITY.md` gap 8 | — |
 | 9 | `trim` | border-color-aware, per-side | numeric threshold only | P1 |
 | 10 | `border` | draws border | **DONE** (spec-derived URL syntax — Cloudflare's own `border` is Workers-only, no URL form published) — see `docs/CLOUDFLARE_PARITY.md` gap 10 | — |
-| 11 | `draw` (overlays) | watermark/overlay array | **PARTIAL** — parsing + compositing pipeline done and tested against local buffers; remote overlay fetch deliberately gated (same SSRF concern as gap 2) — see `docs/CLOUDFLARE_PARITY.md` gap 11 | remote fetch remains open, tracked alongside OQ-2 |
+| 11 | `draw` (overlays) | watermark/overlay array | **DONE** — parsing, compositing, and remote overlay fetch (behind `IMGX_ALLOW_DRAW_OVERLAYS`, default off) all shipped — see `docs/CLOUDFLARE_PARITY.md` gap 11 | — |
 | 12 | `gravity`/`g` | named + `auto` + possible focal-point coords | compass words + `smart`/`attention` | P0 (verify) |
 | 13 | `rotate` ordering | before resize/crop | unverified | P0 (verify) |
 
@@ -76,7 +76,7 @@ Phase B1 (docs honesty fix) shipped as part of the URL migration — `docs/pages
 
 ## 6. Open Questions — final disposition
 
-- **OQ-2 — RESOLVED: implemented, off by default.** Arbitrary remote-URL main-image sources are supported behind `IMGX_ALLOW_REMOTE_SOURCES` (default `false`, preserving every existing deployment's behavior unchanged). When enabled, fetches go through a dedicated SSRF-safe fetcher: scheme allowlist (http/https only), DNS-resolution-time rejection of private/loopback/link-local/CGNAT ranges (checked against the *resolved* IP, not just the hostname string, so DNS-rebinding can't bypass it), a capped and re-validated redirect chain, and the same streaming size/timeout caps as the existing origin fetcher (INV-12). See `docs/INVARIANTS.md` for the added SSRF-boundary invariant and `docs/CLOUDFLARE_PARITY.md` gap 2 for the full guard list and test provenance.
+- **OQ-2 — RESOLVED: implemented, off by default.** Arbitrary remote-URL main-image sources are supported behind `IMGX_ALLOW_REMOTE_SOURCES` (default `false`, preserving every existing deployment's behavior unchanged). When enabled, fetches go through a dedicated SSRF-safe fetcher: scheme allowlist (http/https only), DNS-resolution-time rejection of private/loopback/link-local/CGNAT ranges (checked against the *resolved* IP, not just the hostname string, so DNS-rebinding can't bypass it) plus a direct check for literal-IP-address hosts (found during implementation: hyper's connector skips DNS resolution entirely when the host is already an IP literal, e.g. a URL pointed straight at `169.254.169.254`, which would otherwise silently bypass the resolver-based guard), a capped and re-validated redirect chain, and the same streaming size/timeout caps as the existing origin fetcher (INV-12). See `docs/INVARIANTS.md` for the added SSRF-boundary invariant and `docs/CLOUDFLARE_PARITY.md` gap 2 for the full guard list and test provenance.
 - **OQ-3 — RESOLVED: keep imgx's existing defaults.** `fit` stays `contain`-default and `quality` stays `80`-default; Cloudflare's `scale-down`/`85` remain available as explicit non-default values. Rationale: changing a default is an observable behavior change for every existing imgx deployment that relies on the current default, which is a materially different (and much larger-blast-radius) decision than adding a new opt-in value — not something to fold into a parity pass silently. If a future need arises to match Cloudflare's defaults exactly, it should be its own conscious, documented decision (mirroring how `docs/INVARIANTS.md` treats INV-1's cache-key-preservation policy), not a byproduct of this PRD.
 - **OQ-4 — RESOLVED: additive, non-breaking.** `onerror=redirect` ships as an explicit opt-in per request; imgx's default (raw-bytes fallback on transform failure, INV-13) is unchanged. See gap 7 in `docs/CLOUDFLARE_PARITY.md`.
 - **OQ-5 — RESOLVED: both syntaxes coexist.** Legacy numeric `trim=<threshold>` (border-color-aware, unchanged) and Cloudflare's per-side `trim.top`/`.right`/`.bottom`/`.left` (pixel or 0–1 fraction, independent semantics) both work, documented as two distinct features rather than one replacing the other. See gap 9.

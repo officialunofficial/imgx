@@ -7,6 +7,12 @@ GET /cdn-cgi/image/<options>/<image-path>
 GET /cdn-cgi/image/w=400,h=300,f=webp,q=85/photos/hero.jpg
 ```
 
+The source-image segment is normally a relative path, resolved against `IMGX_ORIGIN_BASE_URL`. It may instead be an absolute `http://`/`https://` URL, fetched directly instead of from the configured origin — but only when the operator has set `IMGX_ALLOW_REMOTE_SOURCES=true` (default `false`); otherwise such a request returns `403 Forbidden` before any network call. See `IMGX_ALLOW_REMOTE_SOURCES` in [Configuration](/configuration) for the security guards this enables and the risk it accepts.
+
+```
+GET /cdn-cgi/image/w=400/https://example.com/photos/hero.jpg
+```
+
 ## Dimensions
 
 ### `w` / `width`
@@ -446,13 +452,13 @@ only for HTTP origins (not R2, which has no public URL to redirect to).
 /cdn-cgi/image/w=400,onerror=redirect/photo.jpg
 ```
 
-### `draw` (overlays) — not yet enabled
+### `draw` (overlays) — opt-in, off by default
 
-`draw.<N>.url`, `draw.<N>.width`/`.height`, `.top`/`.left`/`.bottom`/`.right`, `.opacity`, `.repeat`, `.background`, `.rotate`, `.fit`, `.gravity` parse and validate (an array of overlays, indexed by `<N>` starting at `0`), but **every request naming a `draw` overlay currently returns `422`**: the remote-URL fetch needed to actually retrieve an overlay image is deliberately not implemented yet, for the same SSRF-related reasons imgx doesn't fetch arbitrary remote main-image sources. See `docs/CLOUDFLARE_PARITY.md` gap 11 for the full status and scope-decision rationale.
+`draw.<N>.url`, `draw.<N>.width`/`.height`, `.top`/`.left`/`.bottom`/`.right`, `.opacity`, `.repeat`, `.background`, `.rotate`, `.fit`, `.gravity` parse and validate (an array of overlays, indexed by `<N>` starting at `0`). By default (`IMGX_ALLOW_DRAW_OVERLAYS=false`), **every request naming a `draw` overlay returns `403 Forbidden`** before any network call. Set `IMGX_ALLOW_DRAW_OVERLAYS=true` to enable fetching `draw[].url` overlay images through imgx's SSRF-safe remote fetcher (see `IMGX_ALLOW_REMOTE_SOURCES` in [Configuration](/configuration) — this is a separate flag, so an operator can enable overlays without enabling arbitrary remote main-image sources). See `docs/CLOUDFLARE_PARITY.md` gap 11 for the full status.
 
 ```
 /cdn-cgi/image/draw.0.url=https://example.com/logo.png,draw.0.opacity=0.5/photo.jpg
-→ 422 Unprocessable Entity (draw overlays not yet enabled)
+→ 403 Forbidden by default; composites the overlay onto the base image when IMGX_ALLOW_DRAW_OVERLAYS=true
 ```
 
 ---
