@@ -72,18 +72,18 @@ echo ""
 
 # Image requests — first hit is cache miss, subsequent are cache hits
 # Prime the cache first
-curl -sf "http://${HOST}/${IMAGE}" > /dev/null 2>&1 || true
-curl -sf "http://${HOST}/${IMAGE}/w=800,h=600,f=jpeg,q=80" > /dev/null 2>&1 || true
-curl -sf "http://${HOST}/${IMAGE}/w=800,h=600,f=webp,q=80" > /dev/null 2>&1 || true
-curl -sf "http://${HOST}/${IMAGE}/w=400,h=300,f=webp,q=80" > /dev/null 2>&1 || true
-curl -sf "http://${HOST}/${IMAGE}/w=200,h=150,f=webp,q=80" > /dev/null 2>&1 || true
+curl -sf "http://${HOST}/cdn-cgi/image/${IMAGE}" > /dev/null 2>&1 || true
+curl -sf "http://${HOST}/cdn-cgi/image/w=800,h=600,f=jpeg,q=80/${IMAGE}" > /dev/null 2>&1 || true
+curl -sf "http://${HOST}/cdn-cgi/image/w=800,h=600,f=webp,q=80/${IMAGE}" > /dev/null 2>&1 || true
+curl -sf "http://${HOST}/cdn-cgi/image/w=400,h=300,f=webp,q=80/${IMAGE}" > /dev/null 2>&1 || true
+curl -sf "http://${HOST}/cdn-cgi/image/w=200,h=150,f=webp,q=80/${IMAGE}" > /dev/null 2>&1 || true
 
 echo "Cache hits (primed):"
-run_bench "original (no transform)" "${IMAGE}"
-run_bench "800x600 JPEG q80" "${IMAGE}/w=800,h=600,f=jpeg,q=80"
-run_bench "800x600 WebP q80" "${IMAGE}/w=800,h=600,f=webp,q=80"
-run_bench "400x300 WebP q80" "${IMAGE}/w=400,h=300,f=webp,q=80"
-run_bench "200x150 WebP q80 (thumbnail)" "${IMAGE}/w=200,h=150,f=webp,q=80"
+run_bench "original (no transform)" "cdn-cgi/image/${IMAGE}"
+run_bench "800x600 JPEG q80" "cdn-cgi/image/w=800,h=600,f=jpeg,q=80/${IMAGE}"
+run_bench "800x600 WebP q80" "cdn-cgi/image/w=800,h=600,f=webp,q=80/${IMAGE}"
+run_bench "400x300 WebP q80" "cdn-cgi/image/w=400,h=300,f=webp,q=80/${IMAGE}"
+run_bench "200x150 WebP q80 (thumbnail)" "cdn-cgi/image/w=200,h=150,f=webp,q=80/${IMAGE}"
 
 echo ""
 echo "Done."

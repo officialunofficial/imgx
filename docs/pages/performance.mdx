@@ -98,14 +98,14 @@ When testing imgx performance:
 ```bash
 # Single request latency (cold)
 curl -w "time_total: %{time_total}s\n" -o /dev/null -s \
-  http://localhost:8080/photos/hero.jpg/w=800,f=webp,q=85
+  http://localhost:8080/cdn-cgi/image/w=800,f=webp,q=85/photos/hero.jpg
 
 # Single request latency (warm, run twice)
 curl -w "time_total: %{time_total}s\n" -o /dev/null -s \
-  http://localhost:8080/photos/hero.jpg/w=800,f=webp,q=85
+  http://localhost:8080/cdn-cgi/image/w=800,f=webp,q=85/photos/hero.jpg
 
 # Concurrent load test (requires hey: https://github.com/rakyll/hey)
-hey -n 200 -c 20 http://localhost:8080/photos/hero.jpg/w=400,f=auto
+hey -n 200 -c 20 http://localhost:8080/cdn-cgi/image/w=400,f=auto/photos/hero.jpg
 ```
 
 ### Profiling with samply

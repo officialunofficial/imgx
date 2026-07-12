@@ -13,7 +13,7 @@ imgx sits between your clients and your image storage:
 ```
 Client (browser, app)
   │
-  │  GET /photos/hero.jpg/w=800,f=auto,q=85
+  │  GET /cdn-cgi/image/w=800,f=auto,q=85/photos/hero.jpg
   ▼
 ┌──────────┐
 │  imgx   │──▶ Cache hit? Serve immediately.
@@ -46,19 +46,19 @@ Your images stay where they already live. imgx fetches, transforms, caches, and 
 
 ```bash
 # Original image, no transforms
-curl https://your-host.com/photos/hero.jpg
+curl https://your-host.com/cdn-cgi/image/photos/hero.jpg
 
 # Resize to 400px wide
-curl https://your-host.com/photos/hero.jpg/w=400
+curl https://your-host.com/cdn-cgi/image/w=400/photos/hero.jpg
 
 # Resize, convert to WebP, quality 85
-curl https://your-host.com/photos/hero.jpg/w=800,h=600,f=webp,q=85
+curl https://your-host.com/cdn-cgi/image/w=800,h=600,f=webp,q=85/photos/hero.jpg
 
 # Smart crop for thumbnails
-curl https://your-host.com/photos/hero.jpg/w=400,h=400,fit=cover,g=smart
+curl https://your-host.com/cdn-cgi/image/w=400,h=400,fit=cover,g=smart/photos/hero.jpg
 
 # Extract first frame from an animated GIF
-curl https://your-host.com/spinner.gif/frame=0,f=png
+curl https://your-host.com/cdn-cgi/image/frame=0,f=png/spinner.gif
 ```
 
 ---
@@ -66,13 +66,13 @@ curl https://your-host.com/spinner.gif/frame=0,f=png
 ## URL format
 
 ```
-GET /<image-path>/<transforms>
+GET /cdn-cgi/image/<options>/<image-path>
 ```
 
-The last path segment is treated as transforms when it contains `=`. Otherwise, the entire path is the image key.
+imgx uses Cloudflare's exact `/cdn-cgi/image/<OPTIONS>/<SOURCE-IMAGE>` convention: a fixed prefix, then an OPTIONS segment, then the source image path. The segment right after the prefix is treated as options when it contains `=`; otherwise it's the start of a transform-less image path.
 
 | URL | Image path | Transforms |
 |-----|-----------|------------|
-| `/photos/hero.jpg` | `photos/hero.jpg` | none |
-| `/photos/hero.jpg/w=400` | `photos/hero.jpg` | `w=400` |
-| `/a/b/c.jpg/w=800,h=600,f=webp` | `a/b/c.jpg` | `w=800,h=600,f=webp` |
+| `/cdn-cgi/image/photos/hero.jpg` | `photos/hero.jpg` | none |
+| `/cdn-cgi/image/w=400/photos/hero.jpg` | `photos/hero.jpg` | `w=400` |
+| `/cdn-cgi/image/w=800,h=600,f=webp/a/b/c.jpg` | `a/b/c.jpg` | `w=800,h=600,f=webp` |

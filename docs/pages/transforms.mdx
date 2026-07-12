@@ -1,10 +1,10 @@
 # Transform parameters
 
-Specify transforms as the last path segment in the URL. imgx treats a segment as a transform string when it contains `=`. Separate multiple parameters with commas.
+imgx uses Cloudflare's exact URL convention: a fixed `cdn-cgi/image/` prefix, then an OPTIONS segment, then the source image path. imgx treats the segment immediately after the prefix as the options segment when it contains `=`. Separate multiple parameters with commas.
 
 ```
-GET /<image-path>/<transforms>
-GET /photos/hero.jpg/w=400,h=300,f=webp,q=85
+GET /cdn-cgi/image/<options>/<image-path>
+GET /cdn-cgi/image/w=400,h=300,f=webp,q=85/photos/hero.jpg
 ```
 
 ## Dimensions
@@ -17,8 +17,8 @@ Output width in pixels, resized according to the current `fit` mode.
 - **Default:** original width
 
 ```
-/photo.jpg/w=400
-/photo.jpg/width=400
+/cdn-cgi/image/w=400/photo.jpg
+/cdn-cgi/image/width=400/photo.jpg
 ```
 
 ### `h` / `height`
@@ -29,8 +29,8 @@ Output height in pixels.
 - **Default:** original height
 
 ```
-/photo.jpg/h=300
-/photo.jpg/w=400,h=300
+/cdn-cgi/image/h=300/photo.jpg
+/cdn-cgi/image/w=400,h=300/photo.jpg
 ```
 
 When you specify only one dimension, imgx derives the other from the source aspect ratio.
@@ -44,7 +44,7 @@ Device pixel ratio. Multiplies `w` and `h` for retina and HiDPI displays. The ef
 
 ```
 # 400px at 2x = 800px actual output
-/photo.jpg/w=400,dpr=2
+/cdn-cgi/image/w=400,dpr=2/photo.jpg
 ```
 
 ## Quality
@@ -57,8 +57,8 @@ Compression quality for lossy formats (JPEG, WebP, AVIF). Higher values produce 
 - **Default:** `80`
 
 ```
-/photo.jpg/q=90
-/photo.jpg/w=400,q=60
+/cdn-cgi/image/q=90/photo.jpg
+/cdn-cgi/image/w=400,q=60/photo.jpg
 ```
 
 ## Format
@@ -71,10 +71,10 @@ Output format. When set to `auto` or omitted, imgx negotiates the format from th
 - **Default:** `auto`
 
 ```
-/photo.jpg/f=webp
-/photo.jpg/format=avif
-/photo.jpg/fmt=png
-/animation.gif/f=gif
+/cdn-cgi/image/f=webp/photo.jpg
+/cdn-cgi/image/format=avif/photo.jpg
+/cdn-cgi/image/fmt=png/photo.jpg
+/cdn-cgi/image/f=gif/animation.gif
 ```
 
 ## Fit mode
@@ -93,8 +93,8 @@ Controls how the image fits the target dimensions.
 | `pad` | Resize like `contain`, then letterbox onto the target canvas using the background color. |
 
 ```
-/photo.jpg/w=400,h=400,fit=cover
-/photo.jpg/w=400,h=300,fit=fill
+/cdn-cgi/image/w=400,h=400,fit=cover/photo.jpg
+/cdn-cgi/image/w=400,h=300,fit=fill/photo.jpg
 ```
 
 With `fit=pad`, set both `w` and `h` to force a fixed output canvas. The padding color comes from `bg`/`background` and defaults to white. For animated output, `fit=pad` currently behaves like `contain`.
@@ -120,8 +120,8 @@ When `fit=cover` crops the image, this controls which region to keep.
 | `attention` | `att` | Attention-based detection (keeps visually interesting areas) |
 
 ```
-/photo.jpg/w=400,h=400,fit=cover,g=smart
-/photo.jpg/w=400,h=400,fit=cover,g=north
+/cdn-cgi/image/w=400,h=400,fit=cover,g=smart/photo.jpg
+/cdn-cgi/image/w=400,h=400,fit=cover,g=north/photo.jpg
 ```
 
 :::info
@@ -137,8 +137,8 @@ Unsharp mask with the given sigma value.
 - **Range:** 0.0–10.0
 
 ```
-/photo.jpg/sharpen=1.5
-/photo.jpg/w=400,sharpen=2.0
+/cdn-cgi/image/sharpen=1.5/photo.jpg
+/cdn-cgi/image/w=400,sharpen=2.0/photo.jpg
 ```
 
 ### `blur`
@@ -148,8 +148,8 @@ Gaussian blur with the given sigma value.
 - **Range:** 0.1–250.0
 
 ```
-/photo.jpg/blur=3.0
-/photo.jpg/w=400,blur=10.0
+/cdn-cgi/image/blur=3.0/photo.jpg
+/cdn-cgi/image/w=400,blur=10.0/photo.jpg
 ```
 
 ### `brightness`
@@ -157,7 +157,7 @@ Gaussian blur with the given sigma value.
 - **Range:** 0.0–2.0 (1.0 is normal)
 
 ```
-/photo.jpg/brightness=1.2
+/cdn-cgi/image/brightness=1.2/photo.jpg
 ```
 
 ### `contrast`
@@ -165,7 +165,7 @@ Gaussian blur with the given sigma value.
 - **Range:** 0.0–2.0 (1.0 is normal)
 
 ```
-/photo.jpg/contrast=1.3
+/cdn-cgi/image/contrast=1.3/photo.jpg
 ```
 
 ### `saturation`
@@ -173,7 +173,7 @@ Gaussian blur with the given sigma value.
 - **Range:** 0.0–2.0 (1.0 is normal)
 
 ```
-/photo.jpg/saturation=0.0
+/cdn-cgi/image/saturation=0.0/photo.jpg
 ```
 
 ### `gamma`
@@ -183,7 +183,7 @@ Gamma correction.
 - **Range:** 0.1–10.0
 
 ```
-/photo.jpg/gamma=2.2
+/cdn-cgi/image/gamma=2.2/photo.jpg
 ```
 
 ### `rotate`
@@ -191,7 +191,7 @@ Gamma correction.
 - **Values:** 0, 90, 180, 270
 
 ```
-/photo.jpg/rotate=90
+/cdn-cgi/image/rotate=90/photo.jpg
 ```
 
 ### `flip`
@@ -199,7 +199,7 @@ Gamma correction.
 - **Values:** `h` (horizontal), `v` (vertical), `hv` (both)
 
 ```
-/photo.jpg/flip=h
+/cdn-cgi/image/flip=h/photo.jpg
 ```
 
 ### `bg` / `background`
@@ -209,7 +209,7 @@ Hex RGB color used for `fit=pad` canvas fill and alpha flattening before encodin
 - **Format:** 6-character hex, no `#` prefix
 
 ```
-/photo.png/f=jpeg,bg=ffffff
+/cdn-cgi/image/f=jpeg,bg=ffffff/photo.png
 ```
 
 ### `trim`
@@ -219,7 +219,7 @@ Detect and crop uniform borders around the image.
 - **Range:** 1.0–100.0 (threshold)
 
 ```
-/photo.jpg/trim=10
+/cdn-cgi/image/trim=10/photo.jpg
 ```
 
 ### `metadata`
@@ -229,7 +229,7 @@ Controls EXIF and ICC metadata in the output.
 - **Values:** `strip` (default), `keep`, `copyright`
 
 ```
-/photo.jpg/metadata=keep
+/cdn-cgi/image/metadata=keep/photo.jpg
 ```
 
 ## Animation
@@ -246,13 +246,13 @@ Controls whether animated images (GIF, animated WebP) preserve animation in the 
 
 ```bash
 # Serve an animated GIF, resized
-/spinner.gif/w=64
+/cdn-cgi/image/w=64/spinner.gif
 
 # Strip animation (Cloudflare-compatible syntax)
-/spinner.gif/anim=false
+/cdn-cgi/image/anim=false/spinner.gif
 
 # Strip animation (imgx syntax)
-/spinner.gif/anim=static
+/cdn-cgi/image/anim=static/spinner.gif
 ```
 
 When `anim=auto` and no explicit format is set, imgx negotiates an animated-capable format from the `Accept` header: **WebP > GIF**. If the client accepts neither, the output degrades to a static first frame in the best available format.
@@ -265,8 +265,8 @@ Extract a specific 0-indexed frame from an animated image and serve it as a stat
 - **Default:** none (all frames preserved)
 
 ```
-/spinner.gif/frame=0,f=png
-/spinner.gif/frame=2
+/cdn-cgi/image/frame=0,f=png/spinner.gif
+/cdn-cgi/image/frame=2/spinner.gif
 ```
 
 If the index exceeds the number of frames, imgx returns the last frame.
@@ -334,7 +334,7 @@ Invalid transforms return structured JSON errors:
 ## Full example
 
 ```
-GET /products/shoe-red.png/w=800,h=600,fit=cover,g=attention,f=auto,q=85,dpr=2,sharpen=0.5
+GET /cdn-cgi/image/w=800,h=600,fit=cover,g=attention,f=auto,q=85,dpr=2,sharpen=0.5/products/shoe-red.png
 ```
 
 This request:
