@@ -362,12 +362,13 @@ async fn handle_image_request(
 
     let transform_input = fetch_result.data.clone();
     let accept_owned = accept_header.map(|s| s.to_string());
+    let tp_for_task = tp.clone();
 
     let transform_task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         pipeline::transform(
             &transform_input,
-            &tp,
+            &tp_for_task,
             accept_owned.as_deref(),
             Some(transform_limits),
         )
