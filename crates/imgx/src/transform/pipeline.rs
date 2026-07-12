@@ -69,6 +69,11 @@ pub fn transform(
     // Load first frame only (cheap) to detect animation metadata.
     let mut current = VipsImage::from_buffer(input_data)?;
 
+    // Captured for `format=json`'s "original" stats (gap 5) -- the raw
+    // probed dimensions before any rotate/resize/crop touches them.
+    let original_width = current.width() as u32;
+    let original_height = current.height() as u32;
+
     // Decompression-bomb guard: reject before any resize/effect/encode work
     // touches full pixel data if the *first frame's* pixel count alone
     // already exceeds the configured budget. This is intentionally
@@ -167,6 +172,36 @@ pub fn transform(
         }
     }
 
+    // Cloudflare's per-side trim keys (docs/CLOUDFLARE_PARITY.md gap 9):
+    // fixed pixel crop from each edge independently, NOT border-color
+    // aware (unlike the legacy numeric `trim` above, via find_trim) --
+    // additive, both may be combined in the same request. A value in
+    // `0.0..1.0` is a fraction of that side's dimension, resolved here
+    // where the actual image size is known (parse time isn't).
+    if !animated_output
+        && (tp.trim_top.is_some()
+            || tp.trim_right.is_some()
+            || tp.trim_bottom.is_some()
+            || tp.trim_left.is_some())
+    {
+        let w = current.width();
+        let h = current.height();
+        let resolve = |v: Option<f32>, dim: i32| -> i32 {
+            match v {
+                Some(v) if v < 1.0 => (v as f64 * dim as f64).round() as i32,
+                Some(v) => v.round() as i32,
+                None => 0,
+            }
+        };
+        let top = resolve(tp.trim_top, h).clamp(0, h);
+        let left = resolve(tp.trim_left, w).clamp(0, w);
+        let right = resolve(tp.trim_right, w).clamp(0, w);
+        let bottom = resolve(tp.trim_bottom, h).clamp(0, h);
+        let new_w = (w - left - right).max(1);
+        let new_h = (h - top - bottom).max(1);
+        current = current.crop(left, top, new_w, new_h)?;
+    }
+
     // -- ROTATE / FLIP --
     if let Some(rotation) = tp.rotate {
         let angle = match rotation {
@@ -212,6 +247,32 @@ pub fn transform(
                 let derived = h as f64 * ratio;
                 (derived.min(8192.0) as i32).max(1)
             }
+        };
+
+        // Bugfix uncovered while verifying gap 13 (rotate-before-resize
+        // ordering, docs/CLOUDFLARE_PARITY.md): vips_thumbnail_image
+        // defaults its `height` option to the `width` value when omitted
+        // entirely -- i.e. it fits within a WIDTHxWIDTH *square* box, not
+        // "preserve aspect ratio from width alone" as callers requesting
+        // only `w=` naturally expect. Confirmed both via this crate's
+        // pipeline and directly via `vipsthumbnail --size` on a
+        // known-non-square fixture. For fit modes that don't already
+        // define their own explicit target box (Cover/Fill/Crop/
+        // AspectCrop all require both dimensions to mean anything), a
+        // missing height is now derived from the *current* (i.e.
+        // already-rotated/flipped) aspect ratio before the thumbnail call,
+        // rather than left as `None` for vips to silently square-box.
+        let derived_height = if eff_h.is_none()
+            && !matches!(
+                effective_fit,
+                FitMode::Cover | FitMode::Fill | FitMode::Crop | FitMode::AspectCrop
+            )
+            && source_w > 0
+        {
+            let ratio = source_h as f64 / source_w as f64;
+            Some(((thumb_width as f64 * ratio).round().min(8192.0) as i32).max(1))
+        } else {
+            eff_h
         };
 
         // Animated + cover: vips_thumbnail_image's crop corrupts frame
@@ -265,8 +326,46 @@ pub fn transform(
             }
 
             current.set_int("page-height", th);
+        } else if let (FitMode::AspectCrop, false, Some(tw), Some(th)) =
+            (effective_fit, animated_output, eff_w, eff_h)
+        {
+            // Cloudflare's `aspect-crop` (docs/CLOUDFLARE_PARITY.md gap
+            // 3): crop to the target aspect ratio. If the source is
+            // large enough to cover the target without upscaling, this
+            // is identical to `crop`/`cover` (downscale-then-crop). If
+            // the source is smaller, it must NOT be upscaled -- instead
+            // the *original-size* image is cropped directly to the
+            // target aspect ratio.
+            let hscale = tw as f64 / source_w as f64;
+            let vscale = th as f64 / source_h as f64;
+            let scale = hscale.max(vscale);
+            if scale > 1.0 {
+                let target_ratio = tw as f64 / th as f64;
+                let source_ratio = source_w as f64 / source_h as f64;
+                let (crop_w, crop_h) = if source_ratio > target_ratio {
+                    let new_w = ((source_h as f64 * target_ratio).round() as i32)
+                        .min(source_w)
+                        .max(1);
+                    (new_w, source_h)
+                } else {
+                    let new_h = ((source_w as f64 / target_ratio).round() as i32)
+                        .min(source_h)
+                        .max(1);
+                    (source_w, new_h)
+                };
+                let crop_left = (source_w - crop_w) / 2;
+                let crop_top = (source_h - crop_h) / 2;
+                current = current.crop(crop_left, crop_top, crop_w, crop_h)?;
+            } else {
+                let opts = ThumbnailOptions {
+                    height: Some(th),
+                    crop: Some(map_gravity_to_crop(tp.gravity)),
+                    size: Some(consts::VIPS_SIZE_DOWN),
+                };
+                current = current.thumbnail(tw, opts)?;
+            }
         } else {
-            let opts = build_thumbnail_options(effective_fit, tp.gravity, eff_h);
+            let opts = build_thumbnail_options(effective_fit, tp.gravity, derived_height);
             current = current.thumbnail(thumb_width, opts)?;
 
             // After resize, refresh page-height metadata for animated
@@ -337,13 +436,42 @@ pub fn transform(
         current = current.flatten(bg)?;
     }
 
+    let out_width = current.width() as u32;
+    let out_height = current.height() as u32;
+
+    // -- JSON -- (gap 5: format=json is a metadata-only response, no
+    // image bytes. Schema is spec-derived -- see
+    // docs/CLOUDFLARE_PARITY.md -- but the values themselves are real,
+    // computed from the actual transform, not guessed: a real codec is
+    // negotiated and actually encoded so "transformed.file_size" reflects
+    // the size the image WOULD have been served at.)
+    if tp.format == Some(OutputFormat::Json) {
+        let negotiated = negotiate::negotiate_format(accept_header, current.has_alpha(), None);
+        let encoded = encode_image(&current, negotiated, tp.quality, tp.metadata)?;
+        let json = format!(
+            "{{\"original\":{{\"width\":{original_width},\"height\":{original_height},\"file_size\":{}}},\"transformed\":{{\"width\":{out_width},\"height\":{out_height},\"format\":\"{}\",\"file_size\":{}}}}}",
+            input_data.len(),
+            negotiated.as_str(),
+            encoded.len(),
+        );
+        return Ok(TransformResult {
+            data: json.into_bytes(),
+            format: OutputFormat::Json,
+            width: out_width,
+            height: out_height,
+            is_animated: animated_output,
+            frame_count: if animated_output {
+                effective_pages.map(|p| p as u32)
+            } else {
+                None
+            },
+        });
+    }
+
     // -- ENCODE --
     let output_format = animated_format.unwrap_or_else(|| {
         negotiate::negotiate_format(accept_header, current.has_alpha(), tp.format)
     });
-
-    let out_width = current.width() as u32;
-    let out_height = current.height() as u32;
 
     let data = encode_image(&current, output_format, tp.quality, tp.metadata)?;
 
@@ -403,6 +531,21 @@ fn build_thumbnail_options(
         FitMode::Cover => opts.crop = Some(map_gravity_to_crop(gravity)),
         FitMode::Fill => opts.size = Some(consts::VIPS_SIZE_FORCE),
         FitMode::Outside => opts.size = Some(consts::VIPS_SIZE_UP),
+        // Cloudflare's `crop`: fill the target area like `cover`, but
+        // never upscale (VIPS_SIZE_DOWN clamps to downscale-only). See
+        // docs/CLOUDFLARE_PARITY.md gap 3.
+        FitMode::Crop => {
+            opts.crop = Some(map_gravity_to_crop(gravity));
+            opts.size = Some(consts::VIPS_SIZE_DOWN);
+        }
+        // AspectCrop is handled by its own dedicated branch in
+        // `transform()` before `build_thumbnail_options` is ever called
+        // for it (its crop math isn't a plain vips_thumbnail_image call)
+        // -- this arm only exists for match exhaustiveness.
+        FitMode::AspectCrop => {
+            opts.crop = Some(map_gravity_to_crop(gravity));
+            opts.size = Some(consts::VIPS_SIZE_DOWN);
+        }
     }
     opts
 }
@@ -433,11 +576,21 @@ fn encode_image(
     // future-enhancement note).
     let do_strip = metadata == MetadataMode::Strip;
     match format {
-        OutputFormat::Jpeg | OutputFormat::Auto => image.save_jpeg(q, do_strip),
+        // BaselineJpeg shares Jpeg's encode path exactly: libvips'
+        // vips_jpegsave_buffer already defaults `interlace` to FALSE
+        // (baseline), so there is no separate FFI call to make -- see
+        // docs/CLOUDFLARE_PARITY.md gap 5.
+        OutputFormat::Jpeg | OutputFormat::BaselineJpeg | OutputFormat::Auto => {
+            image.save_jpeg(q, do_strip)
+        }
         OutputFormat::Png => image.save_png(6, do_strip),
         OutputFormat::Webp => image.save_webp(q, do_strip),
         OutputFormat::Avif => image.save_avif(q, do_strip),
         OutputFormat::Gif => encode_gif(image),
+        // Never reached: `transform()` intercepts `format == Json`
+        // before calling `encode_image` and builds a JSON stats payload
+        // instead (see the `-- JSON --` block below).
+        OutputFormat::Json => image.save_jpeg(q, do_strip),
     }
 }
 
@@ -960,5 +1113,198 @@ mod tests {
         let result = transform(&data, &parsed, None, None).unwrap();
         assert_eq!(result.width, 4);
         assert_eq!(result.height, 4);
+    }
+
+    // ----------------------------------------------------------------
+    // Cloudflare parity gaps (docs/CLOUDFLARE_PARITY.md)
+    // ----------------------------------------------------------------
+
+    fn nonsquare_fixture() -> Vec<u8> {
+        fixture("bench_2000x1500.png")
+    }
+
+    /// Gap 13 -- verify (and lock in as a regression test) that rotate is
+    /// applied BEFORE resize, and that width/height refer to the
+    /// post-rotation axes -- matching Cloudflare's documented behavior
+    /// ("Rotation is performed before resizing; width and height options
+    /// will refer to the axes after the image is rotated," verified
+    /// against developers.cloudflare.com/images/optimization/features/
+    /// via the Cloudflare docs MCP search tool). The 2000x1500 (4:3
+    /// landscape) source, rotated 90 degrees, becomes 1500x2000
+    /// (portrait) BEFORE the w=200 resize is applied -- so a w=200
+    /// resize (no height given, aspect-ratio-derived) must produce a
+    /// TALLER-than-wide 200x~267 output, not a 200x150 output (which is
+    /// what resize-before-rotate would produce).
+    #[test]
+    fn rotate_is_applied_before_resize_axes_reflect_post_rotation_orientation() {
+        init();
+        let data = nonsquare_fixture();
+        let p = TransformParams {
+            width: Some(200),
+            rotate: Some(Rotation::Deg90),
+            ..Default::default()
+        };
+        let result = transform(&data, &p, None, None).unwrap();
+        assert_eq!(result.width, 200);
+        // 1500x2000 (post-rotation) resized to width=200 preserves aspect
+        // ratio => height = 200 * (2000/1500) = 266.67 -> 266 or 267.
+        assert!(
+            result.height > result.width,
+            "post-rotation resize must be taller than wide (got {}x{}); \
+             a resize-before-rotate bug would instead produce a 200x150 \
+             wide output",
+            result.width,
+            result.height
+        );
+    }
+
+    /// Gap 3 -- pixel-dimension proof that Cloudflare's `squeeze` and
+    /// imgx's existing `fill` are equivalent (both force exact
+    /// non-aspect-preserving dimensions), justifying the parser alias in
+    /// params.rs rather than a new enum variant.
+    #[test]
+    fn transform_with_fit_squeeze_matches_fill_dimensions() {
+        init();
+        let data = static_fixture();
+        let squeeze = parse("w=2,h=3,fit=squeeze").unwrap();
+        let fill = parse("w=2,h=3,fit=fill").unwrap();
+        assert_eq!(squeeze.fit, fill.fit);
+        let result = transform(&data, &squeeze, None, None).unwrap();
+        assert_eq!(result.width, 2);
+        assert_eq!(result.height, 3);
+    }
+
+    /// Gap 3 -- pixel-dimension proof that Cloudflare's `scale-up`
+    /// (upscale-only, never downscale, preserve aspect) matches imgx's
+    /// existing `outside` (`VIPS_SIZE_UP`): requesting a target SMALLER
+    /// than the 4x4 source must leave the source untouched (never
+    /// downscale).
+    #[test]
+    fn transform_with_fit_scale_up_never_downscales_smaller_target() {
+        init();
+        let data = static_fixture(); // 4x4
+        let p = parse("w=2,h=2,fit=scale-up").unwrap();
+        let result = transform(&data, &p, None, None).unwrap();
+        assert_eq!(
+            result.width, 4,
+            "scale-up must never downscale below source size"
+        );
+        assert_eq!(result.height, 4);
+    }
+
+    /// Gap 3 -- `fit=crop`: fills the target area like `cover` when the
+    /// source is large enough, but never upscales.
+    #[test]
+    fn transform_with_fit_crop_never_upscales_smaller_source() {
+        init();
+        let data = static_fixture(); // 4x4
+        let p = parse("w=8,h=8,fit=crop").unwrap();
+        let result = transform(&data, &p, None, None).unwrap();
+        assert!(
+            result.width <= 4 && result.height <= 4,
+            "fit=crop must never upscale a source smaller than the \
+             target (got {}x{})",
+            result.width,
+            result.height
+        );
+    }
+
+    #[test]
+    fn transform_with_fit_crop_fills_target_when_source_is_larger() {
+        init();
+        let data = nonsquare_fixture(); // 2000x1500
+        let p = parse("w=100,h=100,fit=crop").unwrap();
+        let result = transform(&data, &p, None, None).unwrap();
+        assert_eq!(result.width, 100);
+        assert_eq!(result.height, 100);
+    }
+
+    /// Gap 3 -- `fit=aspect-crop`: when the source is smaller than the
+    /// target's covering size, it must NOT upscale, but must still crop
+    /// to the target aspect ratio (unlike `crop`, which would just keep
+    /// the whole original image in that case).
+    #[test]
+    fn transform_with_fit_aspect_crop_never_upscales_but_matches_target_ratio() {
+        init();
+        let data = static_fixture(); // 4x4, ratio 1:1
+        // Target ratio 2:1 -- source stays <= 4 wide/tall (no upscale)
+        // but must be cropped so width:height is 2:1, not left at 4:4.
+        let p = parse("w=200,h=100,fit=aspect-crop").unwrap();
+        let result = transform(&data, &p, None, None).unwrap();
+        assert!(result.width <= 4 && result.height <= 4);
+        assert_eq!(
+            result.width, 4,
+            "aspect-crop keeps the full width and crops height to match ratio"
+        );
+        assert_eq!(result.height, 2, "4 wide at a 2:1 ratio crops height to 2");
+    }
+
+    #[test]
+    fn transform_with_fit_aspect_crop_downscales_and_crops_when_source_is_larger() {
+        init();
+        let data = nonsquare_fixture(); // 2000x1500, ratio 4:3
+        let p = parse("w=100,h=100,fit=aspect-crop").unwrap();
+        let result = transform(&data, &p, None, None).unwrap();
+        assert_eq!(result.width, 100);
+        assert_eq!(result.height, 100);
+    }
+
+    /// Gap 9 -- Cloudflare's per-side trim keys crop fixed pixel counts
+    /// from each edge independently of border-color uniformity (unlike
+    /// the legacy numeric `trim=<threshold>`, which is border-color-aware
+    /// via find_trim). A 1.0-fraction value is interpreted as a fraction
+    /// of that side's dimension.
+    #[test]
+    fn transform_with_per_side_trim_crops_fixed_pixel_counts() {
+        init();
+        let data = nonsquare_fixture(); // 2000x1500
+        let p = parse("trim.top=100,trim.left=200").unwrap();
+        let result = transform(&data, &p, None, None).unwrap();
+        assert_eq!(result.width, 2000 - 200);
+        assert_eq!(result.height, 1500 - 100);
+    }
+
+    #[test]
+    fn transform_with_per_side_trim_fraction_values() {
+        init();
+        let data = nonsquare_fixture(); // 2000x1500
+        let p = parse("trim.left=0.1,trim.right=0.1").unwrap();
+        let result = transform(&data, &p, None, None).unwrap();
+        // 10% off each side horizontally: 2000 - 200 - 200 = 1600.
+        assert_eq!(result.width, 1600);
+        assert_eq!(result.height, 1500);
+    }
+
+    #[test]
+    fn transform_with_legacy_numeric_trim_still_works() {
+        init();
+        let data = static_fixture();
+        let p = TransformParams {
+            trim: Some(50.0),
+            ..Default::default()
+        };
+        let result = transform(&data, &p, None, None);
+        assert!(result.is_ok());
+    }
+
+    /// Gap 5 -- `format=json`: metadata-only response, no image bytes.
+    /// Schema is spec-derived (see docs/CLOUDFLARE_PARITY.md) but must
+    /// report real, computed values: original dimensions/file size and
+    /// post-transform dimensions/format/encoded size.
+    #[test]
+    fn transform_with_format_json_returns_metadata_not_image_bytes() {
+        init();
+        let data = nonsquare_fixture(); // 2000x1500
+        let p = parse("w=100,format=json").unwrap();
+        let result = transform(&data, &p, None, None).unwrap();
+        assert_eq!(result.format, OutputFormat::Json);
+        let body = String::from_utf8(result.data).expect("json response must be valid utf8");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("must be valid json");
+        assert_eq!(json["original"]["width"], 2000);
+        assert_eq!(json["original"]["height"], 1500);
+        assert_eq!(json["original"]["file_size"], data.len());
+        assert_eq!(json["transformed"]["width"], 100);
+        assert_eq!(json["transformed"]["height"], 75);
+        assert!(json["transformed"]["file_size"].as_u64().unwrap() > 0);
     }
 }

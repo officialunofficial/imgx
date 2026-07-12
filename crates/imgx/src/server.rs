@@ -27,6 +27,7 @@ use crate::http::response;
 use crate::origin::{FetchError, FetchResult, Fetcher, OriginSource, R2Fetcher};
 use crate::router::{self, ImageRequest, Route};
 use crate::s3::S3Client;
+use crate::transform::params::OnErrorMode;
 use crate::transform::{params, pipeline};
 
 /// The cache backend selected at startup based on config. A closed set
@@ -91,6 +92,19 @@ impl AppOrigin {
         match self {
             AppOrigin::Http(f) => f.fetch(path).await,
             AppOrigin::R2(client) => R2Fetcher::new(client).fetch(path).await,
+        }
+    }
+
+    /// The public origin URL for `onerror=redirect` (gap 7). Cloudflare's
+    /// own docs restrict this feature to "the same zone" as the
+    /// transform -- imgx's equivalent restriction is that it only makes
+    /// sense for an `Http` origin with a real, redirectable URL; an R2
+    /// origin has no such public URL, so redirect isn't offered for it
+    /// (the caller falls back to the raw-bytes default in that case).
+    fn redirect_url(&self, path: &str) -> Option<String> {
+        match self {
+            AppOrigin::Http(f) => f.origin_url(path).ok(),
+            AppOrigin::R2(_) => None,
         }
     }
 }
@@ -392,21 +406,45 @@ async fn handle_image_request(
         // request within the TTL window.
         Ok(Err(e)) => {
             tracing::warn!(error = %e, path = %req.image_path, transform = %transform_string, "image transform failed, serving raw origin bytes");
-            let ct = tp
-                .format
-                .map(|f| f.content_type().to_string())
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            build_image_response(state, fetch_result.data, ct, if_none_match)
+            handle_transform_failure(state, &req, &tp, fetch_result.data, if_none_match)
         }
         Err(e) => {
             tracing::warn!(error = %e, path = %req.image_path, transform = %transform_string, "image transform task panicked, serving raw origin bytes");
-            let ct = tp
-                .format
-                .map(|f| f.content_type().to_string())
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            build_image_response(state, fetch_result.data, ct, if_none_match)
+            handle_transform_failure(state, &req, &tp, fetch_result.data, if_none_match)
         }
     }
+}
+
+/// The fallback path taken when a transform fails: imgx's default
+/// (`onerror` unset) is to serve the raw origin bytes as-is (INV-13 --
+/// never cached under the success key). `onerror=redirect`
+/// (docs/CLOUDFLARE_PARITY.md gap 7) is an additive, opt-in per-request
+/// override: a 302 to the origin image URL instead, matching
+/// Cloudflare's documented `onerror=redirect` behavior. Falls back to
+/// the raw-bytes default if no redirectable origin URL is available
+/// (e.g. an R2 origin).
+fn handle_transform_failure(
+    state: &AppState,
+    req: &ImageRequest,
+    tp: &params::TransformParams,
+    raw_data: Vec<u8>,
+    if_none_match: Option<&str>,
+) -> Response {
+    if tp.onerror == Some(OnErrorMode::Redirect) {
+        let effective_path = strip_path_prefix(&state.config.origin.path_prefix, &req.image_path);
+        if let Some(location) = state.origin.redirect_url(effective_path) {
+            return Response::builder()
+                .status(StatusCode::FOUND)
+                .header(header::LOCATION, location)
+                .body(Body::empty())
+                .unwrap();
+        }
+    }
+    let ct = tp
+        .format
+        .map(|f| f.content_type().to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    build_image_response(state, raw_data, ct, if_none_match)
 }
 
 /// Build a response from image bytes: ETag generation, 304 handling, and
@@ -702,6 +740,66 @@ mod tests {
         let router = build_router(test_state());
         let (status, _) = get(router, "/cdn-cgi/image/test.jpg").await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    /// Gap 7 -- `onerror=redirect` (docs/CLOUDFLARE_PARITY.md): opt-in
+    /// per-request parameter. On a failed transform, redirect to the
+    /// original source URL (302) instead of imgx's default raw-bytes
+    /// fallback. The default (no `onerror`) behavior is NOT changed --
+    /// see the sibling test below and INV-13 in docs/INVARIANTS.md.
+    #[tokio::test]
+    async fn onerror_redirect_returns_302_to_origin_url_on_transform_failure() {
+        let base_url = serve_repeatedly(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 12\r\n\r\nnot an image",
+        )
+        .await;
+        let mut cfg = Config::defaults();
+        cfg.origin.base_url = base_url.clone();
+        let router = build_router(Arc::new(AppState::new(cfg)));
+
+        let (status, _) = get(router, "/cdn-cgi/image/onerror=redirect/photo.jpg").await;
+        assert_eq!(status, StatusCode::FOUND);
+    }
+
+    #[tokio::test]
+    async fn onerror_redirect_location_header_points_at_origin_image_url() {
+        let base_url = serve_repeatedly(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 12\r\n\r\nnot an image",
+        )
+        .await;
+        let mut cfg = Config::defaults();
+        cfg.origin.base_url = base_url.clone();
+        let router = build_router(Arc::new(AppState::new(cfg)));
+
+        let req = axum::http::Request::builder()
+            .uri("/cdn-cgi/image/onerror=redirect/photo.jpg")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap();
+        assert_eq!(location, format!("{base_url}/photo.jpg"));
+    }
+
+    /// Without `onerror=redirect`, a failed transform still falls back to
+    /// raw bytes -- the default behavior is unchanged (INV-13).
+    #[tokio::test]
+    async fn without_onerror_transform_failure_still_falls_back_to_raw_bytes() {
+        let base_url = serve_repeatedly(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 12\r\n\r\nnot an image",
+        )
+        .await;
+        let mut cfg = Config::defaults();
+        cfg.origin.base_url = base_url;
+        let router = build_router(Arc::new(AppState::new(cfg)));
+
+        let (status, body) = get(router, "/cdn-cgi/image/w=100/photo.jpg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "not an image");
     }
 
     #[test]

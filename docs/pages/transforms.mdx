@@ -53,13 +53,18 @@ Device pixel ratio. Multiplies `w` and `h` for retina and HiDPI displays. The ef
 
 Compression quality for lossy formats (JPEG, WebP, AVIF). Higher values produce larger files with fewer artifacts. Has no effect on PNG.
 
-- **Range:** 1–100
+- **Range:** 1–100, or a perceptual quality string: `high`, `medium-high`, `medium-low`, `low`
 - **Default:** `80`
 
 ```
 /cdn-cgi/image/q=90/photo.jpg
 /cdn-cgi/image/w=400,q=60/photo.jpg
+/cdn-cgi/image/quality=high/photo.jpg
 ```
+
+:::info
+Perceptual quality strings map to `high=90`, `medium-high=80`, `medium-low=60`, `low=40` — a spec-derived mapping (Cloudflare documents the strings but not exact integer values). See `docs/CLOUDFLARE_PARITY.md` gap 4.
+:::
 
 ## Format
 
@@ -67,7 +72,7 @@ Compression quality for lossy formats (JPEG, WebP, AVIF). Higher values produce 
 
 Output format. When set to `auto` or omitted, imgx negotiates the format from the client's `Accept` header.
 
-- **Values:** `jpeg`, `jpg`, `png`, `webp`, `avif`, `gif`, `auto`
+- **Values:** `jpeg`, `jpg`, `png`, `webp`, `avif`, `gif`, `baseline-jpeg`, `json`, `auto`
 - **Default:** `auto`
 
 ```
@@ -75,7 +80,27 @@ Output format. When set to `auto` or omitted, imgx negotiates the format from th
 /cdn-cgi/image/format=avif/photo.jpg
 /cdn-cgi/image/fmt=png/photo.jpg
 /cdn-cgi/image/f=gif/animation.gif
+/cdn-cgi/image/f=baseline-jpeg/photo.jpg
+/cdn-cgi/image/w=200,format=json/photo.jpg
 ```
+
+`baseline-jpeg` produces non-progressive (baseline sequential) JPEG — the
+same encode path as `jpeg` today (libvips defaults to baseline unless
+progressive encoding is explicitly requested).
+
+`format=json` returns a metadata-only JSON response instead of image bytes:
+
+```json
+{
+  "original": { "width": 2000, "height": 1500, "file_size": 123456 },
+  "transformed": { "width": 200, "height": 150, "format": "webp", "file_size": 4821 }
+}
+```
+
+`transformed.format`/`transformed.file_size` are computed by actually
+negotiating and encoding a real codec — real numbers, not placeholders. See
+`docs/CLOUDFLARE_PARITY.md` gap 5 for the schema's provenance (spec-derived —
+Cloudflare doesn't publish an exact field-by-field schema).
 
 ## Fit mode
 
@@ -83,21 +108,30 @@ Output format. When set to `auto` or omitted, imgx negotiates the format from th
 
 Controls how the image fits the target dimensions.
 
-| Value | Behavior |
-|-------|----------|
-| `contain` | Scale down to fit within the dimensions. Preserves aspect ratio. Never upscales. **(default)** |
-| `cover` | Scale and crop to fill the exact dimensions. Uses `gravity` to pick the crop anchor. |
-| `fill` | Stretch to exactly fill the dimensions. Ignores aspect ratio. |
-| `inside` | Same as `contain`. |
-| `outside` | Scale up to cover the dimensions. Preserves aspect ratio. |
-| `pad` | Resize like `contain`, then letterbox onto the target canvas using the background color. |
+| Value | Aliases | Behavior |
+|-------|---------|----------|
+| `contain` | `scale-down` | Scale down to fit within the dimensions. Preserves aspect ratio. Never upscales. **(default)** |
+| `cover` | — | Scale and crop to fill the exact dimensions. Uses `gravity` to pick the crop anchor. Upscales if needed. |
+| `fill` | `squeeze` | Stretch to exactly fill the dimensions. Ignores aspect ratio. |
+| `inside` | — | Same as `contain`. |
+| `outside` | `scale-up` | Scale up to cover the dimensions. Preserves aspect ratio. Never downscales. |
+| `pad` | — | Resize like `contain`, then letterbox onto the target canvas using the background color. |
+| `crop` | — | Fill the target area like `cover`, but never upscales — behaves like `contain` when the source is smaller than the target. |
+| `aspect-crop` | — | Crop to the target aspect ratio. Downscales (never upscales) when the source is large enough to cover the target; otherwise crops the original-size image directly to the target ratio. |
 
 ```
 /cdn-cgi/image/w=400,h=400,fit=cover/photo.jpg
 /cdn-cgi/image/w=400,h=300,fit=fill/photo.jpg
+/cdn-cgi/image/w=400,h=400,fit=crop/photo.jpg
+/cdn-cgi/image/w=400,h=200,fit=aspect-crop/photo.jpg
 ```
 
 With `fit=pad`, set both `w` and `h` to force a fixed output canvas. The padding color comes from `bg`/`background` and defaults to white. For animated output, `fit=pad` currently behaves like `contain`.
+
+`scale-down`, `squeeze`, and `scale-up` are Cloudflare Images' names for
+pixel-dimension-equivalent behavior imgx already had under `contain`,
+`fill`, and `outside` respectively — see `docs/CLOUDFLARE_PARITY.md` gap 3
+for the equivalence proof. imgx's own default (`contain`) is unchanged.
 
 ## Gravity
 
@@ -108,24 +142,32 @@ When `fit=cover` crops the image, this controls which region to keep.
 | Value | Aliases | Behavior |
 |-------|---------|----------|
 | `center` | `centre` | Crop from center **(default)** |
-| `north` | `n` | Keep the top edge |
-| `south` | `s` | Keep the bottom edge |
-| `east` | `e` | Keep the right edge |
-| `west` | `w` | Keep the left edge |
+| `north` | `n`, `top` | Keep the top edge |
+| `south` | `s`, `bottom` | Keep the bottom edge |
+| `east` | `e`, `right` | Keep the right edge |
+| `west` | `w`, `left` | Keep the left edge |
 | `northeast` | `ne` | Keep the top-right corner |
 | `northwest` | `nw` | Keep the top-left corner |
 | `southeast` | `se` | Keep the bottom-right corner |
 | `southwest` | `sw` | Keep the bottom-left corner |
-| `smart` | — | Entropy-based detection (keeps high-detail areas) |
+| `smart` | `auto` | Entropy-based detection (keeps high-detail areas) |
 | `attention` | `att` | Attention-based detection (keeps visually interesting areas) |
 
 ```
 /cdn-cgi/image/w=400,h=400,fit=cover,g=smart/photo.jpg
 /cdn-cgi/image/w=400,h=400,fit=cover,g=north/photo.jpg
+/cdn-cgi/image/w=400,h=400,fit=cover,g=auto/photo.jpg
+/cdn-cgi/image/w=400,h=400,fit=cover,g=top/photo.jpg
 ```
 
+`top`/`bottom`/`left`/`right` and `auto` are Cloudflare Images' own gravity
+vocabulary — aliased onto imgx's existing compass words and `smart`
+respectively (same meaning, verified against Cloudflare's docs). Cloudflare's
+`face` (face-detection-based gravity) and `XxY` relative-coordinate focal
+points are **not** implemented — see `docs/CLOUDFLARE_PARITY.md` gap 12.
+
 :::info
-For content-aware cropping, use `smart` or `attention`. Directional values (`north`, `south`, and others) fall back to center cropping.
+For content-aware cropping, use `smart`/`auto` or `attention`. Directional values (`north`, `south`, and others) fall back to center cropping.
 :::
 
 ## Effects
@@ -214,13 +256,29 @@ Hex RGB color used for `fit=pad` canvas fill and alpha flattening before encodin
 
 ### `trim`
 
-Detect and crop uniform borders around the image.
+Detect and crop uniform borders around the image (border-color-aware).
 
 - **Range:** 1.0–100.0 (threshold)
 
 ```
 /cdn-cgi/image/trim=10/photo.jpg
 ```
+
+### `trim.top` / `trim.right` / `trim.bottom` / `trim.left`
+
+Crop a fixed amount from one or more edges independently — NOT border-color
+aware (unlike `trim` above), and may be combined with each other or with
+`trim`.
+
+- **Values:** an integer pixel count, or a decimal `0.0`–`1.0` fraction of that side's dimension
+
+```
+/cdn-cgi/image/trim.top=100,trim.left=50/photo.jpg
+/cdn-cgi/image/trim.left=0.1,trim.right=0.1/photo.jpg
+```
+
+See `docs/CLOUDFLARE_PARITY.md` gap 9 for what's implemented (per-side keys)
+versus not yet (the combined `top;right;bottom;left` syntax, `trim.height`/`trim.width`).
 
 ### `metadata`
 
@@ -327,6 +385,21 @@ Invalid transforms return structured JSON errors:
 
 ```json
 {"error":{"status":400,"message":"Bad Request","detail":"invalid transform parameters"}}
+```
+
+### `onerror`
+
+Opt-in per-request behavior when the transform pipeline itself fails (a
+corrupt/unsupported source, an unavailable codec, etc). By default (no
+`onerror`), imgx falls back to serving the raw origin bytes as-is. Setting
+`onerror=redirect` instead returns a `302` redirect to the origin image URL —
+only for HTTP origins (not R2, which has no public URL to redirect to).
+
+- **Values:** `redirect`
+- **Default:** unset (raw-bytes fallback)
+
+```
+/cdn-cgi/image/w=400,onerror=redirect/photo.jpg
 ```
 
 ---
