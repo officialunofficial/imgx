@@ -10,7 +10,8 @@ use imgx_vips::{ThumbnailOptions, VipsError, VipsImage, consts};
 
 use super::negotiate;
 use super::params::{
-    FitMode, FlipMode, Gravity, MetadataMode, OutputFormat, Rotation, TransformParams,
+    CompressionMode, FitMode, FlipMode, Gravity, MetadataMode, OutputFormat, Rotation,
+    TransformParams,
 };
 
 #[derive(Debug, Error)]
@@ -64,6 +65,7 @@ pub fn transform(
     limits: Option<TransformLimits>,
 ) -> Result<TransformResult, TransformError> {
     let limits = limits.unwrap_or_default();
+    let compression_fast = tp.compression == Some(CompressionMode::Fast);
 
     // -- PROBE --
     // Load first frame only (cheap) to detect animation metadata.
@@ -436,6 +438,50 @@ pub fn transform(
         current = current.flatten(bg)?;
     }
 
+    // -- BORDER -- (gap 10: verified against
+    // developers.cloudflare.com/images/optimization/features/ -- "The
+    // border is applied after the image has been resized. The border
+    // width automatically scales with the dpr parameter." No published
+    // URL syntax exists for this feature (Cloudflare marks it
+    // "available only in Workers"), so the border/border.*
+    // key names themselves are spec-derived -- see
+    // docs/CLOUDFLARE_PARITY.md gap 10. Skipped for animated output: an
+    // `embed` on the stacked frame buffer would corrupt frame boundaries
+    // the same way a naive crop does (INV-2's underlying concern).
+    if !animated_output
+        && (tp.border_width.is_some()
+            || tp.border_top.is_some()
+            || tp.border_right.is_some()
+            || tp.border_bottom.is_some()
+            || tp.border_left.is_some())
+    {
+        let uniform = tp.border_width.unwrap_or(0) as f32;
+        let scaled = |side: Option<u32>| -> i32 {
+            let px = side.map(|v| v as f32).unwrap_or(uniform);
+            (px * tp.dpr).round().max(0.0) as i32
+        };
+        let top = scaled(tp.border_top);
+        let right = scaled(tp.border_right);
+        let bottom = scaled(tp.border_bottom);
+        let left = scaled(tp.border_left);
+        if top > 0 || right > 0 || bottom > 0 || left > 0 {
+            let cur_w = current.width();
+            let cur_h = current.height();
+            let target_w = cur_w + left + right;
+            let target_h = cur_h + top + bottom;
+            // Cloudflare's `border.color` accepts any CSS color with no
+            // stated default; imgx only parses 6-hex like `bg` (see
+            // docs/CLOUDFLARE_PARITY.md gap 10) and defaults to black
+            // when unset, since Cloudflare's own docs example shows an
+            // explicit color in every case.
+            let bg = tp
+                .border_color
+                .map(|c| [c[0] as f64, c[1] as f64, c[2] as f64])
+                .unwrap_or([0.0, 0.0, 0.0]);
+            current = current.embed(left, top, target_w, target_h, bg)?;
+        }
+    }
+
     let out_width = current.width() as u32;
     let out_height = current.height() as u32;
 
@@ -447,6 +493,11 @@ pub fn transform(
     // the size the image WOULD have been served at.)
     if tp.format == Some(OutputFormat::Json) {
         let negotiated = negotiate::negotiate_format(accept_header, current.has_alpha(), None);
+        let negotiated = if animated_output {
+            negotiated
+        } else {
+            negotiate::apply_compression_fast(negotiated, compression_fast)
+        };
         let encoded = encode_image(&current, negotiated, tp.quality, tp.metadata)?;
         let json = format!(
             "{{\"original\":{{\"width\":{original_width},\"height\":{original_height},\"file_size\":{}}},\"transformed\":{{\"width\":{out_width},\"height\":{out_height},\"format\":\"{}\",\"file_size\":{}}}}}",
@@ -472,6 +523,15 @@ pub fn transform(
     let output_format = animated_format.unwrap_or_else(|| {
         negotiate::negotiate_format(accept_header, current.has_alpha(), tp.format)
     });
+    // Gap 6 -- compression=fast: bias away from the slowest encoder
+    // (AVIF)/WebP toward JPEG. Skipped for animated output -- forcing
+    // JPEG would silently drop animation, an interaction Cloudflare's
+    // docs don't describe, so animated requests are left alone.
+    let output_format = if animated_output {
+        output_format
+    } else {
+        negotiate::apply_compression_fast(output_format, compression_fast)
+    };
 
     let data = encode_image(&current, output_format, tp.quality, tp.metadata)?;
 
@@ -1306,5 +1366,101 @@ mod tests {
         assert_eq!(json["transformed"]["width"], 100);
         assert_eq!(json["transformed"]["height"], 75);
         assert!(json["transformed"]["file_size"].as_u64().unwrap() > 0);
+    }
+
+    /// Gap 6 -- `compression=fast`: when the client would otherwise
+    /// negotiate AVIF, compression=fast biases the choice to JPEG instead.
+    #[test]
+    fn transform_with_compression_fast_downgrades_avif_negotiation_to_jpeg() {
+        init();
+        let data = static_fixture();
+        let p = parse("compression=fast").unwrap();
+        let result = transform(&data, &p, Some("image/avif,image/webp"), None).unwrap();
+        assert_eq!(result.format, OutputFormat::Jpeg);
+    }
+
+    #[test]
+    fn transform_without_compression_fast_still_negotiates_avif() {
+        init();
+        let data = static_fixture();
+        let p = TransformParams::default();
+        let result = transform(&data, &p, Some("image/avif,image/webp"), None).unwrap();
+        assert_eq!(result.format, OutputFormat::Avif);
+    }
+
+    #[test]
+    fn transform_with_compression_fast_leaves_explicit_png_format_unchanged() {
+        init();
+        let data = static_fixture();
+        let p = parse("compression=fast,format=png").unwrap();
+        let result = transform(&data, &p, None, None).unwrap();
+        assert_eq!(result.format, OutputFormat::Png);
+    }
+
+    /// compression=fast also overrides an *explicit* `format=avif`/`webp`
+    /// request, matching Cloudflare's documented "will usually override
+    /// the format parameter."
+    #[test]
+    fn transform_with_compression_fast_overrides_explicit_avif_format() {
+        init();
+        let data = static_fixture();
+        let p = parse("compression=fast,format=avif").unwrap();
+        let result = transform(&data, &p, None, None).unwrap();
+        assert_eq!(result.format, OutputFormat::Jpeg);
+    }
+
+    // ------------------------------------------------------------------
+    // Gap 10 -- border (docs/CLOUDFLARE_PARITY.md)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn transform_with_uniform_border_grows_output_by_border_on_all_sides() {
+        init();
+        let data = static_fixture(); // 4x4
+        let p = parse("border=2").unwrap();
+        let result = transform(&data, &p, None, None).unwrap();
+        assert_eq!(result.width, 8);
+        assert_eq!(result.height, 8);
+    }
+
+    #[test]
+    fn transform_with_per_side_border_grows_output_asymmetrically() {
+        init();
+        let data = static_fixture(); // 4x4
+        let p = parse("border.top=1,border.left=2,border.right=3,border.bottom=4").unwrap();
+        let result = transform(&data, &p, None, None).unwrap();
+        assert_eq!(result.width, 4 + 2 + 3);
+        assert_eq!(result.height, 4 + 1 + 4);
+    }
+
+    #[test]
+    fn transform_without_border_leaves_dimensions_unchanged() {
+        init();
+        let data = static_fixture();
+        let result = transform(&data, &TransformParams::default(), None, None).unwrap();
+        assert_eq!(result.width, 4);
+        assert_eq!(result.height, 4);
+    }
+
+    #[test]
+    fn transform_with_border_after_resize_uses_post_resize_dimensions() {
+        init();
+        let data = nonsquare_fixture(); // 2000x1500
+        let p = parse("w=100,border=5").unwrap();
+        let result = transform(&data, &p, None, None).unwrap();
+        // Resized to w=100 (h derived as 75), then a 5px uniform border.
+        assert_eq!(result.width, 100 + 10);
+        assert_eq!(result.height, 75 + 10);
+    }
+
+    #[test]
+    fn transform_with_border_and_dpr_scales_border_width() {
+        init();
+        let data = static_fixture(); // 4x4
+        let p = parse("border=2,dpr=2").unwrap();
+        let result = transform(&data, &p, None, None).unwrap();
+        // Border scales with dpr: 2px * dpr 2 = 4px each side.
+        assert_eq!(result.width, 4 + 8);
+        assert_eq!(result.height, 4 + 8);
     }
 }
