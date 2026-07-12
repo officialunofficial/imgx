@@ -24,7 +24,9 @@ use crate::cache::{self, Cache, CacheEntry, MemoryCache, NoopCache, R2Cache, Tie
 use crate::config::{Config, OriginType};
 use crate::http::errors::HttpError;
 use crate::http::response;
-use crate::origin::{FetchError, FetchResult, Fetcher, OriginSource, R2Fetcher};
+use crate::origin::{
+    FetchError, FetchResult, Fetcher, OriginSource, R2Fetcher, RemoteFetchError, RemoteFetcher,
+};
 use crate::router::{self, ImageRequest, Route};
 use crate::s3::S3Client;
 use crate::transform::params::OnErrorMode;
@@ -113,6 +115,12 @@ pub struct AppState {
     pub config: Config,
     pub cache: AppCache,
     pub origin: AppOrigin,
+    /// SSRF-safe fetcher for gap 2 (arbitrary remote-URL sources) and gap
+    /// 11 (draw-overlay remote fetch) -- constructed unconditionally
+    /// (cheap: just an HTTP client), but only ever invoked when the
+    /// corresponding `IMGX_ALLOW_*` config flag is set. See
+    /// docs/INVARIANTS.md INV-14.
+    pub remote_fetcher: RemoteFetcher,
     /// A recorder scoped to this `AppState` instance, not the process-wide
     /// global one `metrics::set_global_recorder` would install. Each
     /// `AppState` (and therefore each test) gets its own isolated metric
@@ -170,6 +178,8 @@ impl AppState {
             ))
         };
 
+        let remote_fetcher = RemoteFetcher::new(cfg.origin.timeout_ms, cfg.server.max_request_size);
+
         let permits = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -199,6 +209,7 @@ impl AppState {
             config: cfg,
             cache,
             origin,
+            remote_fetcher,
             metrics_recorder,
             start_time: Instant::now(),
             vips_semaphore: Arc::new(Semaphore::new(permits)),
@@ -295,19 +306,35 @@ async fn handle_image_request(
         )));
     }
     // Gap 11 -- `draw` overlays (docs/CLOUDFLARE_PARITY.md): the array
-    // syntax parses and the compositing math is implemented and tested
-    // (transform::pipeline::composite_draw_overlay) against local image
-    // buffers, but the remote-URL *fetch* that would supply a real
-    // overlay's bytes is deliberately NOT implemented in this pass (see
-    // CLOUDFLARE_PARITY.md gap 11 for the SSRF-scoping rationale) -- so a
-    // request naming any overlay is rejected here, before an origin
-    // fetch is attempted, rather than silently ignoring `draw` or
-    // returning an image that doesn't actually have the requested
-    // overlay applied.
-    if !tp.draw.is_empty() {
-        return error_response(HttpError::unprocessable_entity(Some(
-            "draw overlays are not yet enabled: remote overlay fetch is deliberately gated, \
-             see IMGX_ALLOW_DRAW_OVERLAYS in docs/CLOUDFLARE_PARITY.md"
+    // syntax parsing and compositing math
+    // (transform::pipeline::composite_draw_overlay) were implemented
+    // first against local image buffers; the remote-URL *fetch* that
+    // supplies a real overlay's bytes is now wired up too (gap 2's
+    // SSRF-safe RemoteFetcher), but only when the operator opts in via
+    // `IMGX_ALLOW_DRAW_OVERLAYS` -- independent of
+    // `IMGX_ALLOW_REMOTE_SOURCES`, since an operator may want one
+    // without the other. Checked here, before any network call, so a
+    // disabled request never attempts an origin fetch either.
+    if !tp.draw.is_empty() && !state.config.origin.allow_draw_overlays {
+        return error_response(HttpError::forbidden(Some(
+            "draw overlays are not enabled: set IMGX_ALLOW_DRAW_OVERLAYS=true to allow \
+             fetching draw[].url overlays"
+                .to_string(),
+        )));
+    }
+    // Gap 2 -- arbitrary remote-URL sources (docs/CLOUDFLARE_PARITY.md):
+    // the source-image segment may be an absolute http(s):// URL instead
+    // of a relative path on the configured origin. Default-off
+    // (`IMGX_ALLOW_REMOTE_SOURCES=false`) preserves today's behavior for
+    // every existing deployment -- rejected here, before any network
+    // call is attempted, rather than silently treated as a relative
+    // path (which would 404/error confusingly against the wrong
+    // origin).
+    let is_remote_source = router::is_absolute_url_source(&req.image_path);
+    if is_remote_source && !state.config.origin.allow_remote_sources {
+        return error_response(HttpError::forbidden(Some(
+            "remote image sources are not enabled: set IMGX_ALLOW_REMOTE_SOURCES=true to allow \
+             fetching absolute http(s):// source URLs"
                 .to_string(),
         )));
     }
@@ -362,29 +389,61 @@ async fn handle_image_request(
     });
 
     let effective_path = strip_path_prefix(&state.config.origin.path_prefix, &req.image_path);
-    let fetch_result = match state.origin.fetch(effective_path).await {
-        Ok(r) => r,
-        Err(FetchError::NotFound) => {
-            return error_response(HttpError::not_found(Some(
-                "image not found at origin".to_string(),
-            )));
+    let fetch_result = if is_remote_source {
+        // Gap 2: `req.image_path` is itself the absolute URL to fetch --
+        // the SSRF-safe RemoteFetcher (origin/remote.rs) enforces the
+        // scheme/private-address/redirect/size guards documented in
+        // docs/INVARIANTS.md INV-14.
+        match state.remote_fetcher.fetch(&req.image_path).await {
+            Ok(r) => FetchResult {
+                data: r.data,
+                content_type: r.content_type,
+                status_code: r.status_code,
+            },
+            Err(e) => return error_response(remote_fetch_error_to_http(e)),
         }
-        Err(FetchError::Timeout) => {
-            return error_response(HttpError::gateway_timeout(Some(
-                "origin server timed out".to_string(),
-            )));
-        }
-        Err(FetchError::ResponseTooLarge) => {
-            return error_response(HttpError::payload_too_large(Some(
-                "image exceeds size limit".to_string(),
-            )));
-        }
-        Err(_) => {
-            return error_response(HttpError::bad_gateway(Some(
-                "failed to fetch from origin".to_string(),
-            )));
+    } else {
+        match state.origin.fetch(effective_path).await {
+            Ok(r) => r,
+            Err(FetchError::NotFound) => {
+                return error_response(HttpError::not_found(Some(
+                    "image not found at origin".to_string(),
+                )));
+            }
+            Err(FetchError::Timeout) => {
+                return error_response(HttpError::gateway_timeout(Some(
+                    "origin server timed out".to_string(),
+                )));
+            }
+            Err(FetchError::ResponseTooLarge) => {
+                return error_response(HttpError::payload_too_large(Some(
+                    "image exceeds size limit".to_string(),
+                )));
+            }
+            Err(_) => {
+                return error_response(HttpError::bad_gateway(Some(
+                    "failed to fetch from origin".to_string(),
+                )));
+            }
         }
     };
+
+    // Gap 11 -- fetch every `draw[].url` overlay (already gated on
+    // `allow_draw_overlays` above) through the same SSRF-safe fetcher,
+    // in cache-key/image_path order, before the transform runs. A
+    // failure here is never cached (same reasoning as origin-fetch
+    // failures below): a transient failure fetching one overlay
+    // shouldn't poison the whole request's cache entry.
+    let mut overlay_bytes: Vec<Vec<u8>> = Vec::with_capacity(tp.draw.len());
+    for overlay in &tp.draw {
+        let Some(url) = overlay.url.as_deref() else {
+            continue;
+        };
+        match state.remote_fetcher.fetch(url).await {
+            Ok(r) => overlay_bytes.push(r.data),
+            Err(e) => return error_response(remote_fetch_error_to_http(e)),
+        }
+    }
 
     let transform_limits = pipeline::TransformLimits {
         max_pixels: state.config.transform.max_pixels,
@@ -405,11 +464,23 @@ async fn handle_image_request(
 
     let transform_task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        pipeline::transform(
+        let result = pipeline::transform(
             &transform_input,
             &tp_for_task,
             accept_owned.as_deref(),
             Some(transform_limits),
+        )?;
+        // Gap 11: composite already-fetched draw overlays onto the
+        // transformed base image, then re-encode. Kept inside this same
+        // spawn_blocking task (rather than after `.await`) since
+        // compositing is more libvips FFI work and must stay off the
+        // async runtime thread, same as `transform()` itself.
+        pipeline::apply_draw_overlays(
+            result,
+            &tp_for_task.draw,
+            &overlay_bytes,
+            tp_for_task.quality,
+            tp_for_task.metadata,
         )
     });
 
@@ -471,8 +542,17 @@ fn handle_transform_failure(
     if_none_match: Option<&str>,
 ) -> Response {
     if tp.onerror == Some(OnErrorMode::Redirect) {
-        let effective_path = strip_path_prefix(&state.config.origin.path_prefix, &req.image_path);
-        if let Some(location) = state.origin.redirect_url(effective_path) {
+        // Gap 2: a remote-URL source *is* its own redirectable URL --
+        // no origin lookup needed, unlike the configured-origin case
+        // below.
+        let location = if router::is_absolute_url_source(&req.image_path) {
+            Some(req.image_path.clone())
+        } else {
+            let effective_path =
+                strip_path_prefix(&state.config.origin.path_prefix, &req.image_path);
+            state.origin.redirect_url(effective_path)
+        };
+        if let Some(location) = location {
             return Response::builder()
                 .status(StatusCode::FOUND)
                 .header(header::LOCATION, location)
@@ -544,6 +624,35 @@ fn json_response(status: StatusCode, body: &str) -> Response {
         .into_response()
 }
 
+/// Map a `RemoteFetchError` (gap 2/11's SSRF-safe fetcher) to the
+/// appropriate `HttpError`. Guard rejections (unsupported scheme,
+/// non-globally-routable address, redirect cap) are `403 Forbidden` --
+/// the request named a target that's disallowed by policy, distinct
+/// from `origin::FetchError`'s equivalents, which describe a *reachable,
+/// allowed* origin failing.
+fn remote_fetch_error_to_http(e: RemoteFetchError) -> HttpError {
+    match e {
+        RemoteFetchError::NotFound => {
+            HttpError::not_found(Some("remote image not found".to_string()))
+        }
+        RemoteFetchError::Timeout => {
+            HttpError::gateway_timeout(Some("remote server timed out".to_string()))
+        }
+        RemoteFetchError::ResponseTooLarge => {
+            HttpError::payload_too_large(Some("remote image exceeds size limit".to_string()))
+        }
+        RemoteFetchError::ServerError(_) | RemoteFetchError::ConnectionFailed(_) => {
+            HttpError::bad_gateway(Some("failed to fetch remote image".to_string()))
+        }
+        RemoteFetchError::InvalidUrl(_)
+        | RemoteFetchError::UnsupportedScheme
+        | RemoteFetchError::PrivateAddress
+        | RemoteFetchError::TooManyRedirects => {
+            HttpError::forbidden(Some(format!("remote fetch rejected: {e}")))
+        }
+    }
+}
+
 fn error_response(err: HttpError) -> Response {
     let status = StatusCode::from_u16(err.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     json_response(status, &err.to_json_response())
@@ -561,6 +670,8 @@ mod tests {
     use super::*;
     use std::sync::Once;
     use tower::ServiceExt;
+    use wiremock::matchers::{method as wm_method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     static VIPS_INIT: Once = Once::new();
 
@@ -924,18 +1035,112 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Gap 11 -- draw overlays (docs/CLOUDFLARE_PARITY.md): remote
-    // overlay fetch is deliberately not implemented in this pass, so any
-    // request naming a `draw` overlay is rejected before an origin fetch
-    // is even attempted.
+    // Gap 11 -- draw overlays (docs/CLOUDFLARE_PARITY.md): remote overlay
+    // fetch is now wired through the shared SSRF-safe RemoteFetcher
+    // (gap 2), gated on its own `IMGX_ALLOW_DRAW_OVERLAYS` flag,
+    // independent of `IMGX_ALLOW_REMOTE_SOURCES`.
     // ----------------------------------------------------------------
 
     #[tokio::test]
-    async fn draw_overlay_request_is_rejected_since_remote_fetch_is_not_yet_enabled() {
+    async fn draw_overlay_request_is_rejected_by_default_with_403() {
         let router = build_router(test_state());
         let (status, body) = get(router, "/cdn-cgi/image/draw.0.url=logo.png/photo.jpg").await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(body.contains("draw overlays are not yet enabled"));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("draw overlays are not enabled"));
+    }
+
+    #[tokio::test]
+    async fn draw_overlay_request_reaches_the_shared_fetcher_when_allowed() {
+        // With the flag enabled, the request must no longer be rejected
+        // with the "not enabled" message. This request's main image
+        // origin is unreachable (default config), so it fails at the
+        // main fetch step with a 502 -- distinct from, and never, the
+        // "not enabled" 422/403 the disabled case returns, proving the
+        // draw-overlay gate itself no longer fires.
+        let mut cfg = Config::defaults();
+        cfg.origin.allow_draw_overlays = true;
+        let router = build_router(Arc::new(AppState::new(cfg)));
+        let (status, body) = get(router, "/cdn-cgi/image/draw.0.url=logo.png/photo.jpg").await;
+        assert_ne!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!body.contains("draw overlays are not enabled"));
+    }
+
+    #[tokio::test]
+    async fn draw_overlay_url_resolving_to_a_private_address_is_rejected_even_when_allowed() {
+        // The overlay URL points at a real loopback server -- proving
+        // the allow-flag flows all the way through to the shared
+        // SSRF-safe fetcher, whose own private-address guard (tested
+        // directly in origin/remote.rs) still applies. The main image
+        // origin is given a working (if not real-image) response so the
+        // request reaches the overlay-fetch step at all, which runs
+        // before the transform.
+        let base_url = serve_repeatedly(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\n\r\nhello",
+        )
+        .await;
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/logo.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"logo".to_vec()))
+            .mount(&server)
+            .await;
+
+        let mut cfg = Config::defaults();
+        cfg.origin.base_url = base_url;
+        cfg.origin.allow_draw_overlays = true;
+        let router = build_router(Arc::new(AppState::new(cfg)));
+        let overlay_url = format!("{}/logo.png", server.uri());
+        let uri = format!("/cdn-cgi/image/draw.0.url={overlay_url}/photo.jpg");
+        let (status, body) = get(router, &uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("remote fetch rejected"));
+    }
+
+    // ----------------------------------------------------------------
+    // Gap 2 -- arbitrary remote-URL sources (docs/CLOUDFLARE_PARITY.md):
+    // default-off, opt-in via `IMGX_ALLOW_REMOTE_SOURCES`.
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn remote_source_request_is_rejected_by_default_with_403_and_no_network_call() {
+        let router = build_router(test_state());
+        let (status, body) = get(router, "/cdn-cgi/image/w=100/https://example.com/cat.jpg").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("remote image sources are not enabled"));
+    }
+
+    #[tokio::test]
+    async fn remote_source_request_reaches_the_shared_fetcher_when_allowed() {
+        // A remote source pointed at a real loopback server: proves the
+        // allow-flag flows through to a real fetch attempt (rejected by
+        // the fetcher's own private-address guard, exactly like the
+        // draw-overlay case above), rather than being silently treated
+        // as a relative path against the configured origin.
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/cat.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"cat".to_vec()))
+            .mount(&server)
+            .await;
+
+        let mut cfg = Config::defaults();
+        cfg.origin.allow_remote_sources = true;
+        let router = build_router(Arc::new(AppState::new(cfg)));
+        let source_url = format!("{}/cat.jpg", server.uri());
+        let uri = format!("/cdn-cgi/image/w=100/{source_url}");
+        let (status, body) = get(router, &uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("remote fetch rejected"));
+    }
+
+    #[tokio::test]
+    async fn remote_source_flag_does_not_enable_draw_overlays_and_vice_versa() {
+        let mut cfg = Config::defaults();
+        cfg.origin.allow_remote_sources = true;
+        let router = build_router(Arc::new(AppState::new(cfg)));
+        let (status, body) = get(router, "/cdn-cgi/image/draw.0.url=logo.png/photo.jpg").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("draw overlays are not enabled"));
     }
 
     // ----------------------------------------------------------------
