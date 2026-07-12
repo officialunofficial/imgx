@@ -15,11 +15,11 @@ Client (browser, app)
   │
   │  GET /cdn-cgi/image/w=800,f=auto,q=85/photos/hero.jpg
   ▼
-┌──────────┐
+┌─────────┐
 │  imgx   │──▶ Cache hit? Serve immediately.
 │          │──▶ Cache miss? Fetch from origin.
 │          │──▶ Transform, cache, and serve.
-└──────────┘
+└─────────┘
   │
   ▼
 Origin (S3, R2, any HTTP server)
