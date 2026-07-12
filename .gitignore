@@ -4,3 +4,4 @@ node_modules/
 .wrangler/
 docs/dist/
 target/
+.claude/worktrees/
