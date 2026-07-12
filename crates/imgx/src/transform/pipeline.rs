@@ -640,12 +640,11 @@ fn resolve_overlay_dim(v: f32, base_dim: i32) -> i32 {
 /// Composite a single already-decoded overlay image onto `base`,
 /// implementing a bounded, spec-derived subset of Cloudflare's `draw`
 /// overlay semantics (docs/CLOUDFLARE_PARITY.md gap 11). This function
-/// proves the libvips compositing math against local, already-fetched
-/// image buffers -- the actual remote-URL fetch that would supply
-/// `overlay_bytes` in a real request is deliberately NOT implemented in
-/// this pass (see the gap-11 note in CLOUDFLARE_PARITY.md); callers here
-/// (currently only this module's own tests) supply already-fetched bytes
-/// directly.
+/// proves the libvips compositing math against local image buffers,
+/// independent of how those bytes were obtained. The real remote-URL
+/// fetch that supplies `overlay_bytes` for a live request goes through
+/// the SSRF-safe `origin::RemoteFetcher` (gap 2), wired up in
+/// `server.rs`'s `handle_image_request` and `apply_draw_overlays` below.
 ///
 /// Documented scope limitations, not silently dropped:
 /// - Opacity attenuation only has an effect when the overlay already
@@ -727,7 +726,11 @@ pub fn composite_draw_overlay(
 }
 
 /// Encode a VipsImage into a buffer using the specified output format.
-fn encode_image(
+/// `pub(crate)` (rather than private) so `server.rs` can re-encode a base
+/// image after compositing draw overlays fetched post-transform -- see
+/// the draw-overlay wiring in `server.rs`'s `handle_image_request`
+/// (Cloudflare parity gap 11).
+pub(crate) fn encode_image(
     image: &VipsImage,
     format: OutputFormat,
     quality: u8,
@@ -756,6 +759,50 @@ fn encode_image(
         // instead (see the `-- JSON --` block below).
         OutputFormat::Json => image.save_jpeg(q, do_strip),
     }
+}
+
+/// Composite already-fetched `draw` overlay bytes onto an already-
+/// transformed `TransformResult`, then re-encode with the same
+/// format/quality/metadata the base transform used. Called from
+/// `server.rs`'s `handle_image_request` after `transform()` and after
+/// every overlay URL has been fetched through the SSRF-safe
+/// `origin::RemoteFetcher` (gap 2), gated on `IMGX_ALLOW_DRAW_OVERLAYS`
+/// (gap 11).
+///
+/// A no-op (returns `result` unchanged) when there is nothing to
+/// composite, when the output is animated (compositing onto a
+/// vertically-stacked animated frame buffer would corrupt frame
+/// boundaries -- the same INV-2 concern the BORDER stage already
+/// documents), or when the output is a `format=json` metadata response
+/// (no image bytes to composite onto).
+pub fn apply_draw_overlays(
+    result: TransformResult,
+    draw: &[DrawOverlay],
+    overlay_bytes: &[Vec<u8>],
+    quality: u8,
+    metadata: MetadataMode,
+) -> Result<TransformResult, TransformError> {
+    if draw.is_empty() || overlay_bytes.is_empty() || result.is_animated {
+        return Ok(result);
+    }
+    if result.format == OutputFormat::Json {
+        return Ok(result);
+    }
+
+    let mut base = VipsImage::from_buffer(&result.data)?;
+    let mut bytes_iter = overlay_bytes.iter();
+    for entry in draw {
+        if entry.url.is_none() {
+            continue;
+        }
+        let Some(bytes) = bytes_iter.next() else {
+            break;
+        };
+        base = composite_draw_overlay(&base, bytes, entry)?;
+    }
+
+    let data = encode_image(&base, result.format, quality, metadata)?;
+    Ok(TransformResult { data, ..result })
 }
 
 /// Encode as GIF. Before encoding, validates that page-height metadata
@@ -1570,10 +1617,10 @@ mod tests {
 
     // ------------------------------------------------------------------
     // Gap 11 -- draw overlays (docs/CLOUDFLARE_PARITY.md): compositing
-    // math proof against local, already-fetched image buffers. The
-    // remote-URL fetch that would supply `overlay_bytes` in production
-    // is deliberately not implemented -- see composite_draw_overlay's
-    // doc comment and CLOUDFLARE_PARITY.md gap 11.
+    // math proof against local, already-fetched image buffers. The real
+    // remote-URL fetch that supplies `overlay_bytes` in production goes
+    // through origin::RemoteFetcher (gap 2) -- see apply_draw_overlays'
+    // own tests further down for the post-transform integration point.
     // ------------------------------------------------------------------
 
     fn overlay_fixture() -> Vec<u8> {
@@ -1690,5 +1737,99 @@ mod tests {
         };
         let result = composite_draw_overlay(&base, &overlay_fixture(), &entry).unwrap();
         assert_eq!(result.width(), base.width());
+    }
+
+    // ------------------------------------------------------------------
+    // apply_draw_overlays -- the post-transform integration point called
+    // from server.rs after every overlay URL has been fetched through
+    // the SSRF-safe origin::RemoteFetcher (gap 2). These tests operate
+    // on a real TransformResult from transform() itself, proving the
+    // composite-then-re-encode round trip end to end.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn apply_draw_overlays_composites_and_reencodes_preserving_dimensions() {
+        init();
+        let data = nonsquare_fixture();
+        let base_result = transform(&data, &TransformParams::default(), None, None).unwrap();
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            ..Default::default()
+        };
+        let composited = apply_draw_overlays(
+            base_result.clone(),
+            std::slice::from_ref(&entry),
+            &[overlay_fixture()],
+            80,
+            MetadataMode::Strip,
+        )
+        .unwrap();
+        assert_eq!(composited.width, base_result.width);
+        assert_eq!(composited.height, base_result.height);
+        assert_ne!(composited.data, base_result.data);
+        // Re-decodable -- proves it's a real, valid re-encoded image, not
+        // just the base bytes passed through unchanged.
+        let decoded = VipsImage::from_buffer(&composited.data).unwrap();
+        assert_eq!(decoded.width(), composited.width as i32);
+    }
+
+    #[test]
+    fn apply_draw_overlays_is_a_no_op_with_no_overlays() {
+        init();
+        let data = nonsquare_fixture();
+        let base_result = transform(&data, &TransformParams::default(), None, None).unwrap();
+        let result =
+            apply_draw_overlays(base_result.clone(), &[], &[], 80, MetadataMode::Strip).unwrap();
+        assert_eq!(result.data, base_result.data);
+    }
+
+    #[test]
+    fn apply_draw_overlays_skips_animated_output() {
+        init();
+        let data = fixture("loading.gif");
+        let p = TransformParams {
+            width: Some(50),
+            ..Default::default()
+        };
+        let base_result = transform(&data, &p, Some("image/gif"), None).unwrap();
+        assert!(base_result.is_animated);
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            ..Default::default()
+        };
+        let result = apply_draw_overlays(
+            base_result.clone(),
+            std::slice::from_ref(&entry),
+            &[overlay_fixture()],
+            80,
+            MetadataMode::Strip,
+        )
+        .unwrap();
+        assert_eq!(result.data, base_result.data);
+    }
+
+    #[test]
+    fn apply_draw_overlays_skips_json_output() {
+        init();
+        let data = nonsquare_fixture();
+        let p = TransformParams {
+            format: Some(OutputFormat::Json),
+            ..Default::default()
+        };
+        let base_result = transform(&data, &p, None, None).unwrap();
+        assert_eq!(base_result.format, OutputFormat::Json);
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            ..Default::default()
+        };
+        let result = apply_draw_overlays(
+            base_result.clone(),
+            std::slice::from_ref(&entry),
+            &[overlay_fixture()],
+            80,
+            MetadataMode::Strip,
+        )
+        .unwrap();
+        assert_eq!(result.data, base_result.data);
     }
 }
