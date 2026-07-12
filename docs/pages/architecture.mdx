@@ -8,40 +8,40 @@ imgx is an HTTP image proxy built for concurrent request handling. It fetches im
 Client Request
      │
      ▼
-┌──────────┐     Parse the target path. Detect well-known
+┌────────┐     Parse the target path. Detect well-known
 │  Router   │───▶ routes (/health, /ready, /metrics)
-└────┬─────┘     or extract image path and transform string.
+└────┬────┘     or extract image path and transform string.
      │
      ▼
-┌──────────┐     Parse comma-separated key=value pairs
+┌────────┐     Parse comma-separated key=value pairs
 │  Params   │───▶ into a TransformParams struct. Validate
 │  Parser   │     ranges for w, h, q, fit, g, and others.
-└────┬─────┘
+└────┬────┘
      │
      ▼
-┌──────────┐     Build a deterministic key: <path>|<transforms>|<format>
+┌────────┐     Build a deterministic key: <path>|<transforms>|<format>
 │  Cache    │───▶ Check L1 (memory), then L2 (R2) if configured.
 │  Lookup   │     Hit → serve with ETag and Cache-Control.
-└────┬─────┘
+└────┬────┘
      │ miss
      ▼
-┌──────────┐     HTTP GET to base URL + path, or
+┌────────┐     HTTP GET to base URL + path, or
 │  Origin   │───▶ S3 GET from the R2 originals bucket.
 │  Fetch    │
-└────┬─────┘
+└────┬────┘
      │
      ▼
-┌──────────┐     1. Probe (detect animation, load first frame)
+┌────────┐     1. Probe (detect animation, load first frame)
 │ Transform │───▶ 2. Decide and reload (animated or static path)
 │ Pipeline  │     3. Resize → Effects → Encode
 │ (libvips) │
-└────┬─────┘
+└────┬────┘
      │
      ▼
-┌──────────┐     Write to L1 (memory) and L2 (R2) if configured.
+┌────────┐     Write to L1 (memory) and L2 (R2) if configured.
 │  Cache    │
 │  Store    │
-└────┬─────┘
+└────┬────┘
      │
      ▼
   Response        200 with image body, ETag, Cache-Control, Vary: Accept
@@ -96,7 +96,7 @@ crates/
 imgx uses a `Cache` trait (async methods, `impl Future` return position) with multiple backends. The backend set is closed (Memory/Noop/R2/Tiered), so the server selects a concrete `AppCache` enum variant at startup based on config rather than using `dyn Cache` — no boxing, no object-safety cost:
 
 ```
-┌─────────────────────────────────────────┐
+┌───────────────────────────────┐
 │            TieredCache                  │
 │                                         │
 │  ┌──────────────┐  ┌─────────────────┐  │
@@ -107,7 +107,7 @@ imgx uses a `Cache` trait (async methods, `impl Future` return position) with mu
 │  │ - Size-bound │  │ - Cross-restart│  │
 │  │ - Fastest    │  │ - Shared       │  │
 │  └──────────────┘  └─────────────────┘  │
-└─────────────────────────────────────────┘
+└───────────────────────────────┘
 ```
 
 **Read path:** L1 hit → return. L1 miss → check L2 → promote to L1 → return.
@@ -131,7 +131,7 @@ When `IMGX_ORIGIN_TYPE=http` (no R2 configured), only the L1 memory cache is act
 Appends the request path to `IMGX_ORIGIN_BASE_URL`:
 
 ```
-Request:  GET /photos/cat.jpg/w=400
+Request:  GET /cdn-cgi/image/w=400/photos/cat.jpg
 Origin:   GET https://images.example.com/photos/cat.jpg
 ```
 
@@ -140,7 +140,7 @@ Origin:   GET https://images.example.com/photos/cat.jpg
 Fetches from a Cloudflare R2 bucket using AWS SigV4-signed presigned URLs:
 
 ```
-Request:  GET /photos/cat.jpg/w=400
+Request:  GET /cdn-cgi/image/w=400/photos/cat.jpg
 Origin:   S3 GET from bucket "originals", key "photos/cat.jpg"
 ```
 
@@ -153,9 +153,9 @@ With R2 origin, the tiered cache uses a second R2 bucket (`IMGX_R2_BUCKET_VARIAN
 The pipeline uses a probe-decide-reload flow for animation-aware processing:
 
 ```
-┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
+┌────────┐    ┌────────┐    ┌────────┐    ┌────────┐    ┌────────┐    ┌────────┐
 │  Probe  │───▶│ Decide  │───▶│ Reload  │───▶│ Resize  │───▶│ Effects │───▶│ Encode  │
-└─────────┘    └─────────┘    └─────────┘    └─────────┘    └─────────┘    └─────────┘
+└────────┘    └────────┘    └────────┘    └────────┘    └────────┘    └────────┘
 ```
 
 ### 1. Probe
