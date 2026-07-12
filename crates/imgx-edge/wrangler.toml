@@ -1,0 +1,45 @@
+# Wrangler configuration for imgx-edge, a thin Cloudflare Workers reverse
+# proxy that sits in front of an imgx origin and lets Workers Caching absorb
+# repeat requests. See ../../docs/pages/cloudflare-edge-deployment.mdx.
+#
+# This file lives next to imgx-edge's Cargo.toml (not at the repo root)
+# because `wrangler` resolves relative paths -- `main`, the build command's
+# working directory, etc. -- against the directory the config file is in.
+# Keeping it colocated with the crate it builds means `wrangler deploy` works
+# from `crates/imgx-edge/` without extra `--config`/cwd juggling, and mirrors
+# the layout of every `workers-rs` template (Cargo.toml + wrangler.toml
+# side by side).
+
+name = "imgx-edge"
+main = "build/index.js"
+
+# Placeholder -- bump to the actual deploy date before running `wrangler
+# deploy`. Cloudflare recommends setting this to "today" at deploy time
+# rather than leaving it stale; it pins the runtime behavior version this
+# Worker opts into.
+compatibility_date = "2026-07-12"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+# Workers Caching (not the programmatic Cache API -- see the module doc
+# comment in src/lib.rs for why). Requires Wrangler >= 4.69.0; the repo's
+# root package.json currently pins wrangler ^4.65.0 for the docs site build,
+# so bump that devDependency before deploying this Worker.
+[cache]
+enabled = true
+
+# No routes/zone binding yet -- which hostname this Worker fronts is an open
+# question for the repo owner (imgx.pages.dev serves the docs site via a
+# separate, dashboard/CI-managed Pages project and is NOT necessarily the
+# right target). Fill this in once a hostname is chosen, e.g.:
+#
+# routes = [
+#   { pattern = "images.example.com/*", zone_name = "example.com" }
+# ]
+
+[vars]
+# The upstream imgx origin this Worker proxies to, e.g.
+# "https://imgx.internal.example.com". Must not include a path. Replace
+# with the real origin before deploying -- there is no working default.
+IMGX_ORIGIN_URL = "https://changeme.invalid"

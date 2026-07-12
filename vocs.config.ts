@@ -48,6 +48,10 @@ export default defineConfig({
       text: "Operations",
       items: [
         { text: "Deployment", link: "/deployment" },
+        {
+          text: "Cloudflare Edge Deployment",
+          link: "/cloudflare-edge-deployment",
+        },
         { text: "Architecture", link: "/architecture" },
         { text: "Performance", link: "/performance" },
       ],
