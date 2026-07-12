@@ -43,12 +43,12 @@ Priority key — **P0**: blocks any honest "1:1 parity" claim. **P1**: parameter
 | 3 | `fit` vocabulary | 8 values incl. `scale-down` (default), `crop`, `aspect-crop`, `scale-up` | 6 values, `contain` default | P0 |
 | 4 | `quality`/`q` | 1–100 + perceptual strings; default 85 | 1–100 only; default 80 | P1 |
 | 5 | `format`/`f` | adds `baseline-jpeg`, `json` | neither | P1 |
-| 6 | `compression=fast` | quality-for-speed tradeoff | none | P2 |
+| 6 | `compression=fast` | quality-for-speed tradeoff | **DONE** — see `docs/CLOUDFLARE_PARITY.md` gap 6 | — |
 | 7 | `onerror=redirect` | redirect on failure | raw-bytes fallback (INVARIANTS.md) | P1 |
-| 8 | `slow-connection-quality`/`scq` | client-hint quality override | none | P2 |
+| 8 | `slow-connection-quality`/`scq` | client-hint quality override | **DONE** — see `docs/CLOUDFLARE_PARITY.md` gap 8 | — |
 | 9 | `trim` | border-color-aware, per-side | numeric threshold only | P1 |
-| 10 | `border` | draws border | none | P2 |
-| 11 | `draw` (overlays) | watermark/overlay array | nothing | P2 (largest net-new) |
+| 10 | `border` | draws border | **DONE** (spec-derived URL syntax — Cloudflare's own `border` is Workers-only, no URL form published) — see `docs/CLOUDFLARE_PARITY.md` gap 10 | — |
+| 11 | `draw` (overlays) | watermark/overlay array | **PARTIAL** — parsing + compositing pipeline done and tested against local buffers; remote overlay fetch deliberately gated (same SSRF concern as gap 2) — see `docs/CLOUDFLARE_PARITY.md` gap 11 | remote fetch remains open, tracked alongside OQ-2 |
 | 12 | `gravity`/`g` | named + `auto` + possible focal-point coords | compass words + `smart`/`attention` | P0 (verify) |
 | 13 | `rotate` ordering | before resize/crop | unverified | P0 (verify) |
 
@@ -76,7 +76,7 @@ Phase B1 (docs honesty fix) shipped as part of the URL migration — `docs/pages
 
 ## 6. Remaining Open Questions
 
-- **OQ-2:** Arbitrary remote-URL sources (Stream B gap 2) — security posture, config surface, env-var names. Not yet designed.
+- **OQ-2:** Arbitrary remote-URL sources (Stream B gap 2) — security posture, config surface, env-var names. Not yet designed. **Update:** gap 11 (`draw` overlays) needed the same shape of problem at smaller scale (fetching an attacker-influenced overlay URL) and deliberately did *not* build a fetcher rather than risk a subtly-wrong SSRF boundary — see `docs/CLOUDFLARE_PARITY.md` gap 11's "Scope decision" note. There is no SSRF-gated fetch reference implementation in the codebase yet from this pass; whoever designs gap 2's general remote-source fetcher should treat gap 11's `TransformParams::draw[].url` fields as a second, narrower consumer to wire in once that fetcher exists (same scheme-allowlist/DNS-private-range-rejection/redirect-cap/size-cap shape applies to both).
 - **OQ-3:** Adopt Cloudflare's defaults (`fit=scale-down`, `quality=85`) globally, per-route, or not at all?
 - **OQ-4:** Error-fallback reconciliation — `onerror=redirect` vs imgx's raw-bytes-on-failure invariant.
 - **OQ-5:** `trim` semantics — replace, or keep legacy numeric alongside Cloudflare's dotted per-side keys?

@@ -26,12 +26,12 @@ Every claim below is marked as one of:
 | 3 | `fit` vocabulary | done | See "Gap 3 — fit" below. |
 | 4 | `quality`/`q` perceptual strings | done (spec-derived mapping) | See "Gap 4 — quality" below. |
 | 5 | `format`/`f`: `baseline-jpeg`, `json` | done | See "Gap 5 — format" below. |
-| 6 | `compression=fast` | not-planned | P2, explicitly deferred per PRD. |
+| 6 | `compression=fast` | done | See "Gap 6 — compression" below. |
 | 7 | `onerror=redirect` | done | See "Gap 7 — onerror" below. |
-| 8 | `slow-connection-quality`/`scq` | not-planned | P2, explicitly deferred per PRD. |
+| 8 | `slow-connection-quality`/`scq` | done | See "Gap 8 — slow-connection-quality" below. |
 | 9 | `trim` per-side keys | partial | Per-side pixel/fraction crop (`trim.top`/`.right`/`.bottom`/`.left`) implemented; legacy numeric `trim=<threshold>` preserved unchanged. `trim.height`/`trim.width` and the single combined `top;right;bottom;left` syntax are NOT implemented — see "Gap 9 — trim" below. |
-| 10 | `border` | not-planned | P2, explicitly deferred per PRD. |
-| 11 | `draw` (overlays) | not-planned | P2, explicitly deferred per PRD (largest net-new feature; PRD OQ-9). |
+| 10 | `border` | done (spec-derived URL syntax) | See "Gap 10 — border" below. |
+| 11 | `draw` (overlays) | partial (parsing + compositing done, remote fetch deliberately gated) | See "Gap 11 — draw" below. |
 | 12 | `gravity`/`g` | partial | Verified side/auto aliases implemented; `face` and `XxY` focal-point coordinates NOT implemented — see "Gap 12 — gravity" below. |
 | 13 | `rotate` ordering | done (verified, already correct) | See "Gap 13 — rotate ordering" below. |
 
@@ -266,3 +266,222 @@ image's actual dimensions). All four may be combined in one request.
   bounded. Not silently broken — simply unrecognized parameter keys, so a
   request using them today gets `ParseError::InvalidParameter` (400), not a
   wrong/silent result.
+
+## Gap 6 — compression
+
+**Verified** against `developers.cloudflare.com/images/optimization/features/`
+(`compression` section) via the Cloudflare docs MCP tool:
+
+> "Selects the output format that is quickest to compress. Accepts `fast`.
+> The default is none. The `compression=fast` option prioritizes encoding
+> speed over output quality and file size, and will usually override the
+> `format` parameter to choose JPEG over more efficient formats like AVIF
+> or WebP."
+
+Implemented as `compression=fast` (`TransformParams::compression:
+Option<CompressionMode>`, `crates/imgx/src/transform/params.rs`). The actual
+bias is applied as a new pure function,
+`negotiate::apply_compression_fast(format, compression_fast)`
+(`crates/imgx/src/transform/negotiate.rs`), called from `pipeline.rs` *after*
+`negotiate_format`/`negotiate_animated_format` resolve a format — deliberately
+not folded into `negotiate_format` itself, so that function's existing
+30-test priority-order API stays untouched. Behavior:
+
+- If the resolved format is `Avif` or `Webp`, it is downgraded to `Jpeg`.
+  This applies whether the format came from Accept-header negotiation *or*
+  an explicit `format=avif`/`format=webp` — matching the doc's literal
+  "will usually override the format parameter," which our implementation
+  treats as an unconditional override (imgx has no per-request encoder
+  benchmarking to make Cloudflare's "usually" a variable decision).
+- `Jpeg`/`Png`/`Gif`/`BaselineJpeg` are left unchanged (nothing to speed up
+  by switching away from).
+- Skipped entirely for animated output (`is_animated_output` in the
+  pipeline) — forcing JPEG would silently drop animation, an interaction
+  Cloudflare's docs don't describe, so animated requests are left alone
+  rather than guessing.
+- Reducing libvips per-format encoder effort/speed settings (the task's
+  "and/or" alternative) was **not implemented**: none of `imgx-vips`'s
+  existing save wrappers (`save_jpeg`/`save_webp`/`save_avif`/`save_gif`)
+  expose an effort knob today, and since compression=fast already routes
+  around the AVIF encoder entirely (the slow one), adding a new FFI-level
+  effort parameter for JPEG (which has none) or WebP (whose "effort" option
+  is a much smaller win than avoiding AVIF) was judged unnecessary scope for
+  this pass.
+
+Cache key: `compression=fast` is included when set
+(`cache_key_includes_compression_when_set`).
+
+## Gap 8 — slow-connection-quality / scq
+
+**Verified** against `developers.cloudflare.com/images/optimization/features/`
+(`slow-connection-quality`/`scq` section) via the Cloudflare docs MCP tool:
+
+> "Overrides the `quality` value whenever a slow connection is detected.
+> Accepts the same fixed or perceptual settings as quality... To detect slow
+> connections, enable any of the following client hints via HTTP in a
+> header: `accept-ch: rtt, save-data, ect, downlink`. `slow-connection-quality`
+> applies when the client hint is present and any of the following
+> conditions are met: rtt greater than 150ms; save-data is "on"; ect is one
+> of slow-2g/2g/3g; downlink is less than 5Mbps."
+
+Implemented as `scq`/`slow-connection-quality`
+(`TransformParams::scq: Option<u8>`, reusing the existing `parse_quality`
+fixed/perceptual parser). The trigger conditions are a pure, independently
+unit-tested predicate, `params::is_slow_connection(rtt, save_data, ect,
+downlink)` — deliberately decoupled from the HTTP layer so the exact
+threshold logic is directly testable without spinning up a request.
+`crates/imgx/src/server.rs`'s `handle_image_request` reads the four raw
+header values (`rtt`, `save-data`, `ect`, `downlink`) off the incoming
+request, calls `is_slow_connection`, and — if true and `scq` was requested —
+calls `TransformParams::apply_scq_override(true)`, which overwrites
+`quality` with the `scq` value *before* the cache key is computed.
+
+**Cache key**: `scq` itself is deliberately **excluded** from
+`to_cache_key()` — see `cache_key_omits_scq_since_the_override_already_shows_up_in_quality`.
+Instead of a parallel cache-key field, `handle_image_request` now builds the
+operational cache key from `TransformParams::to_cache_key()` (the existing
+canonical, order-independent serialization) rather than the raw URL options
+segment it previously used. Since the override mutates `quality` directly,
+and `to_cache_key()` already includes `q=`, two otherwise-identical requests
+that differ only in whether the client hints indicate a slow connection
+naturally get different cache entries — no bolt-on mechanism needed. This
+also incidentally fixes a preexisting divergence: the operational cache key
+was previously the raw URL options string (parameter-order-sensitive),
+not the canonical, order-independent `to_cache_key()` INV-1 describes;
+`w=400,h=300` and `h=300,w=400` now share one cache entry end-to-end, not
+just in `to_cache_key()`'s own unit tests.
+
+This feature's `Note` in Cloudflare's docs restricts it to "the URL
+interface on Chromium-based browsers" — imgx has no way to detect browser
+engine server-side beyond `Accept`/`User-Agent` sniffing, so this
+implementation applies the override whenever the qualifying headers are
+present, regardless of client, matching the *conditions* but not the
+browser-family restriction (a strictly server-observable subset of
+Cloudflare's full behavior).
+
+## Gap 10 — border
+
+**Verified (feature existence + semantics), but Workers-only** against
+`developers.cloudflare.com/images/optimization/features/` (`border` section)
+via the Cloudflare docs MCP tool:
+
+> "Adds a border around the image. Note: This feature is available only in
+> Workers. Accepts the following properties: `color`... `width`...
+> `top`, `right`, `bottom`, `left`... The border is applied after the image
+> has been resized. The border width automatically scales with the dpr
+> parameter."
+
+Cloudflare does **not** publish a URL-interface syntax for `border` at all
+(it's Workers/`cf.image.border`-only) — so the key names below are
+**spec-derived**, chosen to be consistent with imgx's existing conventions
+rather than a verified Cloudflare URL form:
+
+- `border=<width>` — uniform width in pixels on all four sides.
+- `border.color=<hex>` — 6-hex RGB, reusing the exact `bg`/`background`
+  hex-color parser (`parse_hex_color`). Defaults to black (`000000`) when
+  unset — Cloudflare's own docs don't state a default, every example shows
+  an explicit color.
+- `border.top`/`.right`/`.bottom`/`.left=<width>` — per-side pixel width,
+  overriding the uniform `border` value for that side only, using the same
+  dotted-key convention as `trim.top`/etc.
+
+Implemented in `pipeline.rs`'s new `-- BORDER --` stage, placed after all
+resize/effect steps (matching "applied after the image has been resized"),
+reusing the existing `VipsImage::embed` wrapper — **no new FFI needed**.
+Border pixel values are scaled by `tp.dpr` (rounded), matching "automatically
+scales with the dpr parameter." Skipped for animated output, for the same
+reason INV-2's resize-with-crop workaround exists: an `embed` on the
+vertically-stacked frame buffer would corrupt frame boundaries.
+
+A conservative `0..=2000`px bound is enforced in `validate()`
+(`ParseError::InvalidBorder`) — not a Cloudflare-published limit (no numeric
+range beyond "in pixels" is documented), chosen to keep the padded canvas
+well within the existing 8192 FFI-safety ceiling.
+
+## Gap 11 — draw (overlays)
+
+**Verified (feature existence + semantics), but Workers-only** against
+`developers.cloudflare.com/images/optimization/transformations/draw-overlays/`
+and `developers.cloudflare.com/images/optimization/draw-overlays/` via the
+Cloudflare docs MCP tool. Both pages describe `draw` exclusively as a
+`cf.image.draw` array on a Workers `fetch()` subrequest — "This feature is
+available only in Workers" — with fields `url`, `width`/`height` (pixels or
+a `0..1` fraction of the base image's dimension), `fit`/`gravity` (reusing
+the main image's), `opacity` (`0..1`), `repeat` (`true`/`"x"`/`"y"`),
+`top`/`left`/`bottom`/`right` (pixel offsets; setting both `top`+`bottom` or
+both `left`+`right` is documented as an error), `background`, and `rotate`.
+
+**No URL-interface syntax is published for this feature at all** — so, per
+the task's framing, this is designed rather than verified:
+`draw.<N>.<field>` (e.g. `draw.0.url=...`, `draw.0.width=...`,
+`draw.1.url=...` for a second overlay), a flattened array encoding chosen to
+be consistent with imgx's existing dotted-key conventions
+(`trim.top`/`border.top`), **not** claimed to be byte-for-byte identical to
+any real Cloudflare URL form — that detail isn't confidently verifiable
+since Cloudflare has never published one.
+
+**Scope decision — option (b) from the task, not option (a)**: implement
+the `draw` array parsing and the libvips compositing pipeline in full,
+proven against local/already-fetched image buffers, but do **not** build
+the actual remote-URL fetch this pass. Reasoning: a correct, safe SSRF-gated
+fetcher (non-http(s) scheme rejection, DNS resolution with private/
+loopback/link-local IP-range rejection, redirect-count capping, response-size
+capping) is a substantial, security-sensitive undertaking in its own right —
+essentially the same shape of problem as gap 2's arbitrary remote-source
+fetch, which this task explicitly keeps out of scope as a separate
+owner-facing decision (PRD OQ-2). Building a second, narrower SSRF-gated
+fetcher just for overlay URLs, correctly, within an already-large multi-gap
+pass, was judged more likely to ship a subtly-wrong security boundary than
+to build it right. Splitting gap 11 into "prove the parsing and compositing
+math work" (done, tested) vs. "fetch arbitrary attacker-influenced URLs
+safely" (deferred, alongside gap 2) keeps the security-sensitive surface
+area unimplemented rather than half-implemented.
+
+What's implemented and tested:
+
+- **Parsing**: `draw.<N>.<field>` for all documented fields (`url`, `width`,
+  `height`, `top`, `left`, `bottom`, `right`, `opacity`, `repeat`,
+  `background`, `rotate`, `fit`, `gravity`) into `TransformParams::draw:
+  Vec<DrawOverlay>`. `validate()` enforces: `url` non-empty; `top`+`bottom`
+  mutually exclusive; `left`+`right` mutually exclusive (matching
+  Cloudflare's documented error case); `opacity` in `0.0..=1.0`; no negative
+  width/height/position values.
+- **Compositing pipeline**: `transform::pipeline::composite_draw_overlay`
+  (`crates/imgx/src/transform/pipeline.rs`) takes an already-decoded base
+  `VipsImage` and already-fetched overlay bytes and: resizes the overlay to
+  `width`/`height` (pixel or base-relative fraction) via `fit`/`gravity`;
+  rotates it (reusing the main image's `Rotation` enum — Cloudflare's docs
+  say "same as for the main image," which only supports 0/90/180/270, so
+  overlay rotation is bound by the same constraint); tiles it via `repeat`
+  (`VipsImage::tile_to_size`, `VIPS_EXTEND_REPEAT`); flattens it onto
+  `background` if set; scales its alpha band by `opacity` if set; positions
+  it via `top`/`left`/`bottom`/`right` (pixel or fraction, default centered);
+  and composites it onto the base via the new `VipsImage::composite_over`
+  (`vips_composite2`, `VIPS_BLEND_MODE_OVER` — verified against
+  `/usr/include/vips/conversion.h` on the installed libvips 8.15.1). All of
+  this is tested directly against local fixture bytes
+  (`crates/imgx/src/transform/pipeline.rs`'s `composite_draw_overlay_*`
+  tests and `crates/imgx-vips/src/image.rs`'s `composite_over_*`/
+  `tile_to_size_*` tests) — no network fetch involved.
+- **Documented scope limitations** (not silently dropped): opacity
+  attenuation only has an effect on overlays that already carry an alpha
+  channel (matches Cloudflare's own guidance to use PNG/WebP for overlays);
+  when both `background` and `opacity` are set, `background` is applied
+  first and destroys the alpha band `opacity` would need, so `opacity` has
+  no further effect in that combination; blend mode is always "over"
+  (Cloudflare's `draw` doesn't expose a configurable one via its published
+  options — the newer `composite` blend-mode option mentioned in
+  Cloudflare's June 2026 changelog is a distinct, newer feature not covered
+  by the docs indexed during this pass, and is out of scope here).
+
+What's deliberately **not** implemented: the remote-URL fetch itself.
+`crates/imgx/src/server.rs`'s `handle_image_request` rejects any request
+naming a `draw` overlay with a `422` before attempting an origin fetch, with
+a message pointing at `IMGX_ALLOW_DRAW_OVERLAYS` — **a reserved name for
+future work, not a config flag that exists in `config.rs` today**. There is
+no fetch code path for such a flag to gate yet in this pass; the name is
+recorded here so that whoever eventually builds gap 2's general SSRF-safe
+remote-source fetcher has a documented, narrower sibling use case to wire
+this feature's `Some(url)` fields into once that fetcher exists, per the
+task's instruction to note this in
+`docs/PRD-workspace-upgrade-and-cloudflare-parity.md`'s open questions.

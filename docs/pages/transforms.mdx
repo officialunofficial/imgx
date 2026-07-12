@@ -66,6 +66,32 @@ Compression quality for lossy formats (JPEG, WebP, AVIF). Higher values produce 
 Perceptual quality strings map to `high=90`, `medium-high=80`, `medium-low=60`, `low=40` — a spec-derived mapping (Cloudflare documents the strings but not exact integer values). See `docs/CLOUDFLARE_PARITY.md` gap 4.
 :::
 
+### `scq` / `slow-connection-quality`
+
+Overrides `quality` when the request's client-hint headers (`rtt`, `save-data`, `ect`, `downlink`) indicate a slow connection: `rtt` over 150ms, `save-data: on`, `ect` in `slow-2g`/`2g`/`3g`, or `downlink` under 5Mbps.
+
+- **Range:** same as `quality` — 1–100, or a perceptual quality string
+- **Default:** unset (no override)
+
+```
+/cdn-cgi/image/q=80,scq=40/photo.jpg
+```
+
+:::info
+Because the effective quality changes based on the requesting client's headers, imgx caches the two variants separately — a request with the override applied and one without are different cache entries, even for the same URL. See `docs/CLOUDFLARE_PARITY.md` gap 8.
+:::
+
+### `compression`
+
+Prioritizes encoding speed over output quality/size. Accepts `fast`, which biases format selection away from AVIF/WebP (the slowest encoders) toward JPEG — this applies even when an explicit `format=avif`/`format=webp` is requested.
+
+- **Values:** `fast`
+- **Default:** unset
+
+```
+/cdn-cgi/image/compression=fast/photo.jpg
+```
+
 ## Format
 
 ### `f` / `fmt` / `format`
@@ -254,6 +280,24 @@ Hex RGB color used for `fit=pad` canvas fill and alpha flattening before encodin
 /cdn-cgi/image/f=jpeg,bg=ffffff/photo.png
 ```
 
+### `border` / `border.color` / `border.top` / `border.right` / `border.bottom` / `border.left`
+
+Draws a solid-color border around the image, applied after resizing. Border widths scale with `dpr`.
+
+- **`border`:** uniform width in pixels on all four sides
+- **`border.color`:** 6-character hex, no `#` prefix (default: `000000`)
+- **`border.top`/`.right`/`.bottom`/`.left`:** per-side width, overriding `border` for that side
+
+```
+/cdn-cgi/image/border=10/photo.jpg
+/cdn-cgi/image/border=4,border.color=ff0000/photo.jpg
+/cdn-cgi/image/border.top=2,border.left=8/photo.jpg
+```
+
+:::info
+Cloudflare's `border` is available only through its Workers API, with no published URL-interface syntax — the key names above are spec-derived to match imgx's existing dotted-key conventions. See `docs/CLOUDFLARE_PARITY.md` gap 10.
+:::
+
 ### `trim`
 
 Detect and crop uniform borders around the image (border-color-aware).
@@ -400,6 +444,15 @@ only for HTTP origins (not R2, which has no public URL to redirect to).
 
 ```
 /cdn-cgi/image/w=400,onerror=redirect/photo.jpg
+```
+
+### `draw` (overlays) — not yet enabled
+
+`draw.<N>.url`, `draw.<N>.width`/`.height`, `.top`/`.left`/`.bottom`/`.right`, `.opacity`, `.repeat`, `.background`, `.rotate`, `.fit`, `.gravity` parse and validate (an array of overlays, indexed by `<N>` starting at `0`), but **every request naming a `draw` overlay currently returns `422`**: the remote-URL fetch needed to actually retrieve an overlay image is deliberately not implemented yet, for the same SSRF-related reasons imgx doesn't fetch arbitrary remote main-image sources. See `docs/CLOUDFLARE_PARITY.md` gap 11 for the full status and scope-decision rationale.
+
+```
+/cdn-cgi/image/draw.0.url=https://example.com/logo.png,draw.0.opacity=0.5/photo.jpg
+→ 422 Unprocessable Entity (draw overlays not yet enabled)
 ```
 
 ---
