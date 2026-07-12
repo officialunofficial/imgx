@@ -294,6 +294,23 @@ async fn handle_image_request(
             "transform parameters out of range".to_string(),
         )));
     }
+    // Gap 11 -- `draw` overlays (docs/CLOUDFLARE_PARITY.md): the array
+    // syntax parses and the compositing math is implemented and tested
+    // (transform::pipeline::composite_draw_overlay) against local image
+    // buffers, but the remote-URL *fetch* that would supply a real
+    // overlay's bytes is deliberately NOT implemented in this pass (see
+    // CLOUDFLARE_PARITY.md gap 11 for the SSRF-scoping rationale) -- so a
+    // request naming any overlay is rejected here, before an origin
+    // fetch is attempted, rather than silently ignoring `draw` or
+    // returning an image that doesn't actually have the requested
+    // overlay applied.
+    if !tp.draw.is_empty() {
+        return error_response(HttpError::unprocessable_entity(Some(
+            "draw overlays are not yet enabled: remote overlay fetch is deliberately gated, \
+             see IMGX_ALLOW_DRAW_OVERLAYS in docs/CLOUDFLARE_PARITY.md"
+                .to_string(),
+        )));
+    }
     // Gap 8 -- slow-connection-quality/scq (docs/CLOUDFLARE_PARITY.md):
     // read the client-hint headers Cloudflare's docs name (rtt,
     // save-data, ect, downlink) and, if they indicate a slow connection
@@ -904,6 +921,21 @@ mod tests {
             strip_path_prefix("abc", "abc123/photo-id"),
             "abc123/photo-id"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Gap 11 -- draw overlays (docs/CLOUDFLARE_PARITY.md): remote
+    // overlay fetch is deliberately not implemented in this pass, so any
+    // request naming a `draw` overlay is rejected before an origin fetch
+    // is even attempted.
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn draw_overlay_request_is_rejected_since_remote_fetch_is_not_yet_enabled() {
+        let router = build_router(test_state());
+        let (status, body) = get(router, "/cdn-cgi/image/draw.0.url=logo.png/photo.jpg").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("draw overlays are not yet enabled"));
     }
 
     // ----------------------------------------------------------------

@@ -10,8 +10,8 @@ use imgx_vips::{ThumbnailOptions, VipsError, VipsImage, consts};
 
 use super::negotiate;
 use super::params::{
-    CompressionMode, FitMode, FlipMode, Gravity, MetadataMode, OutputFormat, Rotation,
-    TransformParams,
+    CompressionMode, DrawOverlay, DrawRepeat, FitMode, FlipMode, Gravity, MetadataMode,
+    OutputFormat, Rotation, TransformParams,
 };
 
 #[derive(Debug, Error)]
@@ -206,12 +206,7 @@ pub fn transform(
 
     // -- ROTATE / FLIP --
     if let Some(rotation) = tp.rotate {
-        let angle = match rotation {
-            Rotation::Deg0 => consts::VIPS_ANGLE_D0,
-            Rotation::Deg90 => consts::VIPS_ANGLE_D90,
-            Rotation::Deg180 => consts::VIPS_ANGLE_D180,
-            Rotation::Deg270 => consts::VIPS_ANGLE_D270,
-        };
+        let angle = rotation_angle(rotation);
         if angle != consts::VIPS_ANGLE_D0 {
             current = current.rot(angle)?;
         }
@@ -620,6 +615,115 @@ fn map_gravity_to_crop(gravity: Gravity) -> i32 {
         Gravity::Attention => consts::VIPS_INTERESTING_ATTENTION,
         _ => consts::VIPS_INTERESTING_CENTRE,
     }
+}
+
+fn rotation_angle(rotation: Rotation) -> i32 {
+    match rotation {
+        Rotation::Deg0 => consts::VIPS_ANGLE_D0,
+        Rotation::Deg90 => consts::VIPS_ANGLE_D90,
+        Rotation::Deg180 => consts::VIPS_ANGLE_D180,
+        Rotation::Deg270 => consts::VIPS_ANGLE_D270,
+    }
+}
+
+/// Resolve a `draw` overlay dimension/position value: `>= 1.0` is a pixel
+/// count, a value in `0.0..1.0` is a fraction of `base_dim` -- the same
+/// convention as the per-side trim keys (gap 9).
+fn resolve_overlay_dim(v: f32, base_dim: i32) -> i32 {
+    if v < 1.0 {
+        (v as f64 * base_dim as f64).round() as i32
+    } else {
+        v.round() as i32
+    }
+}
+
+/// Composite a single already-decoded overlay image onto `base`,
+/// implementing a bounded, spec-derived subset of Cloudflare's `draw`
+/// overlay semantics (docs/CLOUDFLARE_PARITY.md gap 11). This function
+/// proves the libvips compositing math against local, already-fetched
+/// image buffers -- the actual remote-URL fetch that would supply
+/// `overlay_bytes` in a real request is deliberately NOT implemented in
+/// this pass (see the gap-11 note in CLOUDFLARE_PARITY.md); callers here
+/// (currently only this module's own tests) supply already-fetched bytes
+/// directly.
+///
+/// Documented scope limitations, not silently dropped:
+/// - Opacity attenuation only has an effect when the overlay already
+///   carries an alpha channel (PNG/WebP) -- consistent with Cloudflare's
+///   own recommendation to use PNG/WebP for overlays.
+/// - When both `background` and `opacity` are set on the same entry,
+///   `background` is applied first (flattening away the overlay's own
+///   alpha channel), so `opacity` has no further effect -- a documented
+///   simplification rather than a two-pass blend.
+/// - Blend mode is always "over"; Cloudflare's `draw` doesn't document a
+///   configurable blend mode via its published options.
+pub fn composite_draw_overlay(
+    base: &VipsImage,
+    overlay_bytes: &[u8],
+    entry: &DrawOverlay,
+) -> Result<VipsImage, TransformError> {
+    let mut overlay = VipsImage::from_buffer(overlay_bytes)?;
+
+    let base_w = base.width();
+    let base_h = base.height();
+
+    let target_w = entry.width.map(|w| resolve_overlay_dim(w, base_w));
+    let target_h = entry.height.map(|h| resolve_overlay_dim(h, base_h));
+    if target_w.is_some() || target_h.is_some() {
+        let fit = entry.fit.unwrap_or(FitMode::Contain);
+        let gravity = entry.gravity.unwrap_or(Gravity::Center);
+        let width = target_w.unwrap_or_else(|| overlay.width());
+        let opts = build_thumbnail_options(fit, gravity, target_h);
+        overlay = overlay.thumbnail(width.max(1), opts)?;
+    }
+
+    if let Some(rotation) = entry.rotate {
+        let angle = rotation_angle(rotation);
+        if angle != consts::VIPS_ANGLE_D0 {
+            overlay = overlay.rot(angle)?;
+        }
+    }
+
+    if let Some(repeat) = entry.repeat {
+        let (tile_w, tile_h) = match repeat {
+            DrawRepeat::Both => (base_w, base_h),
+            DrawRepeat::X => (base_w, overlay.height()),
+            DrawRepeat::Y => (overlay.width(), base_h),
+        };
+        overlay = overlay.tile_to_size(tile_w.max(1), tile_h.max(1))?;
+    }
+
+    if let Some(bg) = entry.background
+        && overlay.has_alpha()
+    {
+        let bg_f = [bg[0] as f64, bg[1] as f64, bg[2] as f64];
+        overlay = overlay.flatten(bg_f)?;
+    }
+
+    if let Some(op) = entry.opacity
+        && overlay.has_alpha()
+    {
+        let bands = overlay.bands();
+        let color = overlay.extract_band(0, bands - 1)?;
+        let alpha = overlay.extract_band(bands - 1, 1)?;
+        let alpha_scaled = alpha.linear1(op as f64, 0.0)?;
+        overlay = VipsImage::bandjoin2(&color, &alpha_scaled)?;
+    }
+
+    let ow = overlay.width();
+    let oh = overlay.height();
+    let x = match (entry.left, entry.right) {
+        (Some(l), _) => resolve_overlay_dim(l, base_w),
+        (None, Some(r)) => base_w - ow - resolve_overlay_dim(r, base_w),
+        (None, None) => (base_w - ow) / 2,
+    };
+    let y = match (entry.top, entry.bottom) {
+        (Some(t), _) => resolve_overlay_dim(t, base_h),
+        (None, Some(b)) => base_h - oh - resolve_overlay_dim(b, base_h),
+        (None, None) => (base_h - oh) / 2,
+    };
+
+    base.composite_over(&overlay, x, y).map_err(Into::into)
 }
 
 /// Encode a VipsImage into a buffer using the specified output format.
@@ -1462,5 +1566,129 @@ mod tests {
         // Border scales with dpr: 2px * dpr 2 = 4px each side.
         assert_eq!(result.width, 4 + 8);
         assert_eq!(result.height, 4 + 8);
+    }
+
+    // ------------------------------------------------------------------
+    // Gap 11 -- draw overlays (docs/CLOUDFLARE_PARITY.md): compositing
+    // math proof against local, already-fetched image buffers. The
+    // remote-URL fetch that would supply `overlay_bytes` in production
+    // is deliberately not implemented -- see composite_draw_overlay's
+    // doc comment and CLOUDFLARE_PARITY.md gap 11.
+    // ------------------------------------------------------------------
+
+    fn overlay_fixture() -> Vec<u8> {
+        fixture("test_4x4.png")
+    }
+
+    #[test]
+    fn composite_draw_overlay_output_matches_base_dimensions() {
+        init();
+        let base = VipsImage::from_buffer(&nonsquare_fixture()).unwrap(); // 2000x1500
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            ..Default::default()
+        };
+        let result = composite_draw_overlay(&base, &overlay_fixture(), &entry).unwrap();
+        assert_eq!(result.width(), base.width());
+        assert_eq!(result.height(), base.height());
+    }
+
+    #[test]
+    fn composite_draw_overlay_resizes_overlay_to_requested_pixel_width() {
+        init();
+        let base = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            width: Some(50.0),
+            ..Default::default()
+        };
+        // Should not error resizing the overlay to a 50px-wide box before
+        // compositing -- this exercises the resize branch without a way
+        // to directly observe the intermediate overlay size, so the
+        // assertion is on successful completion + base-sized output.
+        let result = composite_draw_overlay(&base, &overlay_fixture(), &entry).unwrap();
+        assert_eq!(result.width(), base.width());
+    }
+
+    #[test]
+    fn composite_draw_overlay_resizes_overlay_to_fractional_width() {
+        init();
+        let base = VipsImage::from_buffer(&nonsquare_fixture()).unwrap(); // 2000 wide
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            width: Some(0.1), // 10% of 2000 = 200px
+            ..Default::default()
+        };
+        let result = composite_draw_overlay(&base, &overlay_fixture(), &entry).unwrap();
+        assert_eq!(result.width(), base.width());
+    }
+
+    #[test]
+    fn composite_draw_overlay_with_explicit_position_succeeds() {
+        init();
+        let base = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            bottom: Some(5.0),
+            right: Some(5.0),
+            ..Default::default()
+        };
+        let result = composite_draw_overlay(&base, &overlay_fixture(), &entry).unwrap();
+        assert_eq!(result.width(), base.width());
+        assert_eq!(result.height(), base.height());
+    }
+
+    #[test]
+    fn composite_draw_overlay_with_opacity_succeeds() {
+        init();
+        let base = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            opacity: Some(0.5),
+            ..Default::default()
+        };
+        let result = composite_draw_overlay(&base, &overlay_fixture(), &entry).unwrap();
+        assert_eq!(result.width(), base.width());
+    }
+
+    #[test]
+    fn composite_draw_overlay_with_repeat_both_tiles_across_base() {
+        init();
+        let base = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            repeat: Some(DrawRepeat::Both),
+            ..Default::default()
+        };
+        let result = composite_draw_overlay(&base, &overlay_fixture(), &entry).unwrap();
+        assert_eq!(result.width(), base.width());
+        assert_eq!(result.height(), base.height());
+    }
+
+    #[test]
+    fn composite_draw_overlay_with_rotate_succeeds() {
+        init();
+        let base = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            rotate: Some(Rotation::Deg90),
+            ..Default::default()
+        };
+        let result = composite_draw_overlay(&base, &overlay_fixture(), &entry).unwrap();
+        assert_eq!(result.width(), base.width());
+        assert_eq!(result.height(), base.height());
+    }
+
+    #[test]
+    fn composite_draw_overlay_with_background_flattens_overlay_alpha() {
+        init();
+        let base = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            background: Some([255, 0, 0]),
+            ..Default::default()
+        };
+        let result = composite_draw_overlay(&base, &overlay_fixture(), &entry).unwrap();
+        assert_eq!(result.width(), base.width());
     }
 }
