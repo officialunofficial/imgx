@@ -1,9 +1,14 @@
-//! URL routing. Ported from src/router.zig. See docs/INVARIANTS.md INV-4
-//! (path traversal is never reachable) and INV-5 (last `/`-segment is a
-//! transform string iff it contains `=`; only the last such segment
-//! counts). Pure logic, no I/O -- testable in isolation.
+//! URL routing. Ported from src/router.zig, then migrated to Cloudflare's
+//! exact URL convention. See docs/INVARIANTS.md INV-4 (path traversal is
+//! never reachable) and INV-5 (fixed `cdn-cgi/image/` prefix, OPTIONS
+//! segment comes first, source image path is the remainder). Pure logic,
+//! no I/O -- testable in isolation.
 
 use thiserror::Error;
+
+/// The fixed prefix that precedes every image request, mirroring
+/// Cloudflare's `/cdn-cgi/image/<OPTIONS>/<SOURCE-IMAGE>` convention.
+const IMAGE_PREFIX: &str = "cdn-cgi/image/";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RouterError {
@@ -17,11 +22,12 @@ pub enum RouterError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageRequest {
-    /// The path to the image, with leading `/` stripped. Everything
-    /// before the optional transform segment.
+    /// The path to the source image, with the leading `/` and the
+    /// `cdn-cgi/image/<OPTIONS>/` prefix stripped. May itself contain `/`.
     pub image_path: String,
-    /// The last path segment if it looks like a transform string
-    /// (contains `=`). `None` when the URL has no transform segment.
+    /// The options segment immediately after the `cdn-cgi/image/` prefix,
+    /// when it looks like a transform string (contains `=`). `None` when
+    /// that segment is absent (passthrough, no transforms).
     pub transform_string: Option<String>,
 }
 
@@ -35,9 +41,24 @@ pub enum Route {
 }
 
 /// Resolve a raw request path into a `Route`. Well-known paths
-/// (`/health`, `/metrics`, `/ready`) are matched first. Everything else
-/// is a potential image request; the last path segment is a transform
-/// string when it contains `=`.
+/// (`/health`, `/metrics`, `/ready`) are matched first. Every other
+/// request must use Cloudflare's exact convention: a fixed
+/// `cdn-cgi/image/` prefix, then an OPTIONS segment (comma-separated
+/// `key=value` pairs), then the source image path -- the remainder of
+/// the URL, which may itself contain `/`.
+///
+/// Decision (see docs/INVARIANTS.md INV-5): Cloudflare's format assumes
+/// the segment right after the prefix is always OPTIONS and requires at
+/// least one parameter. imgx relaxes this for its own passthrough use
+/// case: if that segment contains no `=`, it is treated as the start of
+/// the image path instead (no transforms applied) rather than rejected.
+/// The strict-Cloudflare case (segment contains `=`) always parses
+/// byte-for-byte per Cloudflare's rule.
+///
+/// This is a full breaking migration: the old trailing-options shape
+/// (`/<image-path>/<transforms>`) is retired outright, not kept as a
+/// fallback. Any request that does not start with `cdn-cgi/image/` is
+/// `NotFound`.
 pub fn resolve(path: &str) -> Route {
     let clean = match sanitize_path(path) {
         Ok(c) => c,
@@ -54,38 +75,46 @@ pub fn resolve(path: &str) -> Route {
         return Route::Ready;
     }
 
-    if let Some(sep) = clean.rfind('/') {
-        let prefix = &clean[..sep];
-        let last = &clean[sep + 1..];
+    let Some(rest) = clean.strip_prefix(IMAGE_PREFIX) else {
+        return Route::NotFound;
+    };
 
-        if last.contains('=') {
-            if prefix.is_empty() {
+    if rest.is_empty() {
+        return Route::NotFound;
+    }
+
+    match rest.find('/') {
+        Some(sep) => {
+            let first = &rest[..sep];
+            let remainder = &rest[sep + 1..];
+
+            if first.contains('=') {
+                if remainder.is_empty() {
+                    return Route::NotFound;
+                }
+                Route::ImageRequest(ImageRequest {
+                    image_path: remainder.to_string(),
+                    transform_string: Some(first.to_string()),
+                })
+            } else {
+                Route::ImageRequest(ImageRequest {
+                    image_path: rest.to_string(),
+                    transform_string: None,
+                })
+            }
+        }
+        None => {
+            // No further `/` after the prefix -- a single segment.
+            if rest.contains('=') {
+                // Options given but no source image path to apply them to.
                 return Route::NotFound;
             }
-            return Route::ImageRequest(ImageRequest {
-                image_path: prefix.to_string(),
-                transform_string: Some(last.to_string()),
-            });
+            Route::ImageRequest(ImageRequest {
+                image_path: rest.to_string(),
+                transform_string: None,
+            })
         }
-
-        return Route::ImageRequest(ImageRequest {
-            image_path: clean.to_string(),
-            transform_string: None,
-        });
     }
-
-    // No `/` in the cleaned path -- single segment.
-    if clean.contains('=') {
-        return Route::NotFound;
-    }
-    if clean.is_empty() {
-        return Route::NotFound;
-    }
-
-    Route::ImageRequest(ImageRequest {
-        image_path: clean.to_string(),
-        transform_string: None,
-    })
 }
 
 /// Sanitize a URL path for safe use as an origin/cache key: strips the
@@ -164,7 +193,7 @@ mod tests {
 
     #[test]
     fn image_with_transforms() {
-        match resolve("/photos/cat.jpg/w=400,h=300") {
+        match resolve("/cdn-cgi/image/w=400,h=300/photos/cat.jpg") {
             Route::ImageRequest(req) => {
                 assert_eq!(req.image_path, "photos/cat.jpg");
                 assert_eq!(req.transform_string.as_deref(), Some("w=400,h=300"));
@@ -175,7 +204,7 @@ mod tests {
 
     #[test]
     fn image_without_transforms() {
-        match resolve("/photos/cat.jpg") {
+        match resolve("/cdn-cgi/image/photos/cat.jpg") {
             Route::ImageRequest(req) => {
                 assert_eq!(req.image_path, "photos/cat.jpg");
                 assert_eq!(req.transform_string, None);
@@ -186,10 +215,21 @@ mod tests {
 
     #[test]
     fn nested_path_with_transforms() {
-        match resolve("/a/b/c/d.jpg/w=100") {
+        match resolve("/cdn-cgi/image/w=100/a/b/c/d.jpg") {
             Route::ImageRequest(req) => {
                 assert_eq!(req.image_path, "a/b/c/d.jpg");
                 assert_eq!(req.transform_string.as_deref(), Some("w=100"));
+            }
+            other => panic!("expected ImageRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_path_without_transforms() {
+        match resolve("/cdn-cgi/image/a/b/c/d.jpg") {
+            Route::ImageRequest(req) => {
+                assert_eq!(req.image_path, "a/b/c/d.jpg");
+                assert_eq!(req.transform_string, None);
             }
             other => panic!("expected ImageRequest, got {other:?}"),
         }
@@ -206,6 +246,22 @@ mod tests {
     }
 
     #[test]
+    fn path_without_cdn_cgi_prefix_returns_not_found() {
+        assert_eq!(resolve("/photos/cat.jpg"), Route::NotFound);
+    }
+
+    #[test]
+    fn path_without_cdn_cgi_prefix_with_transform_shape_returns_not_found() {
+        assert_eq!(resolve("/photos/cat.jpg/w=400,h=300"), Route::NotFound);
+    }
+
+    #[test]
+    fn bare_cdn_cgi_image_prefix_returns_not_found() {
+        assert_eq!(resolve("/cdn-cgi/image"), Route::NotFound);
+        assert_eq!(resolve("/cdn-cgi/image/"), Route::NotFound);
+    }
+
+    #[test]
     fn path_traversal_is_rejected_by_sanitize_path() {
         assert_eq!(
             sanitize_path("/photos/../etc/passwd"),
@@ -215,7 +271,10 @@ mod tests {
 
     #[test]
     fn path_traversal_in_resolve_returns_not_found() {
-        assert_eq!(resolve("/photos/../etc/passwd/w=100"), Route::NotFound);
+        assert_eq!(
+            resolve("/cdn-cgi/image/w=100/photos/../etc/passwd"),
+            Route::NotFound
+        );
     }
 
     #[test]
@@ -228,12 +287,12 @@ mod tests {
 
     #[test]
     fn null_byte_in_resolve_returns_not_found() {
-        assert_eq!(resolve("/photos/cat\0.jpg"), Route::NotFound);
+        assert_eq!(resolve("/cdn-cgi/image/photos/cat\0.jpg"), Route::NotFound);
     }
 
     #[test]
     fn transform_detection_segment_with_equals_is_transform() {
-        match resolve("/img.png/quality=80") {
+        match resolve("/cdn-cgi/image/quality=80/img.png") {
             Route::ImageRequest(req) => {
                 assert_eq!(req.image_path, "img.png");
                 assert_eq!(req.transform_string.as_deref(), Some("quality=80"));
@@ -244,7 +303,7 @@ mod tests {
 
     #[test]
     fn transform_detection_segment_without_equals_is_part_of_path() {
-        match resolve("/photos/vacation/beach.jpg") {
+        match resolve("/cdn-cgi/image/photos/vacation/beach.jpg") {
             Route::ImageRequest(req) => {
                 assert_eq!(req.image_path, "photos/vacation/beach.jpg");
                 assert_eq!(req.transform_string, None);
@@ -255,7 +314,12 @@ mod tests {
 
     #[test]
     fn path_with_only_transforms_and_no_image_path_returns_not_found() {
-        assert_eq!(resolve("/w=400"), Route::NotFound);
+        assert_eq!(resolve("/cdn-cgi/image/w=400"), Route::NotFound);
+    }
+
+    #[test]
+    fn options_segment_with_equals_but_empty_remainder_returns_not_found() {
+        assert_eq!(resolve("/cdn-cgi/image/w=400/"), Route::NotFound);
     }
 
     #[test]
@@ -302,8 +366,8 @@ mod tests {
     }
 
     #[test]
-    fn single_segment_image_path() {
-        match resolve("/cat.jpg") {
+    fn single_segment_image_path_after_prefix() {
+        match resolve("/cdn-cgi/image/cat.jpg") {
             Route::ImageRequest(req) => {
                 assert_eq!(req.image_path, "cat.jpg");
                 assert_eq!(req.transform_string, None);
@@ -313,11 +377,11 @@ mod tests {
     }
 
     #[test]
-    fn multiple_transform_like_segments_only_last_is_treated_as_transform() {
-        match resolve("/a=1/b=2") {
+    fn multiple_transform_like_segments_only_first_is_treated_as_transform() {
+        match resolve("/cdn-cgi/image/a=1/b=2") {
             Route::ImageRequest(req) => {
-                assert_eq!(req.image_path, "a=1");
-                assert_eq!(req.transform_string.as_deref(), Some("b=2"));
+                assert_eq!(req.image_path, "b=2");
+                assert_eq!(req.transform_string.as_deref(), Some("a=1"));
             }
             other => panic!("expected ImageRequest, got {other:?}"),
         }
@@ -357,6 +421,9 @@ mod tests {
 
     #[test]
     fn encoded_traversal_in_resolve_returns_not_found() {
-        assert_eq!(resolve("/photos/%2e%2e/etc/passwd"), Route::NotFound);
+        assert_eq!(
+            resolve("/cdn-cgi/image/w=100/photos/%2e%2e/etc/passwd"),
+            Route::NotFound
+        );
     }
 }
