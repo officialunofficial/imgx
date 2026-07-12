@@ -142,6 +142,21 @@ pub fn sanitize_path(path: &str) -> Result<&str, RouterError> {
     Ok(stripped)
 }
 
+/// `true` when `image_path` is an absolute remote-URL source (Cloudflare
+/// parity gap 2, docs/CLOUDFLARE_PARITY.md) rather than a relative path on
+/// the configured origin: it starts with `http://` or `https://`,
+/// case-insensitive on the scheme. Detection only -- callers decide
+/// whether to actually allow/fetch it (`IMGX_ALLOW_REMOTE_SOURCES`,
+/// see docs/INVARIANTS.md INV-14).
+pub fn is_absolute_url_source(image_path: &str) -> bool {
+    starts_with_ignore_ascii_case(image_path, "http://")
+        || starts_with_ignore_ascii_case(image_path, "https://")
+}
+
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
 /// `true` when `path` contains a `..` traversal component: exact `..`,
 /// `../` prefix, `/..` suffix, or `/../` anywhere.
 fn contains_traversal(path: &str) -> bool {
@@ -425,5 +440,70 @@ mod tests {
             resolve("/cdn-cgi/image/w=100/photos/%2e%2e/etc/passwd"),
             Route::NotFound
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Gap 2 -- arbitrary remote-URL sources (docs/CLOUDFLARE_PARITY.md):
+    // detecting that a source segment is an absolute URL, distinct from
+    // the relative-path router tests above. Router-level detection only
+    // -- allow/deny and the actual SSRF-safe fetch live in config.rs /
+    // origin/remote.rs.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn is_absolute_url_source_detects_http_scheme() {
+        assert!(is_absolute_url_source("http://example.com/cat.jpg"));
+    }
+
+    #[test]
+    fn is_absolute_url_source_detects_https_scheme() {
+        assert!(is_absolute_url_source("https://example.com/cat.jpg"));
+    }
+
+    #[test]
+    fn is_absolute_url_source_is_case_insensitive_on_scheme() {
+        assert!(is_absolute_url_source("HTTP://example.com/cat.jpg"));
+        assert!(is_absolute_url_source("HttpS://example.com/cat.jpg"));
+    }
+
+    #[test]
+    fn is_absolute_url_source_rejects_relative_path() {
+        assert!(!is_absolute_url_source("photos/cat.jpg"));
+    }
+
+    #[test]
+    fn is_absolute_url_source_rejects_other_schemes() {
+        assert!(!is_absolute_url_source("ftp://example.com/cat.jpg"));
+        assert!(!is_absolute_url_source("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn is_absolute_url_source_rejects_short_strings() {
+        assert!(!is_absolute_url_source("http"));
+        assert!(!is_absolute_url_source(""));
+    }
+
+    #[test]
+    fn resolve_extracts_absolute_url_as_image_path_with_transform() {
+        match resolve("/cdn-cgi/image/w=100/https://example.com/cat.jpg") {
+            Route::ImageRequest(req) => {
+                assert_eq!(req.image_path, "https://example.com/cat.jpg");
+                assert_eq!(req.transform_string.as_deref(), Some("w=100"));
+                assert!(is_absolute_url_source(&req.image_path));
+            }
+            other => panic!("expected ImageRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_extracts_absolute_url_as_image_path_without_transform() {
+        match resolve("/cdn-cgi/image/https://example.com/cat.jpg") {
+            Route::ImageRequest(req) => {
+                assert_eq!(req.image_path, "https://example.com/cat.jpg");
+                assert_eq!(req.transform_string, None);
+                assert!(is_absolute_url_source(&req.image_path));
+            }
+            other => panic!("expected ImageRequest, got {other:?}"),
+        }
     }
 }

@@ -69,6 +69,17 @@ pub struct OriginConfig {
     pub max_retries: u8,
     pub origin_type: OriginType,
     pub path_prefix: String,
+    /// Opt-in (default `false`): allow the source-image segment of a
+    /// request to be an absolute `http://`/`https://` URL, fetched
+    /// directly instead of from the configured origin -- Cloudflare
+    /// parity gap 2 (docs/CLOUDFLARE_PARITY.md). See docs/INVARIANTS.md
+    /// INV-14 for the SSRF guards enforced when this is enabled.
+    pub allow_remote_sources: bool,
+    /// Opt-in (default `false`), independent of `allow_remote_sources`:
+    /// allow `draw[].url` overlay fetching from an arbitrary
+    /// `http://`/`https://` URL -- Cloudflare parity gap 11. Reuses the
+    /// same SSRF-safe fetcher and guards as `allow_remote_sources`.
+    pub allow_draw_overlays: bool,
 }
 
 impl Default for OriginConfig {
@@ -79,6 +90,8 @@ impl Default for OriginConfig {
             max_retries: 2,
             origin_type: OriginType::Http,
             path_prefix: String::new(),
+            allow_remote_sources: false,
+            allow_draw_overlays: false,
         }
     }
 }
@@ -196,6 +209,12 @@ impl Config {
         }
         if let Some(v) = env_var("ORIGIN_PATH_PREFIX") {
             cfg.origin.path_prefix = v;
+        }
+        if let Some(v) = env_var("ALLOW_REMOTE_SOURCES") {
+            cfg.origin.allow_remote_sources = parse_bool(&v)?;
+        }
+        if let Some(v) = env_var("ALLOW_DRAW_OVERLAYS") {
+            cfg.origin.allow_draw_overlays = parse_bool(&v)?;
         }
 
         if let Some(v) = env_var("TRANSFORM_MAX_WIDTH") {
@@ -379,6 +398,13 @@ mod tests {
     #[test]
     fn validate_accepts_default_config() {
         assert!(Config::defaults().validate().is_ok());
+    }
+
+    #[test]
+    fn defaults_have_remote_source_and_draw_overlay_fetching_disabled() {
+        let cfg = Config::defaults();
+        assert!(!cfg.origin.allow_remote_sources);
+        assert!(!cfg.origin.allow_draw_overlays);
     }
 
     #[test]
