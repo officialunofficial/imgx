@@ -115,3 +115,5 @@ Client → CDN (Cloudflare, Fastly, nginx) → imgx → R2/S3
 ```
 
 imgx sets `Cache-Control` and `ETag` headers automatically. The CDN caches responses at the edge. imgx's internal cache handles the origin layer.
+
+If that CDN is Cloudflare and you would rather manage the edge as code than through dashboard rules, see [Cloudflare Workers edge deployment](/cloudflare-edge-deployment) for an optional Workers-based reverse proxy. It is one specific implementation of "place a CDN in front" above, not a replacement for it — you can just as well point any CDN at imgx with zero code, as described here.
