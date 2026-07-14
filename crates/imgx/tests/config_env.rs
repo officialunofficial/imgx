@@ -21,6 +21,8 @@ fn clear_all() {
         "ORIGIN_MAX_RETRIES",
         "ORIGIN_PATH_PREFIX",
         "ORIGIN_TYPE",
+        "ALLOW_REMOTE_SOURCES",
+        "ALLOW_DRAW_OVERLAYS",
         "TRANSFORM_MAX_WIDTH",
         "TRANSFORM_MAX_HEIGHT",
         "TRANSFORM_DEFAULT_QUALITY",
@@ -62,6 +64,40 @@ fn load_from_env_with_no_env_vars_returns_defaults() {
     assert!(cfg.transform.strip_metadata);
     assert!(cfg.cache.enabled);
     assert_eq!(cfg.cache.default_ttl_seconds, 3600);
+    assert!(!cfg.origin.allow_remote_sources);
+    assert!(!cfg.origin.allow_draw_overlays);
+
+    clear_all();
+}
+
+#[test]
+fn allow_remote_sources_env_var_enables_remote_source_fetching() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_all();
+
+    unsafe {
+        std::env::set_var("IMGX_ALLOW_REMOTE_SOURCES", "true");
+    }
+
+    let cfg = Config::load_from_env().expect("load succeeds");
+    assert!(cfg.origin.allow_remote_sources);
+    assert!(!cfg.origin.allow_draw_overlays);
+
+    clear_all();
+}
+
+#[test]
+fn allow_draw_overlays_env_var_enables_overlay_fetching_independently() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_all();
+
+    unsafe {
+        std::env::set_var("IMGX_ALLOW_DRAW_OVERLAYS", "true");
+    }
+
+    let cfg = Config::load_from_env().expect("load succeeds");
+    assert!(cfg.origin.allow_draw_overlays);
+    assert!(!cfg.origin.allow_remote_sources);
 
     clear_all();
 }

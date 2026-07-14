@@ -1,0 +1,39 @@
+name: Deploy imgx-edge to Cloudflare Workers
+
+# Manual-dispatch only, deliberately: crates/imgx-edge/wrangler.toml ships
+# with placeholder IMGX_ORIGIN_URL and no routes/zone binding (see PRD
+# OQ-14 in docs/PRD-workspace-upgrade-and-cloudflare-parity.md) -- deploying
+# on every push before those are filled in would publish a non-functional
+# Worker. Once a real origin/route is configured, switch `on:` to a `push`
+# trigger scoped to `crates/imgx-edge/**`, matching docs.yml's pattern.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    defaults:
+      run:
+        working-directory: crates/imgx-edge
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install worker-build
+        run: cargo install worker-build --locked
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: crates/imgx-edge
+          command: deploy
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}

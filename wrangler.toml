@@ -1,0 +1,28 @@
+# Wrangler configuration for the imgx docs site, deployed as a Cloudflare
+# Workers static-assets site (not Cloudflare Pages). Pages is being retired
+# in favor of Workers for static sites; this is the idiomatic replacement.
+#
+# This config lives at the repo root because the docs site's build output
+# (docs/dist, produced by `pnpm docs:build`) and this file's own directory
+# are the natural pairing for a root-level static-assets Worker -- distinct
+# from crates/imgx-edge/wrangler.toml, which configures a separate Rust
+# Worker (a reverse proxy in front of the imgx image server, not this site).
+
+name = "imgx-docs"
+compatibility_date = "2026-07-12"
+
+# Assets-only Worker: no `main` script. Wrangler serves static files
+# directly from `directory` with no Worker code in the request path.
+# vocs's build output is a fully static, multi-page site (not an SPA), so
+# unmatched paths fall through to a real 404 page rather than an SPA shell.
+[assets]
+directory = "./docs/dist"
+not_found_handling = "404-page"
+
+# No `routes`/zone binding yet -- which hostname serves the docs site
+# (a custom domain, or the default *.workers.dev subdomain) is an
+# operator decision to make at deploy time, e.g.:
+#
+# routes = [
+#   { pattern = "docs.example.com/*", zone_name = "example.com" }
+# ]

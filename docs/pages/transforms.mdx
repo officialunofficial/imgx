@@ -1,10 +1,16 @@
 # Transform parameters
 
-Specify transforms as the last path segment in the URL. imgx treats a segment as a transform string when it contains `=`. Separate multiple parameters with commas.
+imgx uses Cloudflare's exact URL convention: a fixed `cdn-cgi/image/` prefix, then an OPTIONS segment, then the source image path. imgx treats the segment immediately after the prefix as the options segment when it contains `=`. Separate multiple parameters with commas.
 
 ```
-GET /<image-path>/<transforms>
-GET /photos/hero.jpg/w=400,h=300,f=webp,q=85
+GET /cdn-cgi/image/<options>/<image-path>
+GET /cdn-cgi/image/w=400,h=300,f=webp,q=85/photos/hero.jpg
+```
+
+The source-image segment is normally a relative path, resolved against `IMGX_ORIGIN_BASE_URL`. It may instead be an absolute `http://`/`https://` URL, fetched directly instead of from the configured origin — but only when the operator has set `IMGX_ALLOW_REMOTE_SOURCES=true` (default `false`); otherwise such a request returns `403 Forbidden` before any network call. See `IMGX_ALLOW_REMOTE_SOURCES` in [Configuration](/configuration) for the security guards this enables and the risk it accepts.
+
+```
+GET /cdn-cgi/image/w=400/https://example.com/photos/hero.jpg
 ```
 
 ## Dimensions
@@ -17,8 +23,8 @@ Output width in pixels, resized according to the current `fit` mode.
 - **Default:** original width
 
 ```
-/photo.jpg/w=400
-/photo.jpg/width=400
+/cdn-cgi/image/w=400/photo.jpg
+/cdn-cgi/image/width=400/photo.jpg
 ```
 
 ### `h` / `height`
@@ -29,8 +35,8 @@ Output height in pixels.
 - **Default:** original height
 
 ```
-/photo.jpg/h=300
-/photo.jpg/w=400,h=300
+/cdn-cgi/image/h=300/photo.jpg
+/cdn-cgi/image/w=400,h=300/photo.jpg
 ```
 
 When you specify only one dimension, imgx derives the other from the source aspect ratio.
@@ -44,7 +50,7 @@ Device pixel ratio. Multiplies `w` and `h` for retina and HiDPI displays. The ef
 
 ```
 # 400px at 2x = 800px actual output
-/photo.jpg/w=400,dpr=2
+/cdn-cgi/image/w=400,dpr=2/photo.jpg
 ```
 
 ## Quality
@@ -53,12 +59,43 @@ Device pixel ratio. Multiplies `w` and `h` for retina and HiDPI displays. The ef
 
 Compression quality for lossy formats (JPEG, WebP, AVIF). Higher values produce larger files with fewer artifacts. Has no effect on PNG.
 
-- **Range:** 1–100
+- **Range:** 1–100, or a perceptual quality string: `high`, `medium-high`, `medium-low`, `low`
 - **Default:** `80`
 
 ```
-/photo.jpg/q=90
-/photo.jpg/w=400,q=60
+/cdn-cgi/image/q=90/photo.jpg
+/cdn-cgi/image/w=400,q=60/photo.jpg
+/cdn-cgi/image/quality=high/photo.jpg
+```
+
+:::info
+Perceptual quality strings map to `high=90`, `medium-high=80`, `medium-low=60`, `low=40` — a spec-derived mapping (Cloudflare documents the strings but not exact integer values). See `docs/CLOUDFLARE_PARITY.md` gap 4.
+:::
+
+### `scq` / `slow-connection-quality`
+
+Overrides `quality` when the request's client-hint headers (`rtt`, `save-data`, `ect`, `downlink`) indicate a slow connection: `rtt` over 150ms, `save-data: on`, `ect` in `slow-2g`/`2g`/`3g`, or `downlink` under 5Mbps.
+
+- **Range:** same as `quality` — 1–100, or a perceptual quality string
+- **Default:** unset (no override)
+
+```
+/cdn-cgi/image/q=80,scq=40/photo.jpg
+```
+
+:::info
+Because the effective quality changes based on the requesting client's headers, imgx caches the two variants separately — a request with the override applied and one without are different cache entries, even for the same URL. See `docs/CLOUDFLARE_PARITY.md` gap 8.
+:::
+
+### `compression`
+
+Prioritizes encoding speed over output quality/size. Accepts `fast`, which biases format selection away from AVIF/WebP (the slowest encoders) toward JPEG — this applies even when an explicit `format=avif`/`format=webp` is requested.
+
+- **Values:** `fast`
+- **Default:** unset
+
+```
+/cdn-cgi/image/compression=fast/photo.jpg
 ```
 
 ## Format
@@ -67,15 +104,35 @@ Compression quality for lossy formats (JPEG, WebP, AVIF). Higher values produce 
 
 Output format. When set to `auto` or omitted, imgx negotiates the format from the client's `Accept` header.
 
-- **Values:** `jpeg`, `jpg`, `png`, `webp`, `avif`, `gif`, `auto`
+- **Values:** `jpeg`, `jpg`, `png`, `webp`, `avif`, `gif`, `baseline-jpeg`, `json`, `auto`
 - **Default:** `auto`
 
 ```
-/photo.jpg/f=webp
-/photo.jpg/format=avif
-/photo.jpg/fmt=png
-/animation.gif/f=gif
+/cdn-cgi/image/f=webp/photo.jpg
+/cdn-cgi/image/format=avif/photo.jpg
+/cdn-cgi/image/fmt=png/photo.jpg
+/cdn-cgi/image/f=gif/animation.gif
+/cdn-cgi/image/f=baseline-jpeg/photo.jpg
+/cdn-cgi/image/w=200,format=json/photo.jpg
 ```
+
+`baseline-jpeg` produces non-progressive (baseline sequential) JPEG — the
+same encode path as `jpeg` today (libvips defaults to baseline unless
+progressive encoding is explicitly requested).
+
+`format=json` returns a metadata-only JSON response instead of image bytes:
+
+```json
+{
+  "original": { "width": 2000, "height": 1500, "file_size": 123456 },
+  "transformed": { "width": 200, "height": 150, "format": "webp", "file_size": 4821 }
+}
+```
+
+`transformed.format`/`transformed.file_size` are computed by actually
+negotiating and encoding a real codec — real numbers, not placeholders. See
+`docs/CLOUDFLARE_PARITY.md` gap 5 for the schema's provenance (spec-derived —
+Cloudflare doesn't publish an exact field-by-field schema).
 
 ## Fit mode
 
@@ -83,21 +140,30 @@ Output format. When set to `auto` or omitted, imgx negotiates the format from th
 
 Controls how the image fits the target dimensions.
 
-| Value | Behavior |
-|-------|----------|
-| `contain` | Scale down to fit within the dimensions. Preserves aspect ratio. Never upscales. **(default)** |
-| `cover` | Scale and crop to fill the exact dimensions. Uses `gravity` to pick the crop anchor. |
-| `fill` | Stretch to exactly fill the dimensions. Ignores aspect ratio. |
-| `inside` | Same as `contain`. |
-| `outside` | Scale up to cover the dimensions. Preserves aspect ratio. |
-| `pad` | Resize like `contain`, then letterbox onto the target canvas using the background color. |
+| Value | Aliases | Behavior |
+|-------|---------|----------|
+| `contain` | `scale-down` | Scale down to fit within the dimensions. Preserves aspect ratio. Never upscales. **(default)** |
+| `cover` | — | Scale and crop to fill the exact dimensions. Uses `gravity` to pick the crop anchor. Upscales if needed. |
+| `fill` | `squeeze` | Stretch to exactly fill the dimensions. Ignores aspect ratio. |
+| `inside` | — | Same as `contain`. |
+| `outside` | `scale-up` | Scale up to cover the dimensions. Preserves aspect ratio. Never downscales. |
+| `pad` | — | Resize like `contain`, then letterbox onto the target canvas using the background color. |
+| `crop` | — | Fill the target area like `cover`, but never upscales — behaves like `contain` when the source is smaller than the target. |
+| `aspect-crop` | — | Crop to the target aspect ratio. Downscales (never upscales) when the source is large enough to cover the target; otherwise crops the original-size image directly to the target ratio. |
 
 ```
-/photo.jpg/w=400,h=400,fit=cover
-/photo.jpg/w=400,h=300,fit=fill
+/cdn-cgi/image/w=400,h=400,fit=cover/photo.jpg
+/cdn-cgi/image/w=400,h=300,fit=fill/photo.jpg
+/cdn-cgi/image/w=400,h=400,fit=crop/photo.jpg
+/cdn-cgi/image/w=400,h=200,fit=aspect-crop/photo.jpg
 ```
 
 With `fit=pad`, set both `w` and `h` to force a fixed output canvas. The padding color comes from `bg`/`background` and defaults to white. For animated output, `fit=pad` currently behaves like `contain`.
+
+`scale-down`, `squeeze`, and `scale-up` are Cloudflare Images' names for
+pixel-dimension-equivalent behavior imgx already had under `contain`,
+`fill`, and `outside` respectively — see `docs/CLOUDFLARE_PARITY.md` gap 3
+for the equivalence proof. imgx's own default (`contain`) is unchanged.
 
 ## Gravity
 
@@ -108,24 +174,32 @@ When `fit=cover` crops the image, this controls which region to keep.
 | Value | Aliases | Behavior |
 |-------|---------|----------|
 | `center` | `centre` | Crop from center **(default)** |
-| `north` | `n` | Keep the top edge |
-| `south` | `s` | Keep the bottom edge |
-| `east` | `e` | Keep the right edge |
-| `west` | `w` | Keep the left edge |
+| `north` | `n`, `top` | Keep the top edge |
+| `south` | `s`, `bottom` | Keep the bottom edge |
+| `east` | `e`, `right` | Keep the right edge |
+| `west` | `w`, `left` | Keep the left edge |
 | `northeast` | `ne` | Keep the top-right corner |
 | `northwest` | `nw` | Keep the top-left corner |
 | `southeast` | `se` | Keep the bottom-right corner |
 | `southwest` | `sw` | Keep the bottom-left corner |
-| `smart` | — | Entropy-based detection (keeps high-detail areas) |
+| `smart` | `auto` | Entropy-based detection (keeps high-detail areas) |
 | `attention` | `att` | Attention-based detection (keeps visually interesting areas) |
 
 ```
-/photo.jpg/w=400,h=400,fit=cover,g=smart
-/photo.jpg/w=400,h=400,fit=cover,g=north
+/cdn-cgi/image/w=400,h=400,fit=cover,g=smart/photo.jpg
+/cdn-cgi/image/w=400,h=400,fit=cover,g=north/photo.jpg
+/cdn-cgi/image/w=400,h=400,fit=cover,g=auto/photo.jpg
+/cdn-cgi/image/w=400,h=400,fit=cover,g=top/photo.jpg
 ```
 
+`top`/`bottom`/`left`/`right` and `auto` are Cloudflare Images' own gravity
+vocabulary — aliased onto imgx's existing compass words and `smart`
+respectively (same meaning, verified against Cloudflare's docs). Cloudflare's
+`face` (face-detection-based gravity) and `XxY` relative-coordinate focal
+points are **not** implemented — see `docs/CLOUDFLARE_PARITY.md` gap 12.
+
 :::info
-For content-aware cropping, use `smart` or `attention`. Directional values (`north`, `south`, and others) fall back to center cropping.
+For content-aware cropping, use `smart`/`auto` or `attention`. Directional values (`north`, `south`, and others) fall back to center cropping.
 :::
 
 ## Effects
@@ -137,8 +211,8 @@ Unsharp mask with the given sigma value.
 - **Range:** 0.0–10.0
 
 ```
-/photo.jpg/sharpen=1.5
-/photo.jpg/w=400,sharpen=2.0
+/cdn-cgi/image/sharpen=1.5/photo.jpg
+/cdn-cgi/image/w=400,sharpen=2.0/photo.jpg
 ```
 
 ### `blur`
@@ -148,8 +222,8 @@ Gaussian blur with the given sigma value.
 - **Range:** 0.1–250.0
 
 ```
-/photo.jpg/blur=3.0
-/photo.jpg/w=400,blur=10.0
+/cdn-cgi/image/blur=3.0/photo.jpg
+/cdn-cgi/image/w=400,blur=10.0/photo.jpg
 ```
 
 ### `brightness`
@@ -157,7 +231,7 @@ Gaussian blur with the given sigma value.
 - **Range:** 0.0–2.0 (1.0 is normal)
 
 ```
-/photo.jpg/brightness=1.2
+/cdn-cgi/image/brightness=1.2/photo.jpg
 ```
 
 ### `contrast`
@@ -165,7 +239,7 @@ Gaussian blur with the given sigma value.
 - **Range:** 0.0–2.0 (1.0 is normal)
 
 ```
-/photo.jpg/contrast=1.3
+/cdn-cgi/image/contrast=1.3/photo.jpg
 ```
 
 ### `saturation`
@@ -173,7 +247,7 @@ Gaussian blur with the given sigma value.
 - **Range:** 0.0–2.0 (1.0 is normal)
 
 ```
-/photo.jpg/saturation=0.0
+/cdn-cgi/image/saturation=0.0/photo.jpg
 ```
 
 ### `gamma`
@@ -183,7 +257,7 @@ Gamma correction.
 - **Range:** 0.1–10.0
 
 ```
-/photo.jpg/gamma=2.2
+/cdn-cgi/image/gamma=2.2/photo.jpg
 ```
 
 ### `rotate`
@@ -191,7 +265,7 @@ Gamma correction.
 - **Values:** 0, 90, 180, 270
 
 ```
-/photo.jpg/rotate=90
+/cdn-cgi/image/rotate=90/photo.jpg
 ```
 
 ### `flip`
@@ -199,7 +273,7 @@ Gamma correction.
 - **Values:** `h` (horizontal), `v` (vertical), `hv` (both)
 
 ```
-/photo.jpg/flip=h
+/cdn-cgi/image/flip=h/photo.jpg
 ```
 
 ### `bg` / `background`
@@ -209,18 +283,52 @@ Hex RGB color used for `fit=pad` canvas fill and alpha flattening before encodin
 - **Format:** 6-character hex, no `#` prefix
 
 ```
-/photo.png/f=jpeg,bg=ffffff
+/cdn-cgi/image/f=jpeg,bg=ffffff/photo.png
 ```
+
+### `border` / `border.color` / `border.top` / `border.right` / `border.bottom` / `border.left`
+
+Draws a solid-color border around the image, applied after resizing. Border widths scale with `dpr`.
+
+- **`border`:** uniform width in pixels on all four sides
+- **`border.color`:** 6-character hex, no `#` prefix (default: `000000`)
+- **`border.top`/`.right`/`.bottom`/`.left`:** per-side width, overriding `border` for that side
+
+```
+/cdn-cgi/image/border=10/photo.jpg
+/cdn-cgi/image/border=4,border.color=ff0000/photo.jpg
+/cdn-cgi/image/border.top=2,border.left=8/photo.jpg
+```
+
+:::info
+Cloudflare's `border` is available only through its Workers API, with no published URL-interface syntax — the key names above are spec-derived to match imgx's existing dotted-key conventions. See `docs/CLOUDFLARE_PARITY.md` gap 10.
+:::
 
 ### `trim`
 
-Detect and crop uniform borders around the image.
+Detect and crop uniform borders around the image (border-color-aware).
 
 - **Range:** 1.0–100.0 (threshold)
 
 ```
-/photo.jpg/trim=10
+/cdn-cgi/image/trim=10/photo.jpg
 ```
+
+### `trim.top` / `trim.right` / `trim.bottom` / `trim.left`
+
+Crop a fixed amount from one or more edges independently — NOT border-color
+aware (unlike `trim` above), and may be combined with each other or with
+`trim`.
+
+- **Values:** an integer pixel count, or a decimal `0.0`–`1.0` fraction of that side's dimension
+
+```
+/cdn-cgi/image/trim.top=100,trim.left=50/photo.jpg
+/cdn-cgi/image/trim.left=0.1,trim.right=0.1/photo.jpg
+```
+
+See `docs/CLOUDFLARE_PARITY.md` gap 9 for what's implemented (per-side keys)
+versus not yet (the combined `top;right;bottom;left` syntax, `trim.height`/`trim.width`).
 
 ### `metadata`
 
@@ -229,7 +337,7 @@ Controls EXIF and ICC metadata in the output.
 - **Values:** `strip` (default), `keep`, `copyright`
 
 ```
-/photo.jpg/metadata=keep
+/cdn-cgi/image/metadata=keep/photo.jpg
 ```
 
 ## Animation
@@ -246,13 +354,13 @@ Controls whether animated images (GIF, animated WebP) preserve animation in the 
 
 ```bash
 # Serve an animated GIF, resized
-/spinner.gif/w=64
+/cdn-cgi/image/w=64/spinner.gif
 
 # Strip animation (Cloudflare-compatible syntax)
-/spinner.gif/anim=false
+/cdn-cgi/image/anim=false/spinner.gif
 
 # Strip animation (imgx syntax)
-/spinner.gif/anim=static
+/cdn-cgi/image/anim=static/spinner.gif
 ```
 
 When `anim=auto` and no explicit format is set, imgx negotiates an animated-capable format from the `Accept` header: **WebP > GIF**. If the client accepts neither, the output degrades to a static first frame in the best available format.
@@ -265,8 +373,8 @@ Extract a specific 0-indexed frame from an animated image and serve it as a stat
 - **Default:** none (all frames preserved)
 
 ```
-/spinner.gif/frame=0,f=png
-/spinner.gif/frame=2
+/cdn-cgi/image/frame=0,f=png/spinner.gif
+/cdn-cgi/image/frame=2/spinner.gif
 ```
 
 If the index exceeds the number of frames, imgx returns the last frame.
@@ -329,12 +437,36 @@ Invalid transforms return structured JSON errors:
 {"error":{"status":400,"message":"Bad Request","detail":"invalid transform parameters"}}
 ```
 
+### `onerror`
+
+Opt-in per-request behavior when the transform pipeline itself fails (a
+corrupt/unsupported source, an unavailable codec, etc). By default (no
+`onerror`), imgx falls back to serving the raw origin bytes as-is. Setting
+`onerror=redirect` instead returns a `302` redirect to the origin image URL —
+only for HTTP origins (not R2, which has no public URL to redirect to).
+
+- **Values:** `redirect`
+- **Default:** unset (raw-bytes fallback)
+
+```
+/cdn-cgi/image/w=400,onerror=redirect/photo.jpg
+```
+
+### `draw` (overlays) — opt-in, off by default
+
+`draw.<N>.url`, `draw.<N>.width`/`.height`, `.top`/`.left`/`.bottom`/`.right`, `.opacity`, `.repeat`, `.background`, `.rotate`, `.fit`, `.gravity` parse and validate (an array of overlays, indexed by `<N>` starting at `0`). By default (`IMGX_ALLOW_DRAW_OVERLAYS=false`), **every request naming a `draw` overlay returns `403 Forbidden`** before any network call. Set `IMGX_ALLOW_DRAW_OVERLAYS=true` to enable fetching `draw[].url` overlay images through imgx's SSRF-safe remote fetcher (see `IMGX_ALLOW_REMOTE_SOURCES` in [Configuration](/configuration) — this is a separate flag, so an operator can enable overlays without enabling arbitrary remote main-image sources). See `docs/CLOUDFLARE_PARITY.md` gap 11 for the full status.
+
+```
+/cdn-cgi/image/draw.0.url=https://example.com/logo.png,draw.0.opacity=0.5/photo.jpg
+→ 403 Forbidden by default; composites the overlay onto the base image when IMGX_ALLOW_DRAW_OVERLAYS=true
+```
+
 ---
 
 ## Full example
 
 ```
-GET /products/shoe-red.png/w=800,h=600,fit=cover,g=attention,f=auto,q=85,dpr=2,sharpen=0.5
+GET /cdn-cgi/image/w=800,h=600,fit=cover,g=attention,f=auto,q=85,dpr=2,sharpen=0.5/products/shoe-red.png
 ```
 
 This request:
