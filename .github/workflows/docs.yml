@@ -10,6 +10,7 @@ on:
       - "docs/**"
       - "vocs.config.ts"
       - "package.json"
+      - "bun.lock"
       - ".github/workflows/docs.yml"
   pull_request:
     branches: [main]
@@ -17,6 +18,7 @@ on:
       - "docs/**"
       - "vocs.config.ts"
       - "package.json"
+      - "bun.lock"
       - ".github/workflows/docs.yml"
 
 jobs:
@@ -27,16 +29,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: "22"
-
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 9
+          bun-version: latest
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: bun install --frozen-lockfile
 
       - name: Build docs
-        run: pnpm docs:build
+        run: bun run docs:build

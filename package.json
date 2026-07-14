@@ -13,12 +13,10 @@
     "vocs": "^1.0.0-alpha.62",
     "wrangler": "^4.65.0"
   },
-  "pnpm": {
-    "onlyBuiltDependencies": ["esbuild", "sharp", "workerd"],
-    "overrides": {
-      "@vanilla-extract/vite-plugin": "5.1.5",
-      "@vanilla-extract/integration": "8.0.6",
-      "@vanilla-extract/compiler": "0.5.1"
-    }
+  "trustedDependencies": ["esbuild", "sharp", "workerd"],
+  "overrides": {
+    "@vanilla-extract/vite-plugin": "5.1.5",
+    "@vanilla-extract/integration": "8.0.6",
+    "@vanilla-extract/compiler": "0.5.1"
   }
 }

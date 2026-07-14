@@ -3,7 +3,7 @@
 # in favor of Workers for static sites; this is the idiomatic replacement.
 #
 # This config lives at the repo root because the docs site's build output
-# (docs/dist, produced by `pnpm docs:build`) and this file's own directory
+# (docs/dist, produced by `bun run docs:build`) and this file's own directory
 # are the natural pairing for a root-level static-assets Worker -- distinct
 # from crates/imgx-edge/wrangler.toml, which configures a separate Rust
 # Worker (a reverse proxy in front of the imgx image server, not this site).
