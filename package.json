@@ -6,11 +6,19 @@
     "docs:preview": "vocs preview"
   },
   "devDependencies": {
-    "@types/react": "^19.2.14",
+    "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
-    "react": "^19.2.4",
-    "react-dom": "^19.2.4",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
     "vocs": "^1.0.0-alpha.62",
     "wrangler": "^4.65.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild", "sharp", "workerd"],
+    "overrides": {
+      "@vanilla-extract/vite-plugin": "5.1.5",
+      "@vanilla-extract/integration": "8.0.6",
+      "@vanilla-extract/compiler": "0.5.1"
+    }
   }
 }

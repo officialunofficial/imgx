@@ -6,17 +6,17 @@ This page covers how to move from Cloudflare Images (imagedelivery.net) to imgx.
 
 ## URL mapping
 
-**Cloudflare Images:**
+**Cloudflare Images (Image Resizing):**
 ```
-https://imagedelivery.net/<account-id>/<image-id>/<variant-or-options>
+https://<zone>/cdn-cgi/image/<options>/<source-image>
 ```
 
 **imgx:**
 ```
-https://your-domain.com/<image-path>/<transforms>
+https://your-domain.com/cdn-cgi/image/<options>/<image-path>
 ```
 
-The imgx URL scheme is compatible with Cloudflare's path structure. A request for `/<account-id>/<image-id>/<transforms>` works out of the box — imgx treats everything before the last `=`-containing segment as the image path. Set `IMGX_ORIGIN_PATH_PREFIX` to your account ID so imgx strips it when fetching from origin.
+imgx now uses Cloudflare's exact `/cdn-cgi/image/<OPTIONS>/<SOURCE-IMAGE>` URL convention: a fixed `cdn-cgi/image/` prefix, then a comma-separated `key=value` options segment, then the source image path (everything after the options segment, which may itself contain `/`). A Cloudflare-style request like `/cdn-cgi/image/w=400,h=300/photo-id` works unchanged against imgx. If your origin stores images under an account-ID prefix, set `IMGX_ORIGIN_PATH_PREFIX` to that prefix so imgx strips it when fetching from origin — that stripping happens on the resolved image path and is unrelated to the URL parsing change above.
 
 ---
 
@@ -72,9 +72,9 @@ docker run -p 8080:8080 \
 
 ### 3. Strip the account ID prefix
 
-Cloudflare Images URLs include your account ID as the first path segment: `/<account-id>/<image-id>/<transforms>`. Your origin storage stores images by `<image-id>` alone.
+If you're migrating from `imagedelivery.net`, Cloudflare Images URLs include your account ID as a path segment ahead of the image ID: `/<account-id>/<image-id>/<variant-or-options>`. Your origin storage stores images by `<image-id>` alone.
 
-Set `IMGX_ORIGIN_PATH_PREFIX` to your Cloudflare account ID so imgx strips it before fetching from origin:
+Set `IMGX_ORIGIN_PATH_PREFIX` to your Cloudflare account ID so imgx strips it from the resolved image path before fetching from origin:
 
 ```bash
 docker run -p 8080:8080 \
@@ -87,21 +87,21 @@ docker run -p 8080:8080 \
   ghcr.io/officialunofficial/imgx:latest
 ```
 
-With this setting, a request for `/abc123/photo-id/w=400` fetches origin key `photo-id` instead of `abc123/photo-id`.
+With this setting, a request for `/cdn-cgi/image/w=400/abc123/photo-id` resolves an image path of `abc123/photo-id`, and `IMGX_ORIGIN_PATH_PREFIX` strips it down to origin key `photo-id` instead of `abc123/photo-id`. This stripping is entirely about the origin key and is orthogonal to the `cdn-cgi/image/<options>/` URL parsing described above.
 
 ### 4. Update your image URLs
 
-Replace Cloudflare Image URLs in your app:
+Replace Cloudflare Image Resizing URLs in your app:
 
 ```
 # Before (Cloudflare)
-https://imagedelivery.net/abc123/photo-id/w=400,format=auto
+https://<zone>/cdn-cgi/image/w=400,format=auto/abc123/photo-id
 
 # After (with IMGX_ORIGIN_PATH_PREFIX=abc123, keep the same path)
-https://your-imgx-host.com/abc123/photo-id/w=400
+https://your-imgx-host.com/cdn-cgi/image/w=400/abc123/photo-id
 
 # Or without the prefix
-https://your-imgx-host.com/photo-id/w=400
+https://your-imgx-host.com/cdn-cgi/image/w=400/photo-id
 ```
 
 Format auto-negotiation is on by default. You do not need to specify `f=auto`.
@@ -115,3 +115,5 @@ Client → CDN (Cloudflare, Fastly, nginx) → imgx → R2/S3
 ```
 
 imgx sets `Cache-Control` and `ETag` headers automatically. The CDN caches responses at the edge. imgx's internal cache handles the origin layer.
+
+If that CDN is Cloudflare and you would rather manage the edge as code than through dashboard rules, see [Cloudflare Workers edge deployment](/cloudflare-edge-deployment) for an optional Workers-based reverse proxy. It is one specific implementation of "place a CDN in front" above, not a replacement for it — you can just as well point any CDN at imgx with zero code, as described here.

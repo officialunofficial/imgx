@@ -57,6 +57,13 @@ impl Fetcher {
         }
     }
 
+    /// Build the origin URL for an image path without fetching it --
+    /// used by `onerror=redirect` (docs/CLOUDFLARE_PARITY.md gap 7) to
+    /// redirect the client straight to the source instead of proxying it.
+    pub fn origin_url(&self, image_path: &str) -> Result<String, UrlError> {
+        self.origin.build_url(image_path)
+    }
+
     /// Fetch an image from the origin by path.
     pub async fn fetch(&self, image_path: &str) -> Result<FetchResult, FetchError> {
         let url = self.origin.build_url(image_path)?;

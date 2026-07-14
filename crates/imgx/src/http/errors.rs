@@ -18,6 +18,14 @@ impl HttpError {
         }
     }
 
+    pub fn forbidden(detail: impl Into<Option<String>>) -> Self {
+        Self {
+            status: 403,
+            message: "Forbidden",
+            detail: detail.into(),
+        }
+    }
+
     pub fn not_found(detail: impl Into<Option<String>>) -> Self {
         Self {
             status: 404,
@@ -144,6 +152,14 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_has_status_403() {
+        let err = HttpError::forbidden(Some("remote sources are disabled".to_string()));
+        assert_eq!(err.status, 403);
+        assert_eq!(err.message, "Forbidden");
+        assert_eq!(err.detail.as_deref(), Some("remote sources are disabled"));
+    }
+
+    #[test]
     fn not_found_has_status_404() {
         let err = HttpError::not_found(Some("image not found".to_string()));
         assert_eq!(err.status, 404);
@@ -215,6 +231,11 @@ mod tests {
     #[test]
     fn status_text_maps_400() {
         assert_eq!(status_text(400), "Bad Request");
+    }
+
+    #[test]
+    fn status_text_maps_403() {
+        assert_eq!(status_text(403), "Forbidden");
     }
 
     #[test]

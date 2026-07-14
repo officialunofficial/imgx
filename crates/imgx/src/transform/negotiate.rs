@@ -23,7 +23,14 @@ impl AcceptResult {
             OutputFormat::Jpeg => self.supports_jpeg || self.wildcard,
             OutputFormat::Png => self.supports_png || self.wildcard,
             OutputFormat::Gif => self.supports_gif || self.wildcard,
+            OutputFormat::BaselineJpeg => self.supports_jpeg || self.wildcard,
             OutputFormat::Auto => true,
+            // Never reached via negotiate_format/negotiate_animated_format:
+            // both short-circuit on any explicit non-Auto format before
+            // calling supports(), and Json is never itself negotiated
+            // against (pipeline.rs negotiates a real codec for the JSON
+            // response's "transformed" stats separately).
+            OutputFormat::Json => true,
         }
     }
 }
@@ -148,6 +155,23 @@ pub fn negotiate_animated_format(
         return Some(OutputFormat::Gif);
     }
     None
+}
+
+/// Cloudflare's `compression=fast` (gap 6, docs/CLOUDFLARE_PARITY.md):
+/// "will usually override the format parameter to choose JPEG over more
+/// efficient formats like AVIF or WebP" (verified against
+/// developers.cloudflare.com/images/optimization/features/). Applied as a
+/// post-negotiation override, not folded into `negotiate_format` itself,
+/// so that function's existing tested priority-order API stays untouched.
+/// Static images only -- see the call site in `pipeline.rs` for why this
+/// is skipped for animated output (forcing JPEG would silently drop
+/// animation, which Cloudflare's docs don't describe as an interaction).
+pub fn apply_compression_fast(format: OutputFormat, compression_fast: bool) -> OutputFormat {
+    if compression_fast && matches!(format, OutputFormat::Avif | OutputFormat::Webp) {
+        OutputFormat::Jpeg
+    } else {
+        format
+    }
 }
 
 #[cfg(test)]
@@ -473,5 +497,53 @@ mod tests {
     #[test]
     fn accept_result_supports_gif_through_wildcard() {
         assert!(parse_accept_header("*/*").supports(OutputFormat::Gif));
+    }
+
+    // ------------------------------------------------------------------
+    // Gap 6 -- compression=fast (docs/CLOUDFLARE_PARITY.md)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn apply_compression_fast_downgrades_avif_to_jpeg() {
+        assert_eq!(
+            apply_compression_fast(OutputFormat::Avif, true),
+            OutputFormat::Jpeg
+        );
+    }
+
+    #[test]
+    fn apply_compression_fast_downgrades_webp_to_jpeg() {
+        assert_eq!(
+            apply_compression_fast(OutputFormat::Webp, true),
+            OutputFormat::Jpeg
+        );
+    }
+
+    #[test]
+    fn apply_compression_fast_leaves_jpeg_png_gif_unchanged() {
+        assert_eq!(
+            apply_compression_fast(OutputFormat::Jpeg, true),
+            OutputFormat::Jpeg
+        );
+        assert_eq!(
+            apply_compression_fast(OutputFormat::Png, true),
+            OutputFormat::Png
+        );
+        assert_eq!(
+            apply_compression_fast(OutputFormat::Gif, true),
+            OutputFormat::Gif
+        );
+    }
+
+    #[test]
+    fn apply_compression_fast_is_a_noop_when_disabled() {
+        assert_eq!(
+            apply_compression_fast(OutputFormat::Avif, false),
+            OutputFormat::Avif
+        );
+        assert_eq!(
+            apply_compression_fast(OutputFormat::Webp, false),
+            OutputFormat::Webp
+        );
     }
 }

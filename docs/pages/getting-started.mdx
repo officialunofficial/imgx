@@ -47,13 +47,13 @@ Assuming your origin has a file at the key `photos/hero.jpg`:
 
 ```bash
 # Original, no transforms
-curl http://localhost:8080/photos/hero.jpg
+curl http://localhost:8080/cdn-cgi/image/photos/hero.jpg
 
 # Resize to 400px wide
-curl http://localhost:8080/photos/hero.jpg/w=400
+curl http://localhost:8080/cdn-cgi/image/w=400/photos/hero.jpg
 
 # Resize and convert to WebP at quality 85
-curl http://localhost:8080/photos/hero.jpg/w=800,f=webp,q=85
+curl http://localhost:8080/cdn-cgi/image/w=800,f=webp,q=85/photos/hero.jpg
 ```
 
 No upload API. No database. Your images stay where they are.

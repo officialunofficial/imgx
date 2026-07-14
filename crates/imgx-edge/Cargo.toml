@@ -1,0 +1,18 @@
+[package]
+name = "imgx-edge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Compiled to wasm32-unknown-unknown by `worker-build`, not `cargo build`.
+# `cdylib` is what `worker-build` (and wrangler's build step) expect to find;
+# `rlib` is kept too so `cargo test`/`cargo clippy` can target this crate
+# normally on the host toolchain.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+worker = "0.8"
+worker-macros = "0.8"
