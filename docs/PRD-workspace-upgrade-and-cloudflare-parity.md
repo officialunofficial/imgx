@@ -28,9 +28,11 @@ Final status: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targ
 
 ## 3. Stream B: Cloudflare Images URL & Parameter Parity
 
-### 3.a URL-shape decision — RESOLVED
+### 3.a URL-shape decision — RESOLVED (superseded — see below)
 
-**Owner selected Option B: migrate the primary scheme.** imgx's canonical URL format is now `GET /cdn-cgi/image/<OPTIONS>/<SOURCE-IMAGE>` — fixed prefix, options-first — matching Cloudflare's exact convention. This is a breaking change: the old trailing-options shape (`/<image-path>/<transforms>`) is retired outright, not kept as a fallback. See `crates/imgx/src/router.rs` and `docs/INVARIANTS.md` INV-5 for the implementation and the specific relaxation decision (a segment after the prefix with no `=` is treated as a transform-less image path rather than rejected, since Cloudflare's own "at least one parameter" rule would otherwise break imgx's passthrough use case).
+**Owner selected Option B: migrate the primary scheme.** imgx's canonical URL format became `GET /cdn-cgi/image/<OPTIONS>/<SOURCE-IMAGE>` — fixed prefix, options-first. This is a breaking change: the old trailing-options shape (`/<image-path>/<transforms>`) is retired outright, not kept as a fallback. See `crates/imgx/src/router.rs` and `docs/INVARIANTS.md` INV-5 for the implementation and the specific relaxation decision (a segment after the prefix with no `=` is treated as a transform-less image path rather than rejected, since Cloudflare's own "at least one parameter" rule would otherwise break imgx's passthrough use case).
+
+**Superseded:** the `cdn-cgi/` segment was subsequently dropped as a CGI-bin-era relic. The canonical URL format is now `GET /image/<OPTIONS>/<SOURCE-IMAGE>` — same options-first shape, no `cdn-cgi/` prefix. See `docs/INVARIANTS.md` INV-5.
 
 ### 3.b Parameter gap table (Phase B3+ — not yet implemented)
 

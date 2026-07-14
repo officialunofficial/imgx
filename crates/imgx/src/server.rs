@@ -865,7 +865,7 @@ mod tests {
     #[tokio::test]
     async fn image_request_with_invalid_transform_returns_400() {
         let router = build_router(test_state());
-        let (status, body) = get(router, "/cdn-cgi/image/banana=42/test.jpg").await;
+        let (status, body) = get(router, "/image/banana=42/test.jpg").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("invalid transform parameters"));
     }
@@ -873,7 +873,7 @@ mod tests {
     #[tokio::test]
     async fn image_request_with_out_of_range_transform_returns_422() {
         let router = build_router(test_state());
-        let (status, body) = get(router, "/cdn-cgi/image/w=0/test.jpg").await;
+        let (status, body) = get(router, "/image/w=0/test.jpg").await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(body.contains("out of range"));
     }
@@ -887,7 +887,7 @@ mod tests {
         // over this deployment's configured max_width -- must be rejected
         // before an origin fetch is ever attempted (origin is unreachable
         // by default; a 502/504 here would mean the check didn't fire).
-        let (status, body) = get(router, "/cdn-cgi/image/w=200/test.jpg").await;
+        let (status, body) = get(router, "/image/w=200/test.jpg").await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(body.contains("out of range"));
     }
@@ -897,7 +897,7 @@ mod tests {
         let mut cfg = Config::defaults();
         cfg.transform.max_width = 100;
         let router = build_router(Arc::new(AppState::new(cfg)));
-        let (status, _) = get(router, "/cdn-cgi/image/w=100/test.jpg").await;
+        let (status, _) = get(router, "/image/w=100/test.jpg").await;
         assert_ne!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -914,7 +914,7 @@ mod tests {
 
         // First request: origin returns garbage, vips fails to decode it,
         // falls back to serving the raw bytes -- a cache miss either way.
-        let (status, body) = get(router.clone(), "/cdn-cgi/image/w=100/photo.jpg").await;
+        let (status, body) = get(router.clone(), "/image/w=100/photo.jpg").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "not an image");
         assert_eq!(metric_value(&state, "imgx_cache_misses_total"), 1.0);
@@ -923,7 +923,7 @@ mod tests {
         // Second, identical request: if the failed transform had been
         // cached under the transform's cache key, this would be a cache
         // hit. It must still be a miss -- the fallback is never cached.
-        let (status, body) = get(router, "/cdn-cgi/image/w=100/photo.jpg").await;
+        let (status, body) = get(router, "/image/w=100/photo.jpg").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "not an image");
         assert_eq!(metric_value(&state, "imgx_cache_misses_total"), 2.0);
@@ -937,14 +937,14 @@ mod tests {
         // Default config's origin is http://localhost:9000, nothing is
         // listening there, so this fails at fetch -- but cache_misses
         // must still have been counted before the fetch was attempted.
-        let _ = get(router, "/cdn-cgi/image/test.jpg").await;
+        let _ = get(router, "/image/test.jpg").await;
         assert_eq!(metric_value(&state, "imgx_cache_misses_total"), 1.0);
     }
 
     #[tokio::test]
     async fn image_request_unreachable_origin_returns_502() {
         let router = build_router(test_state());
-        let (status, _) = get(router, "/cdn-cgi/image/test.jpg").await;
+        let (status, _) = get(router, "/image/test.jpg").await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
     }
 
@@ -963,7 +963,7 @@ mod tests {
         cfg.origin.base_url = base_url.clone();
         let router = build_router(Arc::new(AppState::new(cfg)));
 
-        let (status, _) = get(router, "/cdn-cgi/image/onerror=redirect/photo.jpg").await;
+        let (status, _) = get(router, "/image/onerror=redirect/photo.jpg").await;
         assert_eq!(status, StatusCode::FOUND);
     }
 
@@ -978,7 +978,7 @@ mod tests {
         let router = build_router(Arc::new(AppState::new(cfg)));
 
         let req = axum::http::Request::builder()
-            .uri("/cdn-cgi/image/onerror=redirect/photo.jpg")
+            .uri("/image/onerror=redirect/photo.jpg")
             .body(Body::empty())
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
@@ -1003,7 +1003,7 @@ mod tests {
         cfg.origin.base_url = base_url;
         let router = build_router(Arc::new(AppState::new(cfg)));
 
-        let (status, body) = get(router, "/cdn-cgi/image/w=100/photo.jpg").await;
+        let (status, body) = get(router, "/image/w=100/photo.jpg").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "not an image");
     }
@@ -1044,7 +1044,7 @@ mod tests {
     #[tokio::test]
     async fn draw_overlay_request_is_rejected_by_default_with_403() {
         let router = build_router(test_state());
-        let (status, body) = get(router, "/cdn-cgi/image/draw.0.url=logo.png/photo.jpg").await;
+        let (status, body) = get(router, "/image/draw.0.url=logo.png/photo.jpg").await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(body.contains("draw overlays are not enabled"));
     }
@@ -1060,7 +1060,7 @@ mod tests {
         let mut cfg = Config::defaults();
         cfg.origin.allow_draw_overlays = true;
         let router = build_router(Arc::new(AppState::new(cfg)));
-        let (status, body) = get(router, "/cdn-cgi/image/draw.0.url=logo.png/photo.jpg").await;
+        let (status, body) = get(router, "/image/draw.0.url=logo.png/photo.jpg").await;
         assert_ne!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(!body.contains("draw overlays are not enabled"));
     }
@@ -1090,7 +1090,7 @@ mod tests {
         cfg.origin.allow_draw_overlays = true;
         let router = build_router(Arc::new(AppState::new(cfg)));
         let overlay_url = format!("{}/logo.png", server.uri());
-        let uri = format!("/cdn-cgi/image/draw.0.url={overlay_url}/photo.jpg");
+        let uri = format!("/image/draw.0.url={overlay_url}/photo.jpg");
         let (status, body) = get(router, &uri).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(body.contains("remote fetch rejected"));
@@ -1104,7 +1104,7 @@ mod tests {
     #[tokio::test]
     async fn remote_source_request_is_rejected_by_default_with_403_and_no_network_call() {
         let router = build_router(test_state());
-        let (status, body) = get(router, "/cdn-cgi/image/w=100/https://example.com/cat.jpg").await;
+        let (status, body) = get(router, "/image/w=100/https://example.com/cat.jpg").await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(body.contains("remote image sources are not enabled"));
     }
@@ -1127,7 +1127,7 @@ mod tests {
         cfg.origin.allow_remote_sources = true;
         let router = build_router(Arc::new(AppState::new(cfg)));
         let source_url = format!("{}/cat.jpg", server.uri());
-        let uri = format!("/cdn-cgi/image/w=100/{source_url}");
+        let uri = format!("/image/w=100/{source_url}");
         let (status, body) = get(router, &uri).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(body.contains("remote fetch rejected"));
@@ -1138,7 +1138,7 @@ mod tests {
         let mut cfg = Config::defaults();
         cfg.origin.allow_remote_sources = true;
         let router = build_router(Arc::new(AppState::new(cfg)));
-        let (status, body) = get(router, "/cdn-cgi/image/draw.0.url=logo.png/photo.jpg").await;
+        let (status, body) = get(router, "/image/draw.0.url=logo.png/photo.jpg").await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(body.contains("draw overlays are not enabled"));
     }
@@ -1164,7 +1164,7 @@ mod tests {
         // First request: no client hints present -> scq never applies,
         // effective quality is the plain q=80.
         let req = axum::http::Request::builder()
-            .uri("/cdn-cgi/image/q=80,scq=40/photo.png")
+            .uri("/image/q=80,scq=40/photo.png")
             .body(Body::empty())
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
@@ -1177,7 +1177,7 @@ mod tests {
         // the effective quality (40) differs from the first request's
         // (80). Must be a cache MISS, not a hit off the first entry.
         let req_slow = axum::http::Request::builder()
-            .uri("/cdn-cgi/image/q=80,scq=40/photo.png")
+            .uri("/image/q=80,scq=40/photo.png")
             .header("rtt", "300")
             .body(Body::empty())
             .unwrap();
@@ -1189,7 +1189,7 @@ mod tests {
         // Third request: repeats the exact slow-connection request --
         // now a cache HIT against the second request's entry.
         let req_slow_again = axum::http::Request::builder()
-            .uri("/cdn-cgi/image/q=80,scq=40/photo.png")
+            .uri("/image/q=80,scq=40/photo.png")
             .header("rtt", "300")
             .body(Body::empty())
             .unwrap();
@@ -1208,7 +1208,7 @@ mod tests {
         let router = build_router(Arc::clone(&state));
 
         let req = axum::http::Request::builder()
-            .uri("/cdn-cgi/image/q=80,scq=40/photo.png")
+            .uri("/image/q=80,scq=40/photo.png")
             .header("save-data", "on")
             .body(Body::empty())
             .unwrap();

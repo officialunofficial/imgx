@@ -131,7 +131,7 @@ When `IMGX_ORIGIN_TYPE=http` (no R2 configured), only the L1 memory cache is act
 Appends the request path to `IMGX_ORIGIN_BASE_URL`:
 
 ```
-Request:  GET /cdn-cgi/image/w=400/photos/cat.jpg
+Request:  GET /image/w=400/photos/cat.jpg
 Origin:   GET https://images.example.com/photos/cat.jpg
 ```
 
@@ -140,7 +140,7 @@ Origin:   GET https://images.example.com/photos/cat.jpg
 Fetches from a Cloudflare R2 bucket using AWS SigV4-signed presigned URLs:
 
 ```
-Request:  GET /cdn-cgi/image/w=400/photos/cat.jpg
+Request:  GET /image/w=400/photos/cat.jpg
 Origin:   S3 GET from bucket "originals", key "photos/cat.jpg"
 ```
 

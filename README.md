@@ -26,37 +26,37 @@ cargo build --release -p imgx
 ## URL Format
 
 ```
-GET /cdn-cgi/image/<options>/<image-path>
+GET /image/<options>/<image-path>
 ```
 
-imgx uses Cloudflare's exact `/cdn-cgi/image/<OPTIONS>/<SOURCE-IMAGE>` convention: a fixed `cdn-cgi/image/` prefix, then an OPTIONS segment, then the source image path. The segment right after the prefix is treated as options when it contains `=`; otherwise it's the start of a transform-less image path. Options are comma-separated `key=value` pairs.
+imgx uses a `/image/<OPTIONS>/<SOURCE-IMAGE>` convention: a fixed `image/` prefix, then an OPTIONS segment, then the source image path. The segment right after the prefix is treated as options when it contains `=`; otherwise it's the start of a transform-less image path. Options are comma-separated `key=value` pairs.
 
 ### Examples
 
 ```
 # Resize to 400px wide, auto-negotiate format
-/cdn-cgi/image/w=400/photos/hero.jpg
+/image/w=400/photos/hero.jpg
 
 # Resize to 800x600, convert to WebP at quality 85
-/cdn-cgi/image/w=800,h=600,f=webp,q=85/photos/hero.jpg
+/image/w=800,h=600,f=webp,q=85/photos/hero.jpg
 
 # Cover crop with smart gravity, 2x DPR
-/cdn-cgi/image/w=400,h=400,fit=cover,g=smart,dpr=2/photos/hero.jpg
+/image/w=400,h=400,fit=cover,g=smart,dpr=2/photos/hero.jpg
 
 # Apply blur effect
-/cdn-cgi/image/blur=3.0/photos/hero.jpg
+/image/blur=3.0/photos/hero.jpg
 
 # Animated GIF resized, preserved as animated WebP
-/cdn-cgi/image/w=64/photos/spinner.gif
+/image/w=64/photos/spinner.gif
 
 # Extract frame 0 as static PNG
-/cdn-cgi/image/frame=0,f=png/photos/spinner.gif
+/image/frame=0,f=png/photos/spinner.gif
 
 # Strip animation, serve first frame only
-/cdn-cgi/image/anim=false/photos/spinner.gif
+/image/anim=false/photos/spinner.gif
 
 # Original image, no transforms
-/cdn-cgi/image/photos/hero.jpg
+/image/photos/hero.jpg
 ```
 
 ## Transform Parameters
@@ -100,7 +100,7 @@ The legacy `ZIMGX_` prefix is still read as a fallback for one release during th
 | `GET /health` | Health check &mdash; `{"status":"ok"}` |
 | `GET /ready` | Readiness probe &mdash; `{"ready":true}` |
 | `GET /metrics` | Prometheus exposition format (requests, cache hits/misses, uptime) |
-| `GET /cdn-cgi/image/<options>/<path>` | Image request (with optional transforms) |
+| `GET /image/<options>/<path>` | Image request (with optional transforms) |
 
 ## Architecture
 

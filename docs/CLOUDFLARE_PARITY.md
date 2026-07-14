@@ -21,7 +21,7 @@ Every claim below is marked as one of:
 
 | # | Gap | Status | Note |
 |---|---|---|---|
-| 1 | URL shape | done | `/cdn-cgi/image/<OPTIONS>/<SOURCE>` — shipped in the prior URL migration (INV-5). |
+| 1 | URL shape | done | `/image/<OPTIONS>/<SOURCE>` — shipped in the prior URL migration (INV-5). |
 | 2 | Arbitrary remote-URL source | done | Opt-in via `IMGX_ALLOW_REMOTE_SOURCES` (default off), SSRF-safe fetcher. See "Gap 2 — arbitrary remote-URL sources" below. |
 | 3 | `fit` vocabulary | done | See "Gap 3 — fit" below. |
 | 4 | `quality`/`q` perceptual strings | done (spec-derived mapping) | See "Gap 4 — quality" below. |
@@ -495,7 +495,7 @@ composite onto). Tested in `crates/imgx/src/transform/pipeline.rs`
 **Verified** (feature existence) against
 `developers.cloudflare.com/images/optimization/features/` (the URL-format
 section) via the Cloudflare docs MCP tool — Cloudflare's own docs state
-the `<SOURCE-IMAGE>` segment of `/cdn-cgi/image/<OPTIONS>/<SOURCE-IMAGE>`
+the `<SOURCE-IMAGE>` segment of `/image/<OPTIONS>/<SOURCE-IMAGE>`
 "can be a relative path... or an absolute URL." **Not verified from
 published docs**: Cloudflare doesn't publish the SSRF-mitigation details
 of its own remote-fetch implementation (it runs inside Cloudflare's own
