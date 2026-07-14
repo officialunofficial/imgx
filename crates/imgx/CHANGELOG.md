@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.3] - 2026-07-14
+
+### Other
+
+- *(docs)* Upgrade to vocs 2, move docs site into apps/docs(b0bbb99)
+
+
 ## [0.1.2] - 2026-07-14
 
 ### Other
