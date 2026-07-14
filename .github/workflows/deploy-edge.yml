@@ -5,7 +5,7 @@ name: Deploy imgx-edge to Cloudflare Workers
 # OQ-14 in docs/PRD-workspace-upgrade-and-cloudflare-parity.md) -- deploying
 # on every push before those are filled in would publish a non-functional
 # Worker. Once a real origin/route is configured, switch `on:` to a `push`
-# trigger scoped to `crates/imgx-edge/**`, matching docs.yml's pattern.
+# trigger scoped to `crates/imgx-edge/**`.
 on:
   workflow_dispatch: {}
 

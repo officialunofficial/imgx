@@ -1,5 +1,8 @@
-name: Deploy docs to Cloudflare Workers
+name: Build docs
 
+# Deploys are handled by Cloudflare's own git integration (connected
+# directly to this repo), not CI -- this workflow only builds the docs
+# site as a check.
 on:
   push:
     branches: [main]
@@ -17,11 +20,10 @@ on:
       - ".github/workflows/docs.yml"
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      deployments: write
     steps:
       - uses: actions/checkout@v7
 
@@ -38,12 +40,3 @@ jobs:
 
       - name: Build docs
         run: pnpm docs:build
-
-      - name: Deploy to Cloudflare Workers
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: cloudflare/wrangler-action@v4
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy
-          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
