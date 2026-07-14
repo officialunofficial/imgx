@@ -2,11 +2,10 @@
 # Workers static-assets site (not Cloudflare Pages). Pages is being retired
 # in favor of Workers for static sites; this is the idiomatic replacement.
 #
-# This config lives at the repo root because the docs site's build output
-# (docs/dist, produced by `bun run docs:build`) and this file's own directory
-# are the natural pairing for a root-level static-assets Worker -- distinct
-# from crates/imgx-edge/wrangler.toml, which configures a separate Rust
-# Worker (a reverse proxy in front of the imgx image server, not this site).
+# This config lives in apps/docs, colocated with the vocs project it builds
+# (package.json, vocs.config.ts) -- distinct from crates/imgx-edge/wrangler.toml,
+# which configures a separate Rust Worker (a reverse proxy in front of the
+# imgx image server, not this site).
 
 name = "imgx-docs"
 compatibility_date = "2026-07-12"
@@ -16,7 +15,7 @@ compatibility_date = "2026-07-12"
 # vocs's build output is a fully static, multi-page site (not an SPA), so
 # unmatched paths fall through to a real 404 page rather than an SPA shell.
 [assets]
-directory = "./docs/dist"
+directory = "./dist/public"
 not_found_handling = "404-page"
 
 # No `routes`/zone binding yet -- which hostname serves the docs site

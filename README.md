@@ -75,7 +75,7 @@ imgx uses a `/image/<OPTIONS>/<SOURCE-IMAGE>` convention: a fixed `image/` prefi
 | `anim` | Animation mode | `true`, `false`, `auto`, `static`, `animate` | `auto` (`true`) |
 | `frame` | Extract single frame | 0-999 | - |
 
-See [docs/pages/transforms.mdx](docs/pages/transforms.mdx) for full details.
+See [apps/docs/src/pages/transforms.mdx](apps/docs/src/pages/transforms.mdx) for full details.
 
 ## Environment Variables
 
@@ -91,7 +91,7 @@ See [docs/pages/transforms.mdx](docs/pages/transforms.mdx) for full details.
 | `IMGX_R2_ACCESS_KEY_ID` | R2/S3 access key | - |
 | `IMGX_R2_SECRET_ACCESS_KEY` | R2/S3 secret key | - |
 
-The legacy `ZIMGX_` prefix is still read as a fallback for one release during the migration from zimgx (Zig) to imgx (Rust). See [docs/pages/configuration.mdx](docs/pages/configuration.mdx) for the full reference.
+The legacy `ZIMGX_` prefix is still read as a fallback for one release during the migration from zimgx (Zig) to imgx (Rust). See [apps/docs/src/pages/configuration.mdx](apps/docs/src/pages/configuration.mdx) for the full reference.
 
 ## Endpoints
 
@@ -144,7 +144,7 @@ The legacy `ZIMGX_` prefix is still read as a fallback for one release during th
                                  Respond
 ```
 
-See [docs/pages/architecture.mdx](docs/pages/architecture.mdx) for full details.
+See [apps/docs/src/pages/architecture.mdx](apps/docs/src/pages/architecture.mdx) for full details.
 
 ## Performance
 
@@ -152,10 +152,10 @@ imgx is built on tokio/axum with CPU-bound libvips work dispatched via `spawn_bl
 
 ## Documentation
 
-- [Configuration Reference](docs/pages/configuration.mdx) &mdash; all `IMGX_*` environment variables
-- [Transform Parameters](docs/pages/transforms.mdx) &mdash; resize, format, effects
-- [Deployment Guide](docs/pages/deployment.mdx) &mdash; Docker, Compose, health checks
-- [Architecture](docs/pages/architecture.mdx) &mdash; system design, module map, caching
+- [Configuration Reference](apps/docs/src/pages/configuration.mdx) &mdash; all `IMGX_*` environment variables
+- [Transform Parameters](apps/docs/src/pages/transforms.mdx) &mdash; resize, format, effects
+- [Deployment Guide](apps/docs/src/pages/deployment.mdx) &mdash; Docker, Compose, health checks
+- [Architecture](apps/docs/src/pages/architecture.mdx) &mdash; system design, module map, caching
 - [Invariants](docs/INVARIANTS.md) &mdash; behaviors that must survive any future changes
 - [Parity Verification](docs/PARITY.md) &mdash; zimgx (Zig) → imgx (Rust) rewrite parity pass
 

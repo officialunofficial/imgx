@@ -1,4 +1,4 @@
-import { defineConfig } from "vocs";
+import { defineConfig } from "vocs/config";
 
 export default defineConfig({
   title: "imgx",
@@ -8,7 +8,7 @@ export default defineConfig({
     light: "/logo-black.svg",
     dark: "/logo.svg",
   },
-  rootDir: "docs",
+  renderStrategy: "static",
   topNav: [
     {
       text: "Guide",

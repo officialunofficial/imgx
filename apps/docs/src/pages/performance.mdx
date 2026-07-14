@@ -2,7 +2,7 @@
 
 imgx is designed for low-latency image delivery. This page covers what to expect and how to tune for your workload.
 
-The specific latency numbers previously published on this page were measured against the prior Zig implementation and are not representative of the Rust rewrite (different concurrency model, different encoder call overhead). They've been removed pending a fresh benchmark pass. The qualitative guidance below (what affects cold vs. warm request time, caching strategy, CDN placement) still applies regardless of implementation language. See [docs/PARITY.md](/../PARITY.md) in the repo for the correctness parity verification done as part of the rewrite.
+The specific latency numbers previously published on this page were measured against the prior Zig implementation and are not representative of the Rust rewrite (different concurrency model, different encoder call overhead). They've been removed pending a fresh benchmark pass. The qualitative guidance below (what affects cold vs. warm request time, caching strategy, CDN placement) still applies regardless of implementation language. See `docs/PARITY.md` in the repo for the correctness parity verification done as part of the rewrite.
 
 ---
 

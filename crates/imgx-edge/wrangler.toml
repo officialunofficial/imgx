@@ -1,6 +1,6 @@
 # Wrangler configuration for imgx-edge, a thin Cloudflare Workers reverse
 # proxy that sits in front of an imgx origin and lets Workers Caching absorb
-# repeat requests. See ../../docs/pages/cloudflare-edge-deployment.mdx.
+# repeat requests. See ../../apps/docs/src/pages/cloudflare-edge-deployment.mdx.
 #
 # This file lives next to imgx-edge's Cargo.toml (not at the repo root)
 # because `wrangler` resolves relative paths -- `main`, the build command's

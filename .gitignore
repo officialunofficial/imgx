@@ -2,6 +2,7 @@
 .DS_Store
 node_modules/
 .wrangler/
-docs/dist/
+apps/docs/dist/
+apps/docs/.vocs/
 target/
 .claude/worktrees/

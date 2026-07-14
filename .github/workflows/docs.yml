@@ -7,18 +7,12 @@ on:
   push:
     branches: [main]
     paths:
-      - "docs/**"
-      - "vocs.config.ts"
-      - "package.json"
-      - "bun.lock"
+      - "apps/docs/**"
       - ".github/workflows/docs.yml"
   pull_request:
     branches: [main]
     paths:
-      - "docs/**"
-      - "vocs.config.ts"
-      - "package.json"
-      - "bun.lock"
+      - "apps/docs/**"
       - ".github/workflows/docs.yml"
 
 jobs:
@@ -26,6 +20,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    defaults:
+      run:
+        working-directory: apps/docs
     steps:
       - uses: actions/checkout@v7
 
