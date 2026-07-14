@@ -8,7 +8,7 @@
 # from crates/imgx-edge/wrangler.toml, which configures a separate Rust
 # Worker (a reverse proxy in front of the imgx image server, not this site).
 
-name = "imgx-docs"
+name = "imgx"
 compatibility_date = "2026-07-12"
 
 # Assets-only Worker: no `main` script. Wrangler serves static files
