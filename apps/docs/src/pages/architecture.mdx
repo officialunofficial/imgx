@@ -4,7 +4,7 @@ imgx is an HTTP image proxy built for concurrent request handling. It fetches im
 
 ## Request flow
 
-```
+```text
 Client Request
      │
      ▼
@@ -49,7 +49,7 @@ Client Request
 
 ## Module map
 
-```
+```text
 crates/
 ├── imgx-vips/                     Hand-rolled libvips FFI — the crate's unsafe/audit boundary.
 │   └── src/
@@ -95,7 +95,7 @@ crates/
 
 imgx uses a `Cache` trait (async methods, `impl Future` return position) with multiple backends. The backend set is closed (Memory/Noop/R2/Tiered), so the server selects a concrete `AppCache` enum variant at startup based on config rather than using `dyn Cache` — no boxing, no object-safety cost:
 
-```
+```text
 ┌───────────────────────────────┐
 │            TieredCache                  │
 │                                         │
@@ -130,7 +130,7 @@ When `IMGX_ORIGIN_TYPE=http` (no R2 configured), only the L1 memory cache is act
 
 Appends the request path to `IMGX_ORIGIN_BASE_URL`:
 
-```
+```text
 Request:  GET /image/w=400/photos/cat.jpg
 Origin:   GET https://images.example.com/photos/cat.jpg
 ```
@@ -139,7 +139,7 @@ Origin:   GET https://images.example.com/photos/cat.jpg
 
 Fetches from a Cloudflare R2 bucket using AWS SigV4-signed presigned URLs:
 
-```
+```text
 Request:  GET /image/w=400/photos/cat.jpg
 Origin:   S3 GET from bucket "originals", key "photos/cat.jpg"
 ```
@@ -152,7 +152,7 @@ With R2 origin, the tiered cache uses a second R2 bucket (`IMGX_R2_BUCKET_VARIAN
 
 The pipeline uses a probe-decide-reload flow for animation-aware processing:
 
-```
+```text
 ┌────────┐    ┌────────┐    ┌────────┐    ┌────────┐    ┌────────┐    ┌────────┐
 │  Probe  │───▶│ Decide  │───▶│ Reload  │───▶│ Resize  │───▶│ Effects │───▶│ Encode  │
 └────────┘    └────────┘    └────────┘    └────────┘    └────────┘    └────────┘

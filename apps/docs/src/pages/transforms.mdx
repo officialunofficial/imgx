@@ -2,14 +2,14 @@
 
 imgx uses a `/image/<OPTIONS>/<SOURCE-IMAGE>` URL convention: a fixed `image/` prefix, then an OPTIONS segment, then the source image path. imgx treats the segment immediately after the prefix as the options segment when it contains `=`. Separate multiple parameters with commas.
 
-```
+```text
 GET /image/<options>/<image-path>
 GET /image/w=400,h=300,f=webp,q=85/photos/hero.jpg
 ```
 
 The source-image segment is normally a relative path, resolved against `IMGX_ORIGIN_BASE_URL`. It may instead be an absolute `http://`/`https://` URL, fetched directly instead of from the configured origin — but only when the operator has set `IMGX_ALLOW_REMOTE_SOURCES=true` (default `false`); otherwise such a request returns `403 Forbidden` before any network call. See `IMGX_ALLOW_REMOTE_SOURCES` in [Configuration](/configuration) for the security guards this enables and the risk it accepts.
 
-```
+```text
 GET /image/w=400/https://example.com/photos/hero.jpg
 ```
 
@@ -22,7 +22,7 @@ Output width in pixels, resized according to the current `fit` mode.
 - **Range:** 1–8192
 - **Default:** original width
 
-```
+```text
 /image/w=400/photo.jpg
 /image/width=400/photo.jpg
 ```
@@ -34,7 +34,7 @@ Output height in pixels.
 - **Range:** 1–8192
 - **Default:** original height
 
-```
+```text
 /image/h=300/photo.jpg
 /image/w=400,h=300/photo.jpg
 ```
@@ -48,7 +48,7 @@ Device pixel ratio. Multiplies `w` and `h` for retina and HiDPI displays. The ef
 - **Range:** 1.0–5.0
 - **Default:** `1.0`
 
-```
+```text
 # 400px at 2x = 800px actual output
 /image/w=400,dpr=2/photo.jpg
 ```
@@ -62,7 +62,7 @@ Compression quality for lossy formats (JPEG, WebP, AVIF). Higher values produce 
 - **Range:** 1–100, or a perceptual quality string: `high`, `medium-high`, `medium-low`, `low`
 - **Default:** `80`
 
-```
+```text
 /image/q=90/photo.jpg
 /image/w=400,q=60/photo.jpg
 /image/quality=high/photo.jpg
@@ -79,7 +79,7 @@ Overrides `quality` when the request's client-hint headers (`rtt`, `save-data`, 
 - **Range:** same as `quality` — 1–100, or a perceptual quality string
 - **Default:** unset (no override)
 
-```
+```text
 /image/q=80,scq=40/photo.jpg
 ```
 
@@ -94,7 +94,7 @@ Prioritizes encoding speed over output quality/size. Accepts `fast`, which biase
 - **Values:** `fast`
 - **Default:** unset
 
-```
+```text
 /image/compression=fast/photo.jpg
 ```
 
@@ -107,7 +107,7 @@ Output format. When set to `auto` or omitted, imgx negotiates the format from th
 - **Values:** `jpeg`, `jpg`, `png`, `webp`, `avif`, `gif`, `baseline-jpeg`, `json`, `auto`
 - **Default:** `auto`
 
-```
+```text
 /image/f=webp/photo.jpg
 /image/format=avif/photo.jpg
 /image/fmt=png/photo.jpg
@@ -151,7 +151,7 @@ Controls how the image fits the target dimensions.
 | `crop` | — | Fill the target area like `cover`, but never upscales — behaves like `contain` when the source is smaller than the target. |
 | `aspect-crop` | — | Crop to the target aspect ratio. Downscales (never upscales) when the source is large enough to cover the target; otherwise crops the original-size image directly to the target ratio. |
 
-```
+```text
 /image/w=400,h=400,fit=cover/photo.jpg
 /image/w=400,h=300,fit=fill/photo.jpg
 /image/w=400,h=400,fit=crop/photo.jpg
@@ -185,7 +185,7 @@ When `fit=cover` crops the image, this controls which region to keep.
 | `smart` | `auto` | Entropy-based detection (keeps high-detail areas) |
 | `attention` | `att` | Attention-based detection (keeps visually interesting areas) |
 
-```
+```text
 /image/w=400,h=400,fit=cover,g=smart/photo.jpg
 /image/w=400,h=400,fit=cover,g=north/photo.jpg
 /image/w=400,h=400,fit=cover,g=auto/photo.jpg
@@ -210,7 +210,7 @@ Unsharp mask with the given sigma value.
 
 - **Range:** 0.0–10.0
 
-```
+```text
 /image/sharpen=1.5/photo.jpg
 /image/w=400,sharpen=2.0/photo.jpg
 ```
@@ -221,7 +221,7 @@ Gaussian blur with the given sigma value.
 
 - **Range:** 0.1–250.0
 
-```
+```text
 /image/blur=3.0/photo.jpg
 /image/w=400,blur=10.0/photo.jpg
 ```
@@ -230,7 +230,7 @@ Gaussian blur with the given sigma value.
 
 - **Range:** 0.0–2.0 (1.0 is normal)
 
-```
+```text
 /image/brightness=1.2/photo.jpg
 ```
 
@@ -238,7 +238,7 @@ Gaussian blur with the given sigma value.
 
 - **Range:** 0.0–2.0 (1.0 is normal)
 
-```
+```text
 /image/contrast=1.3/photo.jpg
 ```
 
@@ -246,7 +246,7 @@ Gaussian blur with the given sigma value.
 
 - **Range:** 0.0–2.0 (1.0 is normal)
 
-```
+```text
 /image/saturation=0.0/photo.jpg
 ```
 
@@ -256,7 +256,7 @@ Gamma correction.
 
 - **Range:** 0.1–10.0
 
-```
+```text
 /image/gamma=2.2/photo.jpg
 ```
 
@@ -264,7 +264,7 @@ Gamma correction.
 
 - **Values:** 0, 90, 180, 270
 
-```
+```text
 /image/rotate=90/photo.jpg
 ```
 
@@ -272,7 +272,7 @@ Gamma correction.
 
 - **Values:** `h` (horizontal), `v` (vertical), `hv` (both)
 
-```
+```text
 /image/flip=h/photo.jpg
 ```
 
@@ -282,7 +282,7 @@ Hex RGB color used for `fit=pad` canvas fill and alpha flattening before encodin
 
 - **Format:** 6-character hex, no `#` prefix
 
-```
+```text
 /image/f=jpeg,bg=ffffff/photo.png
 ```
 
@@ -294,7 +294,7 @@ Draws a solid-color border around the image, applied after resizing. Border widt
 - **`border.color`:** 6-character hex, no `#` prefix (default: `000000`)
 - **`border.top`/`.right`/`.bottom`/`.left`:** per-side width, overriding `border` for that side
 
-```
+```text
 /image/border=10/photo.jpg
 /image/border=4,border.color=ff0000/photo.jpg
 /image/border.top=2,border.left=8/photo.jpg
@@ -310,7 +310,7 @@ Detect and crop uniform borders around the image (border-color-aware).
 
 - **Range:** 1.0–100.0 (threshold)
 
-```
+```text
 /image/trim=10/photo.jpg
 ```
 
@@ -322,7 +322,7 @@ aware (unlike `trim` above), and may be combined with each other or with
 
 - **Values:** an integer pixel count, or a decimal `0.0`–`1.0` fraction of that side's dimension
 
-```
+```text
 /image/trim.top=100,trim.left=50/photo.jpg
 /image/trim.left=0.1,trim.right=0.1/photo.jpg
 ```
@@ -336,7 +336,7 @@ Controls EXIF and ICC metadata in the output.
 
 - **Values:** `strip` (default), `keep`, `copyright`
 
-```
+```text
 /image/metadata=keep/photo.jpg
 ```
 
@@ -372,7 +372,7 @@ Extract a specific 0-indexed frame from an animated image and serve it as a stat
 - **Range:** 0–999
 - **Default:** none (all frames preserved)
 
-```
+```text
 /image/frame=0,f=png/spinner.gif
 /image/frame=2/spinner.gif
 ```
@@ -448,7 +448,7 @@ only for HTTP origins (not R2, which has no public URL to redirect to).
 - **Values:** `redirect`
 - **Default:** unset (raw-bytes fallback)
 
-```
+```text
 /image/w=400,onerror=redirect/photo.jpg
 ```
 
@@ -456,7 +456,7 @@ only for HTTP origins (not R2, which has no public URL to redirect to).
 
 `draw.<N>.url`, `draw.<N>.width`/`.height`, `.top`/`.left`/`.bottom`/`.right`, `.opacity`, `.repeat`, `.background`, `.rotate`, `.fit`, `.gravity` parse and validate (an array of overlays, indexed by `<N>` starting at `0`). By default (`IMGX_ALLOW_DRAW_OVERLAYS=false`), **every request naming a `draw` overlay returns `403 Forbidden`** before any network call. Set `IMGX_ALLOW_DRAW_OVERLAYS=true` to enable fetching `draw[].url` overlay images through imgx's SSRF-safe remote fetcher (see `IMGX_ALLOW_REMOTE_SOURCES` in [Configuration](/configuration) — this is a separate flag, so an operator can enable overlays without enabling arbitrary remote main-image sources). See `docs/CLOUDFLARE_PARITY.md` gap 11 for the full status.
 
-```
+```text
 /image/draw.0.url=https://example.com/logo.png,draw.0.opacity=0.5/photo.jpg
 → 403 Forbidden by default; composites the overlay onto the base image when IMGX_ALLOW_DRAW_OVERLAYS=true
 ```
@@ -465,7 +465,7 @@ only for HTTP origins (not R2, which has no public URL to redirect to).
 
 ## Full example
 
-```
+```text
 GET /image/w=800,h=600,fit=cover,g=attention,f=auto,q=85,dpr=2,sharpen=0.5/products/shoe-red.png
 ```
 
