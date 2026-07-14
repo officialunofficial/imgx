@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.2] - 2026-07-14
+
+### Other
+
+- Cloudflare Images URL migration, workers-rs edge scaffold, dependency updates ([#23](https://github.com/officialunofficial/imgx/pull/23))(c043bb1)
+- Merge branch 'main' of https://github.com/officialunofficial/imgx(a32190b)
+
+### Refactoring
+
+- *(router)* Drop cdn-cgi/ prefix from image request URLs(97dc636)
+
+
 ## [0.1.1] - 2026-07-10
 
 ### Bug Fixes
