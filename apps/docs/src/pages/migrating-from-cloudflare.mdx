@@ -7,12 +7,12 @@ This page covers how to move from Cloudflare Images (imagedelivery.net) to imgx.
 ## URL mapping
 
 **Cloudflare Images (Image Resizing):**
-```
+```text
 https://<zone>/image/<options>/<source-image>
 ```
 
 **imgx:**
-```
+```text
 https://your-domain.com/image/<options>/<image-path>
 ```
 
@@ -93,7 +93,7 @@ With this setting, a request for `/image/w=400/abc123/photo-id` resolves an imag
 
 Replace Cloudflare Image Resizing URLs in your app:
 
-```
+```text
 # Before (Cloudflare)
 https://<zone>/image/w=400,format=auto/abc123/photo-id
 
@@ -110,7 +110,7 @@ Format auto-negotiation is on by default. You do not need to specify `f=auto`.
 
 For production, put a CDN or reverse proxy in front of imgx:
 
-```
+```text
 Client → CDN (Cloudflare, Fastly, nginx) → imgx → R2/S3
 ```
 

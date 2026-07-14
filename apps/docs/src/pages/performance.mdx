@@ -72,7 +72,7 @@ Increase `IMGX_CACHE_MAX_SIZE_BYTES` if your working set is large and you have m
 
 For production deployments, put a CDN (Cloudflare, CloudFront, Fastly) in front of imgx. The CDN caches responses at the edge, so most requests never reach your origin server.
 
-```
+```text
 Client → CDN (edge cache) → imgx → Origin storage
 ```
 

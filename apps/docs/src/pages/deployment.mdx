@@ -127,7 +127,7 @@ curl http://localhost:8080/ready
 
 Returns `200` with `text/plain; version=0.0.4` — standard [Prometheus exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/), scrapeable directly by Prometheus, Grafana Agent, the Datadog agent's OpenMetrics check, or any compatible collector:
 
-```
+```text
 # HELP imgx_requests_total Total number of HTTP requests handled.
 # TYPE imgx_requests_total counter
 imgx_requests_total 1042
