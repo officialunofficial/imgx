@@ -10,19 +10,10 @@ imgx sits in front of your existing image storage — any HTTP server or S3/R2 b
 
 imgx sits between your clients and your image storage:
 
-```text
-Client (browser, app)
-  │
-  │  GET /image/w=800,f=auto,q=85/photos/hero.jpg
-  ▼
-┌─────────┐
-│  imgx   │──▶ Cache hit? Serve immediately.
-│          │──▶ Cache miss? Fetch from origin.
-│          │──▶ Transform, cache, and serve.
-└─────────┘
-  │
-  ▼
-Origin (S3, R2, any HTTP server)
+```mermaid
+flowchart TD
+    A["Client (browser, app)"] -->|"GET /image/w=800,f=auto,q=85/photos/hero.jpg"| B["imgx<br/>(cache · fetch · transform)"]
+    B --> C["Origin (S3, R2, any HTTP server)"]
 ```
 
 Your images stay where they already live. imgx fetches, transforms, caches, and serves them.

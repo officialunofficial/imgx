@@ -4,47 +4,16 @@ imgx is an HTTP image proxy built for concurrent request handling. It fetches im
 
 ## Request flow
 
-```text
-Client Request
-     │
-     ▼
-┌────────┐     Parse the target path. Detect well-known
-│  Router   │───▶ routes (/health, /ready, /metrics)
-└────┬────┘     or extract image path and transform string.
-     │
-     ▼
-┌────────┐     Parse comma-separated key=value pairs
-│  Params   │───▶ into a TransformParams struct. Validate
-│  Parser   │     ranges for w, h, q, fit, g, and others.
-└────┬────┘
-     │
-     ▼
-┌────────┐     Build a deterministic key: <path>|<transforms>|<format>
-│  Cache    │───▶ Check L1 (memory), then L2 (R2) if configured.
-│  Lookup   │     Hit → serve with ETag and Cache-Control.
-└────┬────┘
-     │ miss
-     ▼
-┌────────┐     HTTP GET to base URL + path, or
-│  Origin   │───▶ S3 GET from the R2 originals bucket.
-│  Fetch    │
-└────┬────┘
-     │
-     ▼
-┌────────┐     1. Probe (detect animation, load first frame)
-│ Transform │───▶ 2. Decide and reload (animated or static path)
-│ Pipeline  │     3. Resize → Effects → Encode
-│ (libvips) │
-└────┬────┘
-     │
-     ▼
-┌────────┐     Write to L1 (memory) and L2 (R2) if configured.
-│  Cache    │
-│  Store    │
-└────┬────┘
-     │
-     ▼
-  Response        200 with image body, ETag, Cache-Control, Vary: Accept
+```mermaid
+flowchart TD
+    A[Client Request] --> B[Router]
+    B -->|"Parse the target path. Detect well-known routes (/health, /ready, /metrics) or extract image path and transform string."| C[Params Parser]
+    C -->|"Parse comma-separated key=value pairs into a TransformParams struct. Validate ranges for w, h, q, fit, g, and others."| D[Cache Lookup]
+    D -->|"hit → serve with ETag and Cache-Control"| R["Response<br/>200 with image body, ETag, Cache-Control, Vary: Accept"]
+    D -->|"miss"| E[Origin Fetch]
+    E -->|"HTTP GET to base URL + path, or S3 GET from the R2 originals bucket."| F["Transform Pipeline (libvips)"]
+    F -->|"1. Probe (detect animation, load first frame) 2. Decide and reload (animated or static path) 3. Resize → Effects → Encode"| G[Cache Store]
+    G -->|"Write to L1 (memory) and L2 (R2) if configured."| R
 ```
 
 ## Module map
@@ -95,19 +64,12 @@ crates/
 
 imgx uses a `Cache` trait (async methods, `impl Future` return position) with multiple backends. The backend set is closed (Memory/Noop/R2/Tiered), so the server selects a concrete `AppCache` enum variant at startup based on config rather than using `dyn Cache` — no boxing, no object-safety cost:
 
-```text
-┌───────────────────────────────┐
-│            TieredCache                  │
-│                                         │
-│  ┌──────────────┐  ┌─────────────────┐  │
-│  │ L1: Memory   │  │ L2: R2 (S3)    │  │
-│  │ (MemoryCache)│  │ (R2Cache)      │  │
-│  │              │  │                 │  │
-│  │ - LRU evict  │  │ - Persistent   │  │
-│  │ - Size-bound │  │ - Cross-restart│  │
-│  │ - Fastest    │  │ - Shared       │  │
-│  └──────────────┘  └─────────────────┘  │
-└───────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph TieredCache
+        L1["L1: Memory (MemoryCache)<br/>- LRU evict<br/>- Size-bound<br/>- Fastest"]
+        L2["L2: R2/S3 (R2Cache)<br/>- Persistent<br/>- Cross-restart<br/>- Shared"]
+    end
 ```
 
 **Read path:** L1 hit → return. L1 miss → check L2 → promote to L1 → return.
@@ -152,10 +114,9 @@ With R2 origin, the tiered cache uses a second R2 bucket (`IMGX_R2_BUCKET_VARIAN
 
 The pipeline uses a probe-decide-reload flow for animation-aware processing:
 
-```text
-┌────────┐    ┌────────┐    ┌────────┐    ┌────────┐    ┌────────┐    ┌────────┐
-│  Probe  │───▶│ Decide  │───▶│ Reload  │───▶│ Resize  │───▶│ Effects │───▶│ Encode  │
-└────────┘    └────────┘    └────────┘    └────────┘    └────────┘    └────────┘
+```mermaid
+flowchart LR
+    Probe --> Decide --> Reload --> Resize --> Effects --> Encode
 ```
 
 ### 1. Probe
