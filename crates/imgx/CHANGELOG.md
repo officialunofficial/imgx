@@ -3,6 +3,13 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.1.5] - 2026-07-21
+
+### Miscellaneous
+
+- Release v0.1.4(528aac4)
+
+
 ## [0.1.4] - 2026-07-14
 
 ### Bug Fixes
