@@ -66,7 +66,7 @@ imgx uses a `/image/<OPTIONS>/<SOURCE-IMAGE>` convention: a fixed `image/` prefi
 | `w` | Width (px) | 1-8192 | - |
 | `h` | Height (px) | 1-8192 | - |
 | `q` | Quality | 1-100 | 80 |
-| `f` | Output format | `jpeg`, `png`, `webp`, `avif`, `gif`, `auto` | auto (negotiated) |
+| `f` | Output format | `jpeg`, `png`, `webp`, `avif`, `gif`, `thumbhash`, `auto` | auto (negotiated) |
 | `fit` | Resize mode | `contain`, `cover`, `fill`, `inside`, `outside`, `pad` | `contain` |
 | `g` | Crop gravity | `center`, `north`, `south`, `east`, `west`, `ne`, `nw`, `se`, `sw`, `smart`, `attention` | `center` |
 | `sharpen` | Sharpen sigma | 0.0-10.0 | - |
