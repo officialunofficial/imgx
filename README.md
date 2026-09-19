@@ -16,7 +16,7 @@ docker run -p 8080:8080 \
 
 ### Build from source
 
-Requires Rust (stable) and libvips 8.14+.
+Requires Rust 1.98.1 (pinned in `rust-toolchain.toml`) and libvips 8.14+.
 
 ```sh
 cargo build --release -p imgx
