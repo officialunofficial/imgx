@@ -36,7 +36,8 @@ crates/
         ├── transform/
         │   ├── params.rs          TransformParams struct and query string parser.
         │   ├── negotiate.rs       Accept header parsing and format negotiation.
-        │   └── pipeline.rs        Probe → decide → reload → resize → effects → encode.
+        │   ├── pipeline.rs        Probe → decide → reload → resize → effects → encode.
+        │   └── thumbhash.rs       ThumbHash encoder, RGBA expansion, and base64 text encoder.
         │
         ├── http/
         │   ├── response.rs        Content-Type, ETag, Cache-Control, 304 logic.

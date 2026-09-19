@@ -104,7 +104,7 @@ Prioritizes encoding speed over output quality/size. Accepts `fast`, which biase
 
 Output format. When set to `auto` or omitted, imgx negotiates the format from the client's `Accept` header.
 
-- **Values:** `jpeg`, `jpg`, `png`, `webp`, `avif`, `gif`, `baseline-jpeg`, `json`, `auto`
+- **Values:** `jpeg`, `jpg`, `png`, `webp`, `avif`, `gif`, `baseline-jpeg`, `json`, `thumbhash`, `auto`
 - **Default:** `auto`
 
 ```text
@@ -114,6 +114,7 @@ Output format. When set to `auto` or omitted, imgx negotiates the format from th
 /image/f=gif/animation.gif
 /image/f=baseline-jpeg/photo.jpg
 /image/w=200,format=json/photo.jpg
+/image/w=800,h=450,fit=cover,format=thumbhash/photo.jpg
 ```
 
 `baseline-jpeg` produces non-progressive (baseline sequential) JPEG — the
@@ -133,6 +134,34 @@ progressive encoding is explicitly requested).
 negotiating and encoding a real codec — real numbers, not placeholders. See
 `docs/CLOUDFLARE_PARITY.md` gap 5 for the schema's provenance (spec-derived —
 Cloudflare doesn't publish an exact field-by-field schema).
+
+### `format=thumbhash`
+
+`format=thumbhash` returns a short text hash of the transformed image. A client turns the hash into a small blurred placeholder while the full image loads. The body is standard base64 (RFC 4648, with `=` padding). It has 24 to 36 ASCII characters. The response has `Content-Type: text/plain; charset=utf-8`.
+
+```text
+/image/format=thumbhash,w=800,h=450,fit=cover/photos/cat.jpg
+```
+
+Decode the hash in the browser with the MIT-licensed [`thumbhash`](https://github.com/evanw/thumbhash) package:
+
+```js
+import { thumbHashToDataURL } from "thumbhash";
+
+const text = await (await fetch("/image/format=thumbhash,w=800/photos/cat.jpg")).text();
+const hash = Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+img.src = thumbHashToDataURL(hash);
+```
+
+imgx runs every other option before it computes the hash. These options change the hash: `w`, `h`, `fit`, `gravity`, `dpr`, `rotate`, `flip`, `trim`, `border`, `bg`, the effects, and `frame`. An animated source gives the hash of frame 0, or of the frame that `frame=N` selects.
+
+These options have no effect on the body: `q`, `metadata`, `compression`, `anim`, `onerror`, and the `Accept` header. The first four still change the cache key, so a different `q` stores a separate copy of the same hash. `onerror` and `Accept` never enter the cache key.
+
+- **Size of the hash:** 17 to 25 bytes. The hash keeps the aspect ratio of the output image, but not its exact size. imgx hashes a thumbnail of at most 100 by 100 pixels, so a near-square output such as 4000 by 3999 hashes as a square.
+- **`draw`:** a request that combines `format=thumbhash` with `draw` overlays returns `422`. The check runs before the draw permission check and before imgx fetches any overlay.
+- **Errors:** a failed request returns the JSON error envelope. A source over `IMGX_TRANSFORM_MAX_PIXELS`, or a source that libvips cannot process, returns `422`. An internal failure returns `500`. imgx never returns the raw origin bytes for this format. It ignores `onerror=redirect`, and it never caches a failure.
+- **`Vary`:** the response still carries `Vary: Accept`, although `Accept` does not change the body. A CDN that honours `Vary` can store more than one copy of the hash. Set the CDN to ignore `Accept` for this format to avoid that.
+- **Byte parity:** the hash equals the output of `thumbhash@0.1.1` for normal images. Flat images, exact gradients, and symmetric images are degenerate cases. Other implementations already disagree on them, so imgx makes no promise for them. A small size alone does not make an image degenerate.
 
 ## Fit mode
 

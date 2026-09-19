@@ -199,6 +199,14 @@ separate "source MIME type" field in this implementation (would require new
 loader-sniffing FFI beyond this pass's scope) — noted here as a schema
 simplification, not silently omitted.
 
+**`format=thumbhash` (imgx extension, not Cloudflare):** Cloudflare Images
+has no equivalent output format. imgx adds `format=thumbhash` as an opt-in
+extension. It returns the ThumbHash of the transformed image as base64 text
+with `Content-Type: text/plain; charset=utf-8`. A client decodes it with the
+MIT `thumbhash` JS package. This value does not change any Cloudflare-compatible
+behavior. See `apps/docs/src/pages/transforms.mdx` for the wire contract and
+`docs/INVARIANTS.md` INV-15 to INV-20 for the guarantees.
+
 ## Gap 7 — onerror
 
 **Verified** against `developers.cloudflare.com/images/optimization/features/`

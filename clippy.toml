@@ -13,3 +13,9 @@ too-many-arguments-threshold = 8
 # raise the complexity threshold rather than fragmenting a single
 # documented algorithm across helper functions.
 cognitive-complexity-threshold = 35
+
+# INV-16: the ThumbHash encoder must call `libm::cos` so its output does not
+# depend on the platform libm. `f64::cos` and `x.cos()` are both banned.
+disallowed-methods = [
+    { path = "f64::cos", reason = "INV-16: use libm::cos so ThumbHash bytes are platform independent" },
+]
