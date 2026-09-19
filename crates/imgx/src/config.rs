@@ -19,6 +19,8 @@ pub enum ConfigError {
     InvalidDimension,
     #[error("quality must be between 1 and 100")]
     InvalidQuality,
+    #[error("AVIF effort must be between 0 and 9")]
+    InvalidAvifEffort,
     #[error("origin base_url must start with http:// or https://")]
     InvalidUrl,
     #[error("invalid configuration value")]
@@ -126,6 +128,10 @@ pub struct TransformConfig {
     pub strip_metadata: bool,
     pub max_frames: u32,
     pub max_animated_pixels: u64,
+    /// AVIF encoder CPU effort, 0 (fastest) to `MAX_AVIF_EFFORT` (smallest
+    /// output). The default is the libvips default. A lower value gives
+    /// faster encodes and larger AVIF files.
+    pub avif_effort: u8,
 }
 
 impl Default for TransformConfig {
@@ -138,6 +144,7 @@ impl Default for TransformConfig {
             strip_metadata: true,
             max_frames: 100,
             max_animated_pixels: 50_000_000,
+            avif_effort: imgx_vips::DEFAULT_AVIF_EFFORT,
         }
     }
 }
@@ -238,6 +245,9 @@ impl Config {
         if let Some(v) = env_var("TRANSFORM_MAX_ANIMATED_PIXELS") {
             cfg.transform.max_animated_pixels = parse_num(&v)?;
         }
+        if let Some(v) = env_var("TRANSFORM_AVIF_EFFORT") {
+            cfg.transform.avif_effort = parse_num(&v)?;
+        }
 
         if let Some(v) = env_var("CACHE_ENABLED") {
             cfg.cache.enabled = parse_bool(&v)?;
@@ -297,6 +307,9 @@ impl Config {
         }
         if self.transform.default_quality < 1 || self.transform.default_quality > 100 {
             return Err(ConfigError::InvalidQuality);
+        }
+        if self.transform.avif_effort > imgx_vips::MAX_AVIF_EFFORT {
+            return Err(ConfigError::InvalidAvifEffort);
         }
         if self.server.max_connections == 0 || self.server.max_request_size == 0 {
             return Err(ConfigError::InvalidServerLimit);
@@ -385,6 +398,7 @@ mod tests {
         assert_eq!(cfg.origin.max_retries, 2);
 
         assert_eq!(cfg.transform.max_width, 8192);
+        assert_eq!(cfg.transform.avif_effort, imgx_vips::DEFAULT_AVIF_EFFORT);
         assert_eq!(cfg.transform.max_height, 8192);
         assert_eq!(cfg.transform.default_quality, 80);
         assert_eq!(cfg.transform.max_pixels, 71_000_000);
@@ -574,4 +588,20 @@ mod tests {
     // tests/config_env.rs, run with --test-threads=1, since they mutate
     // process-global environment state and would race under the default
     // parallel unit-test runner.
+
+    #[test]
+    fn validate_rejects_avif_effort_above_the_maximum() {
+        let mut cfg = Config::default();
+        cfg.transform.avif_effort = imgx_vips::MAX_AVIF_EFFORT + 1;
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidAvifEffort));
+    }
+
+    #[test]
+    fn validate_accepts_avif_effort_bounds() {
+        let mut cfg = Config::default();
+        cfg.transform.avif_effort = 0;
+        assert_eq!(cfg.validate(), Ok(()));
+        cfg.transform.avif_effort = imgx_vips::MAX_AVIF_EFFORT;
+        assert_eq!(cfg.validate(), Ok(()));
+    }
 }

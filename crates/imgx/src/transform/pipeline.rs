@@ -6,13 +6,14 @@
 
 use thiserror::Error;
 
-use imgx_vips::{ThumbnailOptions, VipsError, VipsImage, consts};
+use imgx_vips::{DEFAULT_AVIF_EFFORT, ThumbnailOptions, VipsError, VipsImage, consts};
 
 use super::negotiate;
 use super::params::{
     CompressionMode, DrawOverlay, DrawRepeat, FitMode, FlipMode, Gravity, MetadataMode,
     OutputFormat, Rotation, TransformParams,
 };
+use super::thumbhash::{self, ThumbhashError};
 
 #[derive(Debug, Error)]
 pub enum TransformError {
@@ -20,6 +21,8 @@ pub enum TransformError {
     Vips(#[from] VipsError),
     #[error("source image exceeds the configured pixel budget ({0} > {1})")]
     ExceedsMaxPixels(u64, u64),
+    #[error(transparent)]
+    Thumbhash(#[from] ThumbhashError),
 }
 
 /// Result of a transform pipeline execution.
@@ -53,18 +56,64 @@ impl Default for TransformLimits {
     }
 }
 
+/// Server-wide encoder settings. They apply to every request and no
+/// request parameter changes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderSettings {
+    pub avif_effort: u8,
+}
+
+impl Default for EncoderSettings {
+    fn default() -> Self {
+        Self {
+            avif_effort: DEFAULT_AVIF_EFFORT,
+        }
+    }
+}
+
+/// The server-wide settings for one transform. They hold the safety
+/// `limits` and the `encoder` settings.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TransformSettings {
+    pub limits: TransformLimits,
+    pub encoder: EncoderSettings,
+}
+
+/// The settings that `encode_image` uses for one image. They hold the
+/// request `quality` and `metadata` mode, and the server-wide `avif_effort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeOptions {
+    pub quality: u8,
+    pub avif_effort: u8,
+    pub metadata: MetadataMode,
+}
+
+impl EncodeOptions {
+    /// Build the options for one request. `quality` and `metadata` come from
+    /// the request. `avif_effort` comes from the server-wide `encoder`.
+    pub fn new(tp: &TransformParams, encoder: EncoderSettings) -> Self {
+        Self {
+            quality: tp.quality,
+            avif_effort: encoder.avif_effort,
+            metadata: tp.metadata,
+        }
+    }
+}
+
 /// Execute the full transform pipeline: decode -> resize -> effects -> encode.
 ///
 /// `input_data` is the raw bytes of the source image. `tp` controls the
 /// resize/effect/encode behavior. `accept_header` is used for format
-/// negotiation when `tp.format` is `None`/`Auto`.
+/// negotiation when `tp.format` is `None`/`Auto`. `None` for `settings`
+/// selects the default limits and encoder settings.
 pub fn transform(
     input_data: &[u8],
     tp: &TransformParams,
     accept_header: Option<&str>,
-    limits: Option<TransformLimits>,
+    settings: Option<TransformSettings>,
 ) -> Result<TransformResult, TransformError> {
-    let limits = limits.unwrap_or_default();
+    let settings = settings.unwrap_or_default();
+    let encode_options = EncodeOptions::new(tp, settings.encoder);
     let compression_fast = tp.compression == Some(CompressionMode::Fast);
 
     // -- PROBE --
@@ -83,10 +132,10 @@ pub fn transform(
     // frame can be dangerous on its own even if max_animated_pixels is
     // never reached because the source turns out not to be animated).
     let first_frame_pixels = current.width() as u64 * current.height() as u64;
-    if first_frame_pixels > limits.max_pixels {
+    if first_frame_pixels > settings.limits.max_pixels {
         return Err(TransformError::ExceedsMaxPixels(
             first_frame_pixels,
-            limits.max_pixels,
+            settings.limits.max_pixels,
         ));
     }
 
@@ -100,7 +149,7 @@ pub fn transform(
         let frame_w = current.width() as u64;
         let page_h = page_height_of(&current).unwrap_or_else(|| current.height()) as u64;
         let frame_count = n_pages.unwrap_or(1) as u64;
-        (frame_w * page_h * frame_count) > limits.max_animated_pixels
+        (frame_w * page_h * frame_count) > settings.limits.max_animated_pixels
     } else {
         false
     };
@@ -110,7 +159,7 @@ pub fn transform(
         Some(
             n_pages
                 .expect("invariant: is_animated is only true when n_pages_of() returned Some")
-                .min(limits.max_frames as i32),
+                .min(settings.limits.max_frames as i32),
         )
     } else {
         n_pages
@@ -220,6 +269,12 @@ pub fn transform(
         }
     }
 
+    // A JPEG or WebP source decodes at reduced size when the resize reads
+    // the source bytes directly. That works only if no earlier stage changed
+    // `current`. See `resize_reads_source`.
+    let resize_source = (resize_reads_source(tp, animated_output) && current.shrinks_on_load())
+        .then_some(input_data);
+
     // -- RESIZE --
     let eff_w = tp.effective_width().map(|w| w as i32);
     let eff_h = tp.effective_height().map(|h| h as i32);
@@ -227,6 +282,9 @@ pub fn transform(
     if eff_w.is_some() || eff_h.is_some() {
         let source_w = current.width();
         let source_h = current.height();
+        // The thumbnail box applies to the image after the EXIF orientation,
+        // so a derived side needs the oriented aspect ratio.
+        let (oriented_w, oriented_h) = oriented_size(&current);
 
         let effective_fit = if tp.fit == FitMode::Pad {
             FitMode::Contain
@@ -240,7 +298,7 @@ pub fn transform(
                 // invariant: the outer `if eff_w.is_some() || eff_h.is_some()`
                 // guarantees eff_h is Some whenever eff_w is None.
                 let h = eff_h.expect("invariant: eff_w.is_none() implies eff_h.is_some()");
-                let ratio = source_w as f64 / source_h as f64;
+                let ratio = oriented_w as f64 / oriented_h as f64;
                 let derived = h as f64 * ratio;
                 (derived.min(8192.0) as i32).max(1)
             }
@@ -259,14 +317,15 @@ pub fn transform(
         // missing height is now derived from the *current* (i.e.
         // already-rotated/flipped) aspect ratio before the thumbnail call,
         // rather than left as `None` for vips to silently square-box.
+        // That ratio uses the oriented dimensions (see `oriented_size`).
         let derived_height = if eff_h.is_none()
             && !matches!(
                 effective_fit,
                 FitMode::Cover | FitMode::Fill | FitMode::Crop | FitMode::AspectCrop
             )
-            && source_w > 0
+            && oriented_w > 0
         {
-            let ratio = source_h as f64 / source_w as f64;
+            let ratio = oriented_h as f64 / oriented_w as f64;
             Some(((thumb_width as f64 * ratio).round().min(8192.0) as i32).max(1))
         } else {
             eff_h
@@ -333,37 +392,44 @@ pub fn transform(
             // the source is smaller, it must NOT be upscaled -- instead
             // the *original-size* image is cropped directly to the
             // target aspect ratio.
-            let hscale = tw as f64 / source_w as f64;
-            let vscale = th as f64 / source_h as f64;
+            //
+            // The scale and the crop use the oriented dimensions, because
+            // `vips_thumbnail_*` applies the EXIF orientation first. The
+            // direct crop turns the pixels upright first, so the crop runs on
+            // the displayed image and the output carries no orientation tag.
+            let hscale = tw as f64 / oriented_w as f64;
+            let vscale = th as f64 / oriented_h as f64;
             let scale = hscale.max(vscale);
             if scale > 1.0 {
+                current = current.autorot()?;
                 let target_ratio = tw as f64 / th as f64;
-                let source_ratio = source_w as f64 / source_h as f64;
+                let source_ratio = oriented_w as f64 / oriented_h as f64;
                 let (crop_w, crop_h) = if source_ratio > target_ratio {
-                    let new_w = ((source_h as f64 * target_ratio).round() as i32)
-                        .min(source_w)
+                    let new_w = ((oriented_h as f64 * target_ratio).round() as i32)
+                        .min(oriented_w)
                         .max(1);
-                    (new_w, source_h)
+                    (new_w, oriented_h)
                 } else {
-                    let new_h = ((source_w as f64 / target_ratio).round() as i32)
-                        .min(source_h)
+                    let new_h = ((oriented_w as f64 / target_ratio).round() as i32)
+                        .min(oriented_h)
                         .max(1);
-                    (source_w, new_h)
+                    (oriented_w, new_h)
                 };
-                let crop_left = (source_w - crop_w) / 2;
-                let crop_top = (source_h - crop_h) / 2;
+                let crop_left = (oriented_w - crop_w) / 2;
+                let crop_top = (oriented_h - crop_h) / 2;
                 current = current.crop(crop_left, crop_top, crop_w, crop_h)?;
             } else {
                 let opts = ThumbnailOptions {
                     height: Some(th),
                     crop: Some(map_gravity_to_crop(tp.gravity)),
                     size: Some(consts::VIPS_SIZE_DOWN),
+                    ..Default::default()
                 };
-                current = current.thumbnail(tw, opts)?;
+                current = resize(&current, resize_source, tw, opts)?;
             }
         } else {
             let opts = build_thumbnail_options(effective_fit, tp.gravity, derived_height);
-            current = current.thumbnail(thumb_width, opts)?;
+            current = resize(&current, resize_source, thumb_width, opts)?;
 
             // After resize, refresh page-height metadata for animated
             // images so the GIF/WebP encoder splits frames correctly.
@@ -493,7 +559,7 @@ pub fn transform(
         } else {
             negotiate::apply_compression_fast(negotiated, compression_fast)
         };
-        let encoded = encode_image(&current, negotiated, tp.quality, tp.metadata)?;
+        let encoded = encode_image(&current, negotiated, &encode_options)?;
         let json = format!(
             "{{\"original\":{{\"width\":{original_width},\"height\":{original_height},\"file_size\":{}}},\"transformed\":{{\"width\":{out_width},\"height\":{out_height},\"format\":\"{}\",\"file_size\":{}}}}}",
             input_data.len(),
@@ -514,6 +580,24 @@ pub fn transform(
         });
     }
 
+    // -- THUMBHASH -- (imgx extension: the body is the base64 ThumbHash of
+    // the transformed image. INV-11 and the animated budget check ran
+    // above, so a source over budget never reaches this block. `validate()`
+    // rejects `draw` for this format, so no overlay changes the pixels
+    // after this point.)
+    if tp.format == Some(OutputFormat::Thumbhash) {
+        let (hash_width, hash_height, rgba) = thumbhash_rgba(&current)?;
+        let hash = thumbhash::encode(hash_width, hash_height, &rgba)?;
+        return Ok(TransformResult {
+            data: thumbhash::to_base64(&hash).into_bytes(),
+            format: OutputFormat::Thumbhash,
+            width: out_width,
+            height: out_height,
+            is_animated: false,
+            frame_count: None,
+        });
+    }
+
     // -- ENCODE --
     let output_format = animated_format.unwrap_or_else(|| {
         negotiate::negotiate_format(accept_header, current.has_alpha(), tp.format)
@@ -528,7 +612,7 @@ pub fn transform(
         negotiate::apply_compression_fast(output_format, compression_fast)
     };
 
-    let data = encode_image(&current, output_format, tp.quality, tp.metadata)?;
+    let data = encode_image(&current, output_format, &encode_options)?;
 
     Ok(TransformResult {
         data,
@@ -548,6 +632,29 @@ pub fn transform(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Render `image` into an 8-bit RGBA raster of at most 100x100 pixels for
+/// the ThumbHash encoder. Returns the raster width, height, and bytes.
+/// `thumbnail` keeps the aspect ratio, never upscales, and converts CMYK,
+/// 16-bit, and float sources to 8-bit sRGB. It ignores the EXIF orientation
+/// tag, so the raster has the orientation of `image`, the pixels that every
+/// other output format encodes.
+fn thumbhash_rgba(image: &VipsImage) -> Result<(u32, u32, Vec<u8>), TransformError> {
+    let side = thumbhash::MAX_SIDE as i32;
+    let small = image.thumbnail(
+        side,
+        ThumbnailOptions {
+            height: Some(side),
+            crop: None,
+            size: Some(consts::VIPS_SIZE_DOWN),
+            no_rotate: true,
+        },
+    )?;
+    let bytes = small.write_to_memory()?;
+    let (width, height) = (small.width() as u32, small.height() as u32);
+    let rgba = thumbhash::rgba_from_bands(&bytes, width, height, small.bands() as u32)?;
+    Ok((width, height, rgba))
+}
+
 /// `n-pages` metadata, guarding against the < 1 sentinel the same way
 /// bindings.zig's `getNPages` does.
 fn n_pages_of(img: &VipsImage) -> Option<i32> {
@@ -560,12 +667,56 @@ fn page_height_of(img: &VipsImage) -> Option<i32> {
     img.page_height().filter(|&n| n >= 1)
 }
 
+/// Return the width and height of `image` after libvips applies the EXIF
+/// orientation. `vips_thumbnail_*` applies it first, so a resize box fits the
+/// turned image. Orientations 5 to 8 turn the image by 90 degrees, so they
+/// swap the sides. The resize stage always applies the tag: the request has
+/// no `no_rotate` option. The `aspect-crop` direct crop calls `autorot` to
+/// match.
+fn oriented_size(image: &VipsImage) -> (i32, i32) {
+    let (width, height) = (image.width(), image.height());
+    match image.get_int("orientation") {
+        Some(5..=8) => (height, width),
+        _ => (width, height),
+    }
+}
+
 /// Convert an optional RGB byte triplet to an f64 background array.
 /// Defaults to white when no color is specified.
 fn bg_color_from_params(background: Option<[u8; 3]>) -> [f64; 3] {
     match background {
         Some(rgb) => [rgb[0] as f64, rgb[1] as f64, rgb[2] as f64],
         None => [255.0, 255.0, 255.0],
+    }
+}
+
+/// Return true when no stage before the resize changes `current`. The
+/// resize can then decode the source bytes again, at reduced size. Keep this
+/// list in step with the stages of `transform` that run before the resize.
+fn resize_reads_source(tp: &TransformParams, animated_output: bool) -> bool {
+    !animated_output
+        && tp.frame.is_none()
+        && tp.trim.is_none()
+        && tp.trim_top.is_none()
+        && tp.trim_right.is_none()
+        && tp.trim_bottom.is_none()
+        && tp.trim_left.is_none()
+        && tp.rotate.is_none()
+        && tp.flip.is_none()
+}
+
+/// Resize `current` to fit `width`. With `source` set, decode those bytes
+/// again at reduced size (`VipsImage::thumbnail_buffer`). Otherwise shrink
+/// the full-size `current`.
+fn resize(
+    current: &VipsImage,
+    source: Option<&[u8]>,
+    width: i32,
+    opts: ThumbnailOptions,
+) -> Result<VipsImage, VipsError> {
+    match source {
+        Some(bytes) => VipsImage::thumbnail_buffer(bytes, width, opts),
+        None => current.thumbnail(width, opts),
     }
 }
 
@@ -733,15 +884,14 @@ pub fn composite_draw_overlay(
 pub(crate) fn encode_image(
     image: &VipsImage,
     format: OutputFormat,
-    quality: u8,
-    metadata: MetadataMode,
+    options: &EncodeOptions,
 ) -> Result<Vec<u8>, VipsError> {
-    let q = quality as i32;
+    let q = options.quality as i32;
     // Strip -> strip all metadata; Keep/Copyright -> preserve metadata
     // (libvips has no "copyright-only" mode, so Copyright is treated the
     // same as Keep for now, matching the Zig implementation's known
     // future-enhancement note).
-    let do_strip = metadata == MetadataMode::Strip;
+    let do_strip = options.metadata == MetadataMode::Strip;
     match format {
         // BaselineJpeg shares Jpeg's encode path exactly: libvips'
         // vips_jpegsave_buffer already defaults `interlace` to FALSE
@@ -752,12 +902,13 @@ pub(crate) fn encode_image(
         }
         OutputFormat::Png => image.save_png(6, do_strip),
         OutputFormat::Webp => image.save_webp(q, do_strip),
-        OutputFormat::Avif => image.save_avif(q, do_strip),
+        OutputFormat::Avif => image.save_avif(q, options.avif_effort, do_strip),
         OutputFormat::Gif => encode_gif(image),
-        // Never reached: `transform()` intercepts `format == Json`
-        // before calling `encode_image` and builds a JSON stats payload
-        // instead (see the `-- JSON --` block below).
-        OutputFormat::Json => image.save_jpeg(q, do_strip),
+        // Never reached: `transform()` intercepts `format == Json` and
+        // `format == Thumbhash` before calling `encode_image` and builds a
+        // text payload instead (see the `-- JSON --` and `-- THUMBHASH --`
+        // blocks above).
+        OutputFormat::Json | OutputFormat::Thumbhash => image.save_jpeg(q, do_strip),
     }
 }
 
@@ -774,18 +925,18 @@ pub(crate) fn encode_image(
 /// vertically-stacked animated frame buffer would corrupt frame
 /// boundaries -- the same INV-2 concern the BORDER stage already
 /// documents), or when the output is a `format=json` metadata response
-/// (no image bytes to composite onto).
+/// or a `format=thumbhash` text response (no image bytes to composite
+/// onto).
 pub fn apply_draw_overlays(
     result: TransformResult,
     draw: &[DrawOverlay],
     overlay_bytes: &[Vec<u8>],
-    quality: u8,
-    metadata: MetadataMode,
+    options: &EncodeOptions,
 ) -> Result<TransformResult, TransformError> {
     if draw.is_empty() || overlay_bytes.is_empty() || result.is_animated {
         return Ok(result);
     }
-    if result.format == OutputFormat::Json {
+    if result.format.produces_text_body() {
         return Ok(result);
     }
 
@@ -801,7 +952,7 @@ pub fn apply_draw_overlays(
         base = composite_draw_overlay(&base, bytes, entry)?;
     }
 
-    let data = encode_image(&base, result.format, quality, metadata)?;
+    let data = encode_image(&base, result.format, options)?;
     Ok(TransformResult { data, ..result })
 }
 
@@ -824,6 +975,10 @@ fn encode_gif(image: &VipsImage) -> Result<Vec<u8>, VipsError> {
 #[cfg(test)]
 mod tests {
     use super::super::params::{AnimMode, parse};
+    use super::super::thumbhash::{
+        self,
+        test_support::{BODY_CHARS, HASH_BYTES, base64_decode, is_standard_base64},
+    };
     use super::*;
     use std::fs;
     use std::path::Path;
@@ -833,6 +988,14 @@ mod tests {
 
     fn init() {
         VIPS_INIT.call_once(|| imgx_vips::init().expect("vips init"));
+    }
+
+    fn test_encode_options() -> EncodeOptions {
+        EncodeOptions {
+            quality: 80,
+            avif_effort: DEFAULT_AVIF_EFFORT,
+            metadata: MetadataMode::Strip,
+        }
     }
 
     fn fixture(name: &str) -> Vec<u8> {
@@ -869,8 +1032,16 @@ mod tests {
             max_pixels: 10,
             ..Default::default()
         };
-        let err = transform(&data, &TransformParams::default(), None, Some(limits))
-            .expect_err("16-pixel source must be rejected under a 10-pixel budget");
+        let err = transform(
+            &data,
+            &TransformParams::default(),
+            None,
+            Some(TransformSettings {
+                limits,
+                ..Default::default()
+            }),
+        )
+        .expect_err("16-pixel source must be rejected under a 10-pixel budget");
         assert!(matches!(err, TransformError::ExceedsMaxPixels(16, 10)));
     }
 
@@ -882,7 +1053,18 @@ mod tests {
             max_pixels: 16,
             ..Default::default()
         };
-        assert!(transform(&data, &TransformParams::default(), None, Some(limits)).is_ok());
+        assert!(
+            transform(
+                &data,
+                &TransformParams::default(),
+                None,
+                Some(TransformSettings {
+                    limits,
+                    ..Default::default()
+                })
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1286,7 +1468,16 @@ mod tests {
             max_frames: 100,
             ..Default::default()
         };
-        let result = transform(&data, &p, Some("image/gif"), Some(cfg)).unwrap();
+        let result = transform(
+            &data,
+            &p,
+            Some("image/gif"),
+            Some(TransformSettings {
+                limits: cfg,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
         assert!(!result.data.is_empty());
         assert!(!result.is_animated);
         assert_eq!(result.height, 128);
@@ -1307,9 +1498,19 @@ mod tests {
             max_animated_pixels: 50_000_000,
             ..Default::default()
         };
-        let result = transform(&data, &p, Some("image/gif"), Some(cfg)).unwrap();
+        let result = transform(
+            &data,
+            &p,
+            Some("image/gif"),
+            Some(TransformSettings {
+                limits: cfg,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
         assert!(!result.data.is_empty());
         assert!(result.is_animated);
+        assert_eq!(result.frame_count, Some(3));
         assert_eq!(result.width, 128);
     }
 
@@ -1760,8 +1961,7 @@ mod tests {
             base_result.clone(),
             std::slice::from_ref(&entry),
             &[overlay_fixture()],
-            80,
-            MetadataMode::Strip,
+            &test_encode_options(),
         )
         .unwrap();
         assert_eq!(composited.width, base_result.width);
@@ -1779,7 +1979,7 @@ mod tests {
         let data = nonsquare_fixture();
         let base_result = transform(&data, &TransformParams::default(), None, None).unwrap();
         let result =
-            apply_draw_overlays(base_result.clone(), &[], &[], 80, MetadataMode::Strip).unwrap();
+            apply_draw_overlays(base_result.clone(), &[], &[], &test_encode_options()).unwrap();
         assert_eq!(result.data, base_result.data);
     }
 
@@ -1801,8 +2001,7 @@ mod tests {
             base_result.clone(),
             std::slice::from_ref(&entry),
             &[overlay_fixture()],
-            80,
-            MetadataMode::Strip,
+            &test_encode_options(),
         )
         .unwrap();
         assert_eq!(result.data, base_result.data);
@@ -1826,10 +2025,882 @@ mod tests {
             base_result.clone(),
             std::slice::from_ref(&entry),
             &[overlay_fixture()],
-            80,
-            MetadataMode::Strip,
+            &test_encode_options(),
         )
         .unwrap();
         assert_eq!(result.data, base_result.data);
+    }
+
+    fn thumbhash_result(data: &[u8], params: &str, accept: Option<&str>) -> TransformResult {
+        let p = parse(params).unwrap();
+        transform(data, &p, accept, None).unwrap()
+    }
+
+    fn thumbhash_bytes(result: &TransformResult) -> Vec<u8> {
+        base64_decode(std::str::from_utf8(&result.data).expect("thumbhash body is ascii"))
+    }
+
+    fn hash_is_landscape(hash: &[u8]) -> bool {
+        hash[4] & 0x80 != 0
+    }
+
+    fn hash_has_alpha(hash: &[u8]) -> bool {
+        hash[2] & 0x80 != 0
+    }
+
+    #[test]
+    fn transform_with_format_thumbhash_returns_base64_text_not_image_bytes() {
+        init();
+        let data = nonsquare_fixture();
+        let result = thumbhash_result(&data, "format=thumbhash", None);
+        assert_eq!(result.format, OutputFormat::Thumbhash);
+        let text = std::str::from_utf8(&result.data).expect("body must be ascii text");
+        assert!(BODY_CHARS.contains(&text.len()), "length {}", text.len());
+        assert!(is_standard_base64(text), "{text}");
+        let hash = base64_decode(text);
+        assert!(
+            HASH_BYTES.contains(&hash.len()),
+            "hash length {}",
+            hash.len()
+        );
+        assert_eq!(thumbhash::to_base64(&hash), text);
+        assert!(!result.is_animated);
+        assert_eq!(result.frame_count, None);
+        assert_eq!((result.width, result.height), (2000, 1500));
+    }
+
+    #[test]
+    fn transform_thumbhash_reflects_output_aspect_ratio_of_resize() {
+        init();
+        let data = nonsquare_fixture();
+        let landscape = thumbhash_result(&data, "format=thumbhash", None);
+        assert!(hash_is_landscape(&thumbhash_bytes(&landscape)));
+
+        let portrait = thumbhash_result(&data, "format=thumbhash,w=100,h=300,fit=cover", None);
+        assert_eq!((portrait.width, portrait.height), (100, 300));
+        let hash = thumbhash_bytes(&portrait);
+        assert!(!hash_is_landscape(&hash));
+        assert_eq!(hash[3] & 7, 2, "lx of a 1:3 image");
+
+        let rotated = thumbhash_result(&data, "format=thumbhash,rotate=90", None);
+        assert_eq!((rotated.width, rotated.height), (1500, 2000));
+        assert!(!hash_is_landscape(&thumbhash_bytes(&rotated)));
+    }
+
+    #[test]
+    fn transform_thumbhash_rejects_source_exceeding_max_pixels() {
+        init();
+        let data = static_fixture();
+        let limits = TransformLimits {
+            max_pixels: 10,
+            ..Default::default()
+        };
+        let p = parse("format=thumbhash").unwrap();
+        let err = transform(
+            &data,
+            &p,
+            None,
+            Some(TransformSettings {
+                limits,
+                ..Default::default()
+            }),
+        )
+        .expect_err("16-pixel source must be rejected under a 10-pixel budget");
+        assert!(matches!(err, TransformError::ExceedsMaxPixels(16, 10)));
+    }
+
+    #[test]
+    fn transform_thumbhash_accepts_source_within_max_pixels() {
+        init();
+        let data = static_fixture();
+        let limits = TransformLimits {
+            max_pixels: 16,
+            ..Default::default()
+        };
+        let p = parse("format=thumbhash").unwrap();
+        let result = transform(
+            &data,
+            &p,
+            None,
+            Some(TransformSettings {
+                limits,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        assert_eq!(result.format, OutputFormat::Thumbhash);
+        assert!(HASH_BYTES.contains(&thumbhash_bytes(&result).len()));
+    }
+
+    #[test]
+    fn transform_thumbhash_reads_at_most_100_pixels_per_side() {
+        init();
+        let data = nonsquare_fixture();
+        let big = VipsImage::from_buffer(&data)
+            .unwrap()
+            .thumbnail(
+                4000,
+                ThumbnailOptions {
+                    height: Some(3000),
+                    crop: None,
+                    size: Some(consts::VIPS_SIZE_FORCE),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!((big.width(), big.height()), (4000, 3000));
+        let (w, h, rgba) = thumbhash_rgba(&big).unwrap();
+        assert_eq!((w, h), (100, 75));
+        assert_eq!(rgba.len(), 4 * 100 * 75);
+        assert!(rgba.len() <= 40_000);
+
+        let result = thumbhash_result(&data, "format=thumbhash,w=4000,h=3000,fit=fill", None);
+        assert_eq!((result.width, result.height), (4000, 3000));
+        assert!(result.data.len() <= 36);
+    }
+
+    #[test]
+    fn transform_thumbhash_is_independent_of_accept_quality_metadata_and_onerror() {
+        init();
+        let data = nonsquare_fixture();
+        let baseline = thumbhash_result(&data, "format=thumbhash,w=300", None).data;
+        for (params, accept) in [
+            (
+                "format=thumbhash,w=300,q=5,metadata=keep",
+                Some("image/avif"),
+            ),
+            (
+                "format=thumbhash,w=300,q=100,metadata=strip,compression=fast",
+                Some("image/webp,image/png"),
+            ),
+            ("format=thumbhash,w=300,anim=static", Some("*/*")),
+            ("format=thumbhash,w=300,onerror=redirect", None),
+            (
+                "fmt=thumbhash,w=300,q=1,metadata=copyright",
+                Some("image/jpeg"),
+            ),
+        ] {
+            let other = thumbhash_result(&data, params, accept).data;
+            assert_eq!(other, baseline, "{params} with accept {accept:?}");
+        }
+    }
+
+    #[test]
+    fn transform_thumbhash_of_animated_gif_uses_first_frame_and_is_not_animated() {
+        init();
+        let data = fixture("loading.gif");
+        let first_frame = VipsImage::from_buffer(&data).unwrap();
+        assert!(n_pages_of(&first_frame).is_some_and(|n| n > 1));
+        let (frame_w, frame_h) = (first_frame.width() as u32, first_frame.height() as u32);
+
+        let result = thumbhash_result(&data, "format=thumbhash", Some("image/webp,image/gif"));
+        assert_eq!(result.format, OutputFormat::Thumbhash);
+        assert!(!result.is_animated);
+        assert_eq!(result.frame_count, None);
+        assert_eq!((result.width, result.height), (frame_w, frame_h));
+        assert!(HASH_BYTES.contains(&thumbhash_bytes(&result).len()));
+
+        let explicit = thumbhash_result(&data, "format=thumbhash,frame=0", None);
+        assert_eq!(explicit.data, result.data);
+    }
+
+    #[test]
+    fn transform_thumbhash_of_four_band_opaque_source_clears_alpha_flag() {
+        init();
+        let data = static_fixture();
+        assert_eq!(VipsImage::from_buffer(&data).unwrap().bands(), 4);
+        let result = thumbhash_result(&data, "format=thumbhash", None);
+        assert!(!hash_has_alpha(&thumbhash_bytes(&result)));
+    }
+
+    #[test]
+    fn transform_thumbhash_of_transparent_source_sets_alpha_flag_and_matches_reference_vector() {
+        init();
+        let data = fixture("alpha_4x4.png");
+        let source = VipsImage::from_buffer(&data).unwrap();
+        assert_eq!(source.bands(), 4);
+        let pixels = source.write_to_memory().unwrap();
+        assert!(
+            pixels.as_chunks::<4>().0.iter().any(|px| px[3] < 255),
+            "the fixture must hold pixels with alpha below 255"
+        );
+        let result = thumbhash_result(&data, "format=thumbhash", None);
+        assert!(hash_has_alpha(&thumbhash_bytes(&result)));
+        // `rgbaToThumbHash` of thumbhash@0.1.1 on the same 4x4 RGBA pixels.
+        assert_eq!(
+            std::str::from_utf8(&result.data).unwrap(),
+            "JOmFLQ44l3eweHx3d7DGCOpJYnhwiJeIdw=="
+        );
+    }
+
+    #[test]
+    fn transform_thumbhash_of_cmyk_source_succeeds() {
+        init();
+        let data = fixture("cmyk.jpg");
+        let result = thumbhash_result(&data, "format=thumbhash", None);
+        assert_eq!(result.format, OutputFormat::Thumbhash);
+        let hash = thumbhash_bytes(&result);
+        assert!(HASH_BYTES.contains(&hash.len()));
+        assert!(
+            !hash_has_alpha(&hash),
+            "the K channel must not be read as alpha"
+        );
+    }
+
+    #[test]
+    fn transform_thumbhash_landscape_bit_matches_result_dimensions_for_exif_source() {
+        init();
+        let data = fixture("exif_orientation.jpg");
+        for params in [
+            "format=thumbhash",
+            "format=thumbhash,rotate=90",
+            "format=thumbhash,rotate=180",
+            "format=thumbhash,border=1",
+        ] {
+            let result = thumbhash_result(&data, params, None);
+            let hash = thumbhash_bytes(&result);
+            assert_eq!(
+                hash_is_landscape(&hash),
+                result.width > result.height,
+                "{params}: result is {}x{}",
+                result.width,
+                result.height
+            );
+            let png_params = params.replace("format=thumbhash", "format=png");
+            let png = thumbhash_result(&data, &png_params, None);
+            assert_eq!(
+                (result.width, result.height),
+                (png.width, png.height),
+                "{params}: hash and png results must report the same size"
+            );
+        }
+    }
+
+    fn hash_of_pixels_in(encoded: &[u8]) -> Vec<u8> {
+        let image = VipsImage::from_buffer(encoded).unwrap();
+        let (width, height) = (image.width() as u32, image.height() as u32);
+        let bytes = image.write_to_memory().unwrap();
+        let rgba = thumbhash::rgba_from_bands(&bytes, width, height, image.bands() as u32).unwrap();
+        thumbhash::encode(width, height, &rgba).unwrap()
+    }
+
+    #[test]
+    fn transform_thumbhash_landscape_bit_follows_the_hashed_thumbnail_for_near_square_output() {
+        init();
+        let data = nonsquare_fixture();
+        let landscape = |params: &str| {
+            let result = thumbhash_result(&data, params, None);
+            (
+                hash_is_landscape(&thumbhash_bytes(&result)),
+                result.width > result.height,
+            )
+        };
+        // The 100x100 thumbnail of a 4000x3999 output has equal sides, so
+        // the bit is clear although the result is wider than it is tall.
+        assert_eq!(
+            landscape("format=thumbhash,w=4000,h=3999,fit=fill"),
+            (false, true)
+        );
+        // The bit is never set for a result that is not wider than it is tall.
+        assert_eq!(
+            landscape("format=thumbhash,w=3999,h=4000,fit=fill"),
+            (false, false)
+        );
+        assert_eq!(
+            landscape("format=thumbhash,w=4000,h=4000,fit=fill"),
+            (false, false)
+        );
+        // The bit is set once the thumbnail keeps the order of the sides.
+        assert_eq!(
+            landscape("format=thumbhash,w=4000,h=3900,fit=fill"),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn transform_thumbhash_of_exif_source_hashes_the_pixels_other_formats_output() {
+        init();
+        let data = fixture("exif_orientation.jpg");
+        let png = thumbhash_result(&data, "format=png", None);
+        let result = thumbhash_result(&data, "format=thumbhash", None);
+        assert_eq!(thumbhash_bytes(&result), hash_of_pixels_in(&png.data));
+    }
+
+    #[test]
+    fn transform_thumbhash_of_image_under_100px_hashes_native_pixels() {
+        init();
+        let data = static_fixture();
+        let result = thumbhash_result(&data, "format=thumbhash", None);
+        assert_eq!(
+            thumbhash_bytes(&result),
+            hash_of_pixels_in(&data),
+            "a 4x4 image must hash its own pixels, not an upscaled copy"
+        );
+
+        let data = nonsquare_fixture();
+        let small = thumbhash_result(&data, "format=thumbhash,w=50,h=20,fit=fill", None);
+        assert_eq!((small.width, small.height), (50, 20));
+        let png = thumbhash_result(&data, "format=png,w=50,h=20,fit=fill", None);
+        assert_eq!(
+            thumbhash_bytes(&small),
+            hash_of_pixels_in(&png.data),
+            "a 50x20 output must hash its own pixels, not an upscaled copy"
+        );
+    }
+
+    #[test]
+    fn apply_draw_overlays_is_a_noop_for_thumbhash_result() {
+        init();
+        let data = nonsquare_fixture();
+        let base_result = thumbhash_result(&data, "format=thumbhash", None);
+        assert_eq!(base_result.format, OutputFormat::Thumbhash);
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            ..Default::default()
+        };
+        let result = apply_draw_overlays(
+            base_result.clone(),
+            std::slice::from_ref(&entry),
+            &[overlay_fixture()],
+            &test_encode_options(),
+        )
+        .unwrap();
+        assert_eq!(result, base_result);
+    }
+
+    /// A 2000x1500 JPEG. Unlike the PNG fixture, a JPEG source can decode
+    /// at reduced size.
+    fn nonsquare_jpeg() -> Vec<u8> {
+        let png_bytes = nonsquare_fixture();
+        let png = VipsImage::from_buffer(&png_bytes).unwrap();
+        png.save_jpeg(85, true).unwrap()
+    }
+
+    #[test]
+    fn resize_reads_source_only_when_no_earlier_stage_changes_the_image() {
+        let base = TransformParams::default();
+        assert!(resize_reads_source(&base, false));
+        assert!(!resize_reads_source(&base, true), "animated output");
+        let blockers = [
+            (
+                "frame",
+                TransformParams {
+                    frame: Some(1),
+                    ..base.clone()
+                },
+            ),
+            (
+                "trim",
+                TransformParams {
+                    trim: Some(10.0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "trim_top",
+                TransformParams {
+                    trim_top: Some(1.0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "trim_right",
+                TransformParams {
+                    trim_right: Some(1.0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "trim_bottom",
+                TransformParams {
+                    trim_bottom: Some(1.0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "trim_left",
+                TransformParams {
+                    trim_left: Some(1.0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "rotate",
+                TransformParams {
+                    rotate: Some(Rotation::Deg90),
+                    ..base.clone()
+                },
+            ),
+            (
+                "flip",
+                TransformParams {
+                    flip: Some(FlipMode::H),
+                    ..base.clone()
+                },
+            ),
+            // The dimension tests below use `rotate=0` as their full-decode
+            // control, so it must keep disabling the fast path.
+            (
+                "rotate=0",
+                TransformParams {
+                    rotate: Some(Rotation::Deg0),
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (name, tp) in blockers {
+            assert!(!resize_reads_source(&tp, false), "{name}");
+        }
+    }
+
+    #[test]
+    fn jpeg_source_rotate_is_applied_before_resize() {
+        init();
+        let p = TransformParams {
+            width: Some(200),
+            rotate: Some(Rotation::Deg90),
+            ..Default::default()
+        };
+        let result = transform(&nonsquare_jpeg(), &p, None, None).unwrap();
+        assert_eq!(result.width, 200);
+        assert!(
+            result.height > result.width,
+            "got {}x{}",
+            result.width,
+            result.height
+        );
+    }
+
+    #[test]
+    fn jpeg_source_trim_is_applied_before_resize() {
+        init();
+        // Trimming half of 2000 px leaves 1000x1500. A resize that skipped
+        // the trim would give 100x75.
+        let p = TransformParams {
+            width: Some(100),
+            trim_left: Some(0.5),
+            ..Default::default()
+        };
+        let result = transform(&nonsquare_jpeg(), &p, None, None).unwrap();
+        assert_eq!((result.width, result.height), (100, 150));
+    }
+
+    /// `rotate=0` is a no-op that still disables shrink-on-load, so it
+    /// gives the full-decode result to compare against.
+    #[test]
+    fn shrink_on_load_resize_matches_full_decode_dimensions() {
+        init();
+        let jpeg = nonsquare_jpeg();
+        for (fit, height) in [
+            (FitMode::Contain, None),
+            (FitMode::Inside, Some(80)),
+            (FitMode::Cover, Some(80)),
+            (FitMode::Contain, Some(80)),
+            (FitMode::AspectCrop, Some(80)),
+        ] {
+            let fast = TransformParams {
+                width: Some(120),
+                height,
+                fit,
+                ..Default::default()
+            };
+            let full = TransformParams {
+                rotate: Some(Rotation::Deg0),
+                ..fast.clone()
+            };
+            let a = transform(&jpeg, &fast, None, None).unwrap();
+            let b = transform(&jpeg, &full, None, None).unwrap();
+            assert_eq!((a.width, a.height), (b.width, b.height), "fit={fit:?}");
+        }
+    }
+
+    #[test]
+    fn shrink_on_load_resize_matches_full_decode_dimensions_for_exif_source() {
+        init();
+        let data = fixture("exif_orientation.jpg");
+        let fast = TransformParams {
+            width: Some(2),
+            ..Default::default()
+        };
+        let full = TransformParams {
+            rotate: Some(Rotation::Deg0),
+            ..fast.clone()
+        };
+        let a = transform(&data, &fast, None, None).unwrap();
+        let b = transform(&data, &full, None, None).unwrap();
+        assert_eq!((a.width, a.height), (b.width, b.height));
+    }
+
+    /// A JPEG with the given EXIF orientation tag. It stores 2000x1500
+    /// pixels, or 1500x2000 pixels when `stored_portrait` is set.
+    fn oriented_jpeg(orientation: i32, stored_portrait: bool) -> Vec<u8> {
+        let mut image = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+        if stored_portrait {
+            image = image.rot(consts::VIPS_ANGLE_D90).unwrap();
+        }
+        image.set_int("orientation", orientation);
+        let jpeg = image.save_jpeg(85, false).unwrap();
+        let reloaded = VipsImage::from_buffer(&jpeg).unwrap();
+        assert_eq!(reloaded.get_int("orientation"), Some(orientation));
+        let stored = if stored_portrait {
+            (1500, 2000)
+        } else {
+            (2000, 1500)
+        };
+        assert_eq!((reloaded.width(), reloaded.height()), stored);
+        jpeg
+    }
+
+    /// Run a width-only or height-only request on the fast path (JPEG
+    /// source, shrink-on-load) and on the full-decode path. `rotate=0` is a
+    /// no-op that forces the full decode. Both paths must agree.
+    fn resize_dimensions_on_both_paths(
+        data: &[u8],
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> (u32, u32) {
+        let fast = TransformParams {
+            width,
+            height,
+            ..Default::default()
+        };
+        let full = TransformParams {
+            rotate: Some(Rotation::Deg0),
+            ..fast.clone()
+        };
+        let a = transform(data, &fast, None, None).unwrap();
+        let b = transform(data, &full, None, None).unwrap();
+        assert_eq!(
+            (a.width, a.height),
+            (b.width, b.height),
+            "fast and full-decode paths must agree"
+        );
+        (a.width, a.height)
+    }
+
+    /// Each case pairs a stored shape with the expected output size. The
+    /// flag is true for a stored portrait image. A stored 2000x1500 image
+    /// with a quarter-turn tag displays as 1500x2000. A stored 1500x2000
+    /// image displays as 2000x1500.
+    const QUARTER_TURN_CASES: [(bool, (u32, u32)); 2] = [(false, (300, 400)), (true, (300, 225))];
+
+    #[test]
+    fn resize_width_only_derives_height_from_oriented_aspect_for_quarter_turn_exif() {
+        init();
+        for (stored_portrait, expected) in QUARTER_TURN_CASES {
+            for orientation in [5, 6, 7, 8] {
+                let data = oriented_jpeg(orientation, stored_portrait);
+                assert_eq!(
+                    resize_dimensions_on_both_paths(&data, Some(300), None),
+                    expected,
+                    "orientation {orientation}, stored portrait {stored_portrait}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resize_height_only_derives_width_from_oriented_aspect_for_quarter_turn_exif() {
+        init();
+        for (stored_portrait, expected) in QUARTER_TURN_CASES {
+            for orientation in [5, 6, 7, 8] {
+                let data = oriented_jpeg(orientation, stored_portrait);
+                assert_eq!(
+                    resize_dimensions_on_both_paths(&data, None, Some(expected.1)),
+                    expected,
+                    "orientation {orientation}, stored portrait {stored_portrait}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resize_derives_missing_side_from_stored_aspect_when_exif_is_not_a_quarter_turn() {
+        init();
+        let untagged = {
+            let png = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+            png.save_jpeg(85, false).unwrap()
+        };
+        let mut sources = vec![("none".to_string(), untagged)];
+        for orientation in [1, 2, 3, 4] {
+            sources.push((orientation.to_string(), oriented_jpeg(orientation, false)));
+        }
+        for (label, data) in sources {
+            assert_eq!(
+                resize_dimensions_on_both_paths(&data, Some(300), None),
+                (300, 225),
+                "orientation {label}, width only"
+            );
+            assert_eq!(
+                resize_dimensions_on_both_paths(&data, None, Some(225)),
+                (300, 225),
+                "orientation {label}, height only"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_derives_missing_side_from_oriented_aspect_for_other_fit_modes() {
+        init();
+        for fit in [
+            FitMode::Contain,
+            FitMode::Inside,
+            FitMode::Pad,
+            FitMode::Crop,
+        ] {
+            for (stored_portrait, expected) in QUARTER_TURN_CASES {
+                let data = oriented_jpeg(6, stored_portrait);
+                for (width, height) in [(Some(expected.0), None), (None, Some(expected.1))] {
+                    // `crop` needs a height to define its box.
+                    if fit == FitMode::Crop && height.is_none() {
+                        continue;
+                    }
+                    let p = TransformParams {
+                        width,
+                        height,
+                        fit,
+                        ..Default::default()
+                    };
+                    let result = transform(&data, &p, None, None).unwrap();
+                    assert_eq!(
+                        (result.width, result.height),
+                        expected,
+                        "fit={fit:?}, stored portrait {stored_portrait}, w={width:?}, h={height:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resize_applies_exif_orientation_after_an_explicit_rotate() {
+        init();
+        let p = TransformParams {
+            width: Some(300),
+            rotate: Some(Rotation::Deg90),
+            ..Default::default()
+        };
+        // rotate=90 turns the stored 1500x2000 into 2000x1500. The tag then
+        // turns it back to 1500x2000, so w=300 gives 300x400. The stored
+        // ratio would give 300x225.
+        let data = oriented_jpeg(6, true);
+        let result = transform(&data, &p, None, None).unwrap();
+        assert_eq!((result.width, result.height), (300, 400));
+        // rotate=90 turns the stored 2000x1500 into 1500x2000. The tag then
+        // turns it back to 2000x1500, so w=300 gives 300x225.
+        let data = oriented_jpeg(6, false);
+        let result = transform(&data, &p, None, None).unwrap();
+        assert_eq!((result.width, result.height), (300, 225));
+    }
+
+    /// An untagged JPEG that is 1500x2000 when `portrait` is set and
+    /// 2000x1500 otherwise. It has the displayed shape of a tagged source.
+    fn untagged_jpeg(portrait: bool) -> Vec<u8> {
+        let mut image = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+        if portrait {
+            image = image.rot(consts::VIPS_ANGLE_D90).unwrap();
+        }
+        image.save_jpeg(85, false).unwrap()
+    }
+
+    fn aspect_crop_size(data: &[u8], width: u32, height: u32, fast_path: bool) -> (u32, u32) {
+        let p = TransformParams {
+            width: Some(width),
+            height: Some(height),
+            fit: FitMode::AspectCrop,
+            rotate: (!fast_path).then_some(Rotation::Deg0),
+            ..Default::default()
+        };
+        let result = transform(data, &p, None, None).unwrap();
+        (result.width, result.height)
+    }
+
+    /// The tagged source displays with the sides swapped, so `aspect-crop`
+    /// must give the size of an untagged image with that displayed shape.
+    /// The requests cover the downscale branch and the direct-crop branch.
+    #[test]
+    fn aspect_crop_uses_oriented_dimensions_for_quarter_turn_exif() {
+        init();
+        let requests = [(1000, 1600), (3000, 2500), (1600, 1000), (300, 400)];
+        for stored_portrait in [false, true] {
+            let untagged = untagged_jpeg(!stored_portrait);
+            for orientation in [5, 6, 7, 8] {
+                let tagged = oriented_jpeg(orientation, stored_portrait);
+                for (width, height) in requests {
+                    for fast_path in [true, false] {
+                        assert_eq!(
+                            aspect_crop_size(&tagged, width, height, fast_path),
+                            aspect_crop_size(&untagged, width, height, true),
+                            "orientation {orientation}, stored portrait {stored_portrait}, \
+                             {width}x{height}, fast path {fast_path}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aspect_crop_direct_crop_gives_the_documented_size_for_quarter_turn_exif() {
+        init();
+        // Displayed 1500x2000. The request 3000x2500 needs an upscale, so the
+        // image crops to the 6:5 ratio at the original size.
+        let data = oriented_jpeg(6, false);
+        assert_eq!(aspect_crop_size(&data, 3000, 2500, true), (1500, 1250));
+        // The request 1000x1600 fits without an upscale.
+        assert_eq!(aspect_crop_size(&data, 1000, 1600, true), (1000, 1600));
+    }
+
+    #[test]
+    fn aspect_crop_direct_crop_clears_the_orientation_tag_with_metadata_keep() {
+        init();
+        for orientation in 1..=8 {
+            let data = oriented_jpeg(orientation, false);
+            let p = TransformParams {
+                width: Some(3000),
+                height: Some(2500),
+                fit: FitMode::AspectCrop,
+                format: Some(OutputFormat::Jpeg),
+                metadata: MetadataMode::Keep,
+                ..Default::default()
+            };
+            let result = transform(&data, &p, None, None).unwrap();
+            let reloaded = VipsImage::from_buffer(&result.data).unwrap();
+            assert!(
+                matches!(reloaded.get_int("orientation"), None | Some(1)),
+                "orientation {orientation} left a turn tag on the output"
+            );
+            assert_eq!(
+                (reloaded.width() as u32, reloaded.height() as u32),
+                (result.width, result.height),
+                "orientation {orientation}"
+            );
+        }
+    }
+
+    fn encoded_len(data: &[u8], params: &str, settings: Option<TransformSettings>) -> usize {
+        let tp = parse(params).unwrap();
+        transform(data, &tp, None, settings).unwrap().data.len()
+    }
+
+    #[test]
+    fn transform_settings_default_matches_the_parts_defaults() {
+        let settings = TransformSettings::default();
+        assert_eq!(settings.limits, TransformLimits::default());
+        assert_eq!(settings.encoder, EncoderSettings::default());
+    }
+
+    #[test]
+    fn transform_settings_encoder_reaches_the_avif_encoder() {
+        init();
+        let data = nonsquare_fixture();
+        let params = "format=avif,w=300";
+        let with_effort = |avif_effort| {
+            Some(TransformSettings {
+                encoder: EncoderSettings { avif_effort },
+                ..Default::default()
+            })
+        };
+        let slow = encoded_len(&data, params, with_effort(9));
+        let fast = encoded_len(&data, params, with_effort(0));
+        assert!(
+            fast > slow,
+            "effort 0 must give larger AVIF output than effort 9 ({fast} vs {slow})"
+        );
+        assert_eq!(
+            encoded_len(&data, params, None),
+            encoded_len(&data, params, Some(TransformSettings::default())),
+            "None must select the default transform settings"
+        );
+    }
+
+    #[test]
+    fn transform_quality_reaches_the_jpeg_encoder() {
+        init();
+        let data = nonsquare_fixture();
+        let low = encoded_len(&data, "format=jpeg,w=300,quality=10", None);
+        let high = encoded_len(&data, "format=jpeg,w=300,quality=90", None);
+        assert!(
+            low < high,
+            "quality=10 must give fewer bytes ({low} vs {high})"
+        );
+    }
+
+    #[test]
+    fn transform_metadata_keep_preserves_exif_and_strip_removes_it() {
+        init();
+        let data = oriented_jpeg(6, false);
+        let orientation_of = |metadata: &str| {
+            let tp = parse(&format!("format=jpeg,metadata={metadata}")).unwrap();
+            let result = transform(&data, &tp, None, None).unwrap();
+            VipsImage::from_buffer(&result.data)
+                .unwrap()
+                .get_int("orientation")
+        };
+        assert_eq!(orientation_of("keep"), Some(6));
+        assert_eq!(orientation_of("strip"), None);
+    }
+
+    #[test]
+    fn apply_draw_overlays_honours_encode_options_quality() {
+        init();
+        let data = nonsquare_fixture();
+        let tp = parse("format=jpeg,w=600").unwrap();
+        let base_result = transform(&data, &tp, None, None).unwrap();
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            ..Default::default()
+        };
+        let len_at = |quality: u8| {
+            let options = EncodeOptions {
+                quality,
+                ..test_encode_options()
+            };
+            apply_draw_overlays(
+                base_result.clone(),
+                std::slice::from_ref(&entry),
+                &[overlay_fixture()],
+                &options,
+            )
+            .unwrap()
+            .data
+            .len()
+        };
+        let (low, high) = (len_at(10), len_at(90));
+        assert!(
+            low < high,
+            "quality 10 must give fewer bytes ({low} vs {high})"
+        );
+    }
+
+    #[test]
+    fn encode_options_new_copies_request_fields_and_encoder_effort() {
+        let tp = parse("quality=33,metadata=keep").unwrap();
+        let options = EncodeOptions::new(&tp, EncoderSettings { avif_effort: 3 });
+        assert_eq!(
+            options,
+            EncodeOptions {
+                quality: 33,
+                avif_effort: 3,
+                metadata: MetadataMode::Keep,
+            }
+        );
+    }
+
+    #[test]
+    fn oriented_size_swaps_the_sides_only_for_quarter_turn_orientations() {
+        init();
+        for orientation in 1..=8 {
+            let png = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+            png.set_int("orientation", orientation);
+            let expected = if (5..=8).contains(&orientation) {
+                (1500, 2000)
+            } else {
+                (2000, 1500)
+            };
+            assert_eq!(oriented_size(&png), expected, "orientation {orientation}");
+        }
+        let untagged = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+        assert_eq!(oriented_size(&untagged), (2000, 1500));
     }
 }

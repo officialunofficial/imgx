@@ -22,7 +22,7 @@ Two crates:
 - `crates/imgx-vips/` — hand-rolled libvips FFI (the crate's `unsafe`/audit boundary). Raw `extern "C"` declarations in `ffi.rs`, a safe RAII wrapper in `image.rs`.
 - `crates/imgx/` — the binary. `#![forbid(unsafe_code)]` — all `unsafe` stays quarantined in `imgx-vips`.
 
-Module tree inside `crates/imgx/src/` mirrors the domain: `config`, `router`, `server`, `http/{errors,response}`, `cache/{mod,memory,noop,r2,tiered}`, `origin/{source,fetcher,r2}`, `s3/client`, `transform/{params,negotiate,pipeline}`.
+Module tree inside `crates/imgx/src/` mirrors the domain: `config`, `router`, `server`, `http/{errors,response}`, `cache/{mod,memory,noop,r2,tiered}`, `origin/{source,fetcher,r2}`, `s3/client`, `transform/{params,negotiate,pipeline,thumbhash}`.
 
 See `docs/INVARIANTS.md` for behaviors that must never change without a conscious, documented decision.
 
