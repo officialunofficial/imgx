@@ -46,7 +46,7 @@ pub fn encode(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, Thumbhash
     let mut avg_g = 0.0_f64;
     let mut avg_b = 0.0_f64;
     let mut avg_a = 0.0_f64;
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         let alpha = f64::from(px[3]) / 255.0;
         avg_r += alpha / 255.0 * f64::from(px[0]);
         avg_g += alpha / 255.0 * f64::from(px[1]);
@@ -69,7 +69,7 @@ pub fn encode(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, Thumbhash
     let mut p = Vec::with_capacity(pixel_count);
     let mut q = Vec::with_capacity(pixel_count);
     let mut a = Vec::with_capacity(pixel_count);
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         let alpha = f64::from(px[3]) / 255.0;
         let r = avg_r * (1.0 - alpha) + alpha / 255.0 * f64::from(px[0]);
         let g = avg_g * (1.0 - alpha) + alpha / 255.0 * f64::from(px[1]);
