@@ -14,6 +14,9 @@ env:
   RUSTC_WRAPPER: sccache
   SCCACHE_GHA_ENABLED: "true"
 
+# The jobs install libvips with plain apt-get. The cache-apt-pkgs action
+# hid apt failures (404 and 502 errors), so the jobs then failed later
+# with "libvips not found". A failed apt-get now stops the job at once.
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -25,12 +28,10 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install libvips (cached)
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        with:
-          packages: libvips-dev
-          version: "1.0"
-          execute_install_scripts: true
+      - name: Install libvips
+        run: |
+          sudo apt-get update -o Acquire::Retries=5
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 libvips-dev
 
       - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
@@ -53,12 +54,10 @@ jobs:
       # Recommends-only dependency of libheif-dev, and GHA runners disable
       # auto-installing recommends -- install it explicitly or AVIF-saving
       # tests fail here while passing on any dev machine with recommends on.
-      - name: Install libvips (cached)
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        with:
-          packages: libvips-dev libheif-plugin-aomenc
-          version: "1.0"
-          execute_install_scripts: true
+      - name: Install libvips
+        run: |
+          sudo apt-get update -o Acquire::Retries=5
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 libvips-dev libheif-plugin-aomenc
 
       - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
@@ -79,12 +78,10 @@ jobs:
           # would never catch a genuine MSRV regression on its own.
           toolchain: "1.96"
 
-      - name: Install libvips (cached)
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        with:
-          packages: libvips-dev
-          version: "1.0"
-          execute_install_scripts: true
+      - name: Install libvips
+        run: |
+          sudo apt-get update -o Acquire::Retries=5
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 libvips-dev
 
       - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2
@@ -102,12 +99,10 @@ jobs:
         with:
           components: llvm-tools-preview
 
-      - name: Install libvips (cached)
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        with:
-          packages: libvips-dev libheif-plugin-aomenc
-          version: "1.0"
-          execute_install_scripts: true
+      - name: Install libvips
+        run: |
+          sudo apt-get update -o Acquire::Retries=5
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 libvips-dev libheif-plugin-aomenc
 
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: mozilla-actions/sccache-action@v0.0.10
@@ -144,12 +139,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install libvips (cached)
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        with:
-          packages: libvips-dev
-          version: "1.0"
-          execute_install_scripts: true
+      - name: Install libvips
+        run: |
+          sudo apt-get update -o Acquire::Retries=5
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 libvips-dev
 
       - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: Swatinem/rust-cache@v2

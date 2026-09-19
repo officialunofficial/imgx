@@ -41,12 +41,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install libvips (cached)
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        with:
-          packages: libvips-dev
-          version: "1.0"
-          execute_install_scripts: true
+      - name: Install libvips
+        run: |
+          sudo apt-get update -o Acquire::Retries=5
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 libvips-dev
 
       - name: Run release-plz
         uses: release-plz/action@v0.5
