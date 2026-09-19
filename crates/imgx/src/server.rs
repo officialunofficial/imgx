@@ -445,13 +445,15 @@ async fn handle_image_request(
         }
     }
 
-    let transform_limits = pipeline::TransformLimits {
-        max_pixels: state.config.transform.max_pixels,
-        max_frames: state.config.transform.max_frames,
-        max_animated_pixels: state.config.transform.max_animated_pixels,
-    };
-    let encoder_settings = pipeline::EncoderSettings {
-        avif_effort: state.config.transform.avif_effort,
+    let transform_settings = pipeline::TransformSettings {
+        limits: pipeline::TransformLimits {
+            max_pixels: state.config.transform.max_pixels,
+            max_frames: state.config.transform.max_frames,
+            max_animated_pixels: state.config.transform.max_animated_pixels,
+        },
+        encoder: pipeline::EncoderSettings {
+            avif_effort: state.config.transform.avif_effort,
+        },
     };
 
     let Ok(permit) = Arc::clone(&state.vips_semaphore).try_acquire_owned() else {
@@ -471,10 +473,9 @@ async fn handle_image_request(
             &transform_input,
             &tp_for_task,
             accept_owned.as_deref(),
-            Some(transform_limits),
-            Some(encoder_settings),
+            Some(transform_settings),
         )?;
-        let encode_options = pipeline::EncodeOptions::new(&tp_for_task, encoder_settings);
+        let encode_options = pipeline::EncodeOptions::new(&tp_for_task, transform_settings.encoder);
         // Gap 11: composite already-fetched draw overlays onto the
         // transformed base image, then re-encode. Kept inside this same
         // spawn_blocking task (rather than after `.await`) since
@@ -1279,6 +1280,66 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(String::from_utf8(body).unwrap(), THUMBHASH_422_BODY);
         assert_eq!(state.cache.size().await, 0);
+    }
+
+    async fn image_body_with_config(
+        fixture_name: &str,
+        path: &str,
+        accept: &str,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Vec<u8> {
+        init_vips();
+        let mut cfg = Config::defaults();
+        cfg.origin.base_url = serve_fixture_repeatedly(fixture(fixture_name)).await;
+        tweak(&mut cfg);
+        let router = build_router(Arc::new(AppState::new(cfg)));
+        let (status, _, body) = get_full(router, path, &[(header::ACCEPT, accept)]).await;
+        assert_eq!(status, StatusCode::OK);
+        body
+    }
+
+    #[tokio::test]
+    async fn config_avif_effort_reaches_the_avif_encoder() {
+        let body_with_effort = |effort: u8| {
+            image_body_with_config(
+                "bench_2000x1500.png",
+                "/image/format=avif,w=300/photo.png",
+                "image/avif",
+                move |cfg| cfg.transform.avif_effort = effort,
+            )
+        };
+        let slow = body_with_effort(9).await.len();
+        let fast = body_with_effort(0).await.len();
+        assert!(
+            fast > slow,
+            "effort 0 must give larger AVIF output than effort 9 ({fast} vs {slow})"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_max_frames_limits_animated_output_frames() {
+        let body = image_body_with_config(
+            "loading.gif",
+            "/image/format=gif/loading.gif",
+            "image/gif",
+            |cfg| cfg.transform.max_frames = 3,
+        )
+        .await;
+        let decoded = imgx_vips::VipsImage::from_buffer_animated(&body, -1).unwrap();
+        assert_eq!(decoded.n_pages(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn config_max_animated_pixels_flattens_over_budget_animation() {
+        let body = image_body_with_config(
+            "loading.gif",
+            "/image/format=gif/loading.gif",
+            "image/gif",
+            |cfg| cfg.transform.max_animated_pixels = 1000,
+        )
+        .await;
+        let decoded = imgx_vips::VipsImage::from_buffer_animated(&body, -1).unwrap();
+        assert_eq!(decoded.n_pages().unwrap_or(1), 1);
     }
 
     #[tokio::test]
