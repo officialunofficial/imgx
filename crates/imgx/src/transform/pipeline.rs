@@ -13,6 +13,7 @@ use super::params::{
     CompressionMode, DrawOverlay, DrawRepeat, FitMode, FlipMode, Gravity, MetadataMode,
     OutputFormat, Rotation, TransformParams,
 };
+use super::thumbhash::{self, ThumbhashError};
 
 #[derive(Debug, Error)]
 pub enum TransformError {
@@ -20,6 +21,8 @@ pub enum TransformError {
     Vips(#[from] VipsError),
     #[error("source image exceeds the configured pixel budget ({0} > {1})")]
     ExceedsMaxPixels(u64, u64),
+    #[error(transparent)]
+    Thumbhash(#[from] ThumbhashError),
 }
 
 /// Result of a transform pipeline execution.
@@ -515,6 +518,24 @@ pub fn transform(
         });
     }
 
+    // -- THUMBHASH -- (imgx extension: the body is the base64 ThumbHash of
+    // the transformed image. INV-11 and the animated budget check ran
+    // above, so a source over budget never reaches this block. `validate()`
+    // rejects `draw` for this format, so no overlay changes the pixels
+    // after this point.)
+    if tp.format == Some(OutputFormat::Thumbhash) {
+        let (hash_width, hash_height, rgba) = thumbhash_rgba(&current)?;
+        let hash = thumbhash::encode(hash_width, hash_height, &rgba)?;
+        return Ok(TransformResult {
+            data: thumbhash::to_base64(&hash).into_bytes(),
+            format: OutputFormat::Thumbhash,
+            width: out_width,
+            height: out_height,
+            is_animated: false,
+            frame_count: None,
+        });
+    }
+
     // -- ENCODE --
     let output_format = animated_format.unwrap_or_else(|| {
         negotiate::negotiate_format(accept_header, current.has_alpha(), tp.format)
@@ -548,6 +569,29 @@ pub fn transform(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Render `image` into an 8-bit RGBA raster of at most 100x100 pixels for
+/// the ThumbHash encoder. Returns the raster width, height, and bytes.
+/// The `thumbnail` call keeps the aspect ratio, never upscales, and converts
+/// CMYK, 16-bit, and float sources to 8-bit sRGB. The call sets `no_rotate`,
+/// so the raster keeps the orientation of `image`. Every other output format
+/// encodes the same pixels.
+fn thumbhash_rgba(image: &VipsImage) -> Result<(u32, u32, Vec<u8>), TransformError> {
+    let side = thumbhash::MAX_SIDE as i32;
+    let small = image.thumbnail(
+        side,
+        ThumbnailOptions {
+            height: Some(side),
+            crop: None,
+            size: Some(consts::VIPS_SIZE_DOWN),
+            no_rotate: true,
+        },
+    )?;
+    let bytes = small.write_to_memory()?;
+    let (width, height) = (small.width() as u32, small.height() as u32);
+    let rgba = thumbhash::rgba_from_bands(&bytes, width, height, small.bands() as u32)?;
+    Ok((width, height, rgba))
+}
 
 /// `n-pages` metadata, guarding against the < 1 sentinel the same way
 /// bindings.zig's `getNPages` does.
@@ -755,10 +799,11 @@ pub(crate) fn encode_image(
         OutputFormat::Webp => image.save_webp(q, do_strip),
         OutputFormat::Avif => image.save_avif(q, do_strip),
         OutputFormat::Gif => encode_gif(image),
-        // Never reached: `transform()` intercepts `format == Json`
-        // before calling `encode_image` and builds a JSON stats payload
-        // instead (see the `-- JSON --` block below).
-        OutputFormat::Json => image.save_jpeg(q, do_strip),
+        // Never reached: `transform()` intercepts `format == Json` and
+        // `format == Thumbhash` before calling `encode_image` and builds a
+        // text payload instead (see the `-- JSON --` and `-- THUMBHASH --`
+        // blocks above).
+        OutputFormat::Json | OutputFormat::Thumbhash => image.save_jpeg(q, do_strip),
     }
 }
 
@@ -775,7 +820,8 @@ pub(crate) fn encode_image(
 /// vertically-stacked animated frame buffer would corrupt frame
 /// boundaries -- the same INV-2 concern the BORDER stage already
 /// documents), or when the output is a `format=json` metadata response
-/// (no image bytes to composite onto).
+/// or a `format=thumbhash` text response (no image bytes to composite
+/// onto).
 pub fn apply_draw_overlays(
     result: TransformResult,
     draw: &[DrawOverlay],
@@ -786,7 +832,7 @@ pub fn apply_draw_overlays(
     if draw.is_empty() || overlay_bytes.is_empty() || result.is_animated {
         return Ok(result);
     }
-    if result.format == OutputFormat::Json {
+    if result.format.produces_text_body() {
         return Ok(result);
     }
 
@@ -825,6 +871,10 @@ fn encode_gif(image: &VipsImage) -> Result<Vec<u8>, VipsError> {
 #[cfg(test)]
 mod tests {
     use super::super::params::{AnimMode, parse};
+    use super::super::thumbhash::{
+        self,
+        test_support::{BODY_CHARS, HASH_BYTES, base64_decode, is_standard_base64},
+    };
     use super::*;
     use std::fs;
     use std::path::Path;
@@ -1832,5 +1882,325 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.data, base_result.data);
+    }
+
+    fn thumbhash_result(data: &[u8], params: &str, accept: Option<&str>) -> TransformResult {
+        let p = parse(params).unwrap();
+        transform(data, &p, accept, None).unwrap()
+    }
+
+    fn thumbhash_bytes(result: &TransformResult) -> Vec<u8> {
+        base64_decode(std::str::from_utf8(&result.data).expect("thumbhash body is ascii"))
+    }
+
+    fn hash_is_landscape(hash: &[u8]) -> bool {
+        hash[4] & 0x80 != 0
+    }
+
+    fn hash_has_alpha(hash: &[u8]) -> bool {
+        hash[2] & 0x80 != 0
+    }
+
+    #[test]
+    fn transform_with_format_thumbhash_returns_base64_text_not_image_bytes() {
+        init();
+        let data = nonsquare_fixture();
+        let result = thumbhash_result(&data, "format=thumbhash", None);
+        assert_eq!(result.format, OutputFormat::Thumbhash);
+        let text = std::str::from_utf8(&result.data).expect("body must be ascii text");
+        assert!(BODY_CHARS.contains(&text.len()), "length {}", text.len());
+        assert!(is_standard_base64(text), "{text}");
+        let hash = base64_decode(text);
+        assert!(
+            HASH_BYTES.contains(&hash.len()),
+            "hash length {}",
+            hash.len()
+        );
+        assert_eq!(thumbhash::to_base64(&hash), text);
+        assert!(!result.is_animated);
+        assert_eq!(result.frame_count, None);
+        assert_eq!((result.width, result.height), (2000, 1500));
+    }
+
+    #[test]
+    fn transform_thumbhash_reflects_output_aspect_ratio_of_resize() {
+        init();
+        let data = nonsquare_fixture();
+        let landscape = thumbhash_result(&data, "format=thumbhash", None);
+        assert!(hash_is_landscape(&thumbhash_bytes(&landscape)));
+
+        let portrait = thumbhash_result(&data, "format=thumbhash,w=100,h=300,fit=cover", None);
+        assert_eq!((portrait.width, portrait.height), (100, 300));
+        let hash = thumbhash_bytes(&portrait);
+        assert!(!hash_is_landscape(&hash));
+        assert_eq!(hash[3] & 7, 2, "lx of a 1:3 image");
+
+        let rotated = thumbhash_result(&data, "format=thumbhash,rotate=90", None);
+        assert_eq!((rotated.width, rotated.height), (1500, 2000));
+        assert!(!hash_is_landscape(&thumbhash_bytes(&rotated)));
+    }
+
+    #[test]
+    fn transform_thumbhash_rejects_source_exceeding_max_pixels() {
+        init();
+        let data = static_fixture();
+        let limits = TransformLimits {
+            max_pixels: 10,
+            ..Default::default()
+        };
+        let p = parse("format=thumbhash").unwrap();
+        let err = transform(&data, &p, None, Some(limits))
+            .expect_err("16-pixel source must be rejected under a 10-pixel budget");
+        assert!(matches!(err, TransformError::ExceedsMaxPixels(16, 10)));
+    }
+
+    #[test]
+    fn transform_thumbhash_accepts_source_within_max_pixels() {
+        init();
+        let data = static_fixture();
+        let limits = TransformLimits {
+            max_pixels: 16,
+            ..Default::default()
+        };
+        let p = parse("format=thumbhash").unwrap();
+        let result = transform(&data, &p, None, Some(limits)).unwrap();
+        assert_eq!(result.format, OutputFormat::Thumbhash);
+        assert!(HASH_BYTES.contains(&thumbhash_bytes(&result).len()));
+    }
+
+    #[test]
+    fn transform_thumbhash_reads_at_most_100_pixels_per_side() {
+        init();
+        let data = nonsquare_fixture();
+        let big = VipsImage::from_buffer(&data)
+            .unwrap()
+            .thumbnail(
+                4000,
+                ThumbnailOptions {
+                    height: Some(3000),
+                    crop: None,
+                    size: Some(consts::VIPS_SIZE_FORCE),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!((big.width(), big.height()), (4000, 3000));
+        let (w, h, rgba) = thumbhash_rgba(&big).unwrap();
+        assert_eq!((w, h), (100, 75));
+        assert_eq!(rgba.len(), 4 * 100 * 75);
+
+        let result = thumbhash_result(&data, "format=thumbhash,w=4000,h=3000,fit=fill", None);
+        assert_eq!((result.width, result.height), (4000, 3000));
+        assert!(result.data.len() <= 36);
+    }
+
+    #[test]
+    fn transform_thumbhash_is_independent_of_accept_quality_metadata_and_onerror() {
+        init();
+        let data = nonsquare_fixture();
+        let baseline = thumbhash_result(&data, "format=thumbhash,w=300", None).data;
+        for (params, accept) in [
+            (
+                "format=thumbhash,w=300,q=5,metadata=keep",
+                Some("image/avif"),
+            ),
+            (
+                "format=thumbhash,w=300,q=100,metadata=strip,compression=fast",
+                Some("image/webp,image/png"),
+            ),
+            ("format=thumbhash,w=300,anim=static", Some("*/*")),
+            ("format=thumbhash,w=300,onerror=redirect", None),
+            (
+                "fmt=thumbhash,w=300,q=1,metadata=copyright",
+                Some("image/jpeg"),
+            ),
+        ] {
+            let other = thumbhash_result(&data, params, accept).data;
+            assert_eq!(other, baseline, "{params} with accept {accept:?}");
+        }
+    }
+
+    #[test]
+    fn transform_thumbhash_of_animated_gif_uses_first_frame_and_is_not_animated() {
+        init();
+        let data = fixture("loading.gif");
+        let first_frame = VipsImage::from_buffer(&data).unwrap();
+        assert!(n_pages_of(&first_frame).is_some_and(|n| n > 1));
+        let (frame_w, frame_h) = (first_frame.width() as u32, first_frame.height() as u32);
+
+        let result = thumbhash_result(&data, "format=thumbhash", Some("image/webp,image/gif"));
+        assert_eq!(result.format, OutputFormat::Thumbhash);
+        assert!(!result.is_animated);
+        assert_eq!(result.frame_count, None);
+        assert_eq!((result.width, result.height), (frame_w, frame_h));
+        assert!(HASH_BYTES.contains(&thumbhash_bytes(&result).len()));
+
+        let explicit = thumbhash_result(&data, "format=thumbhash,frame=0", None);
+        assert_eq!(explicit.data, result.data);
+    }
+
+    #[test]
+    fn transform_thumbhash_of_four_band_opaque_source_clears_alpha_flag() {
+        init();
+        let data = static_fixture();
+        assert_eq!(VipsImage::from_buffer(&data).unwrap().bands(), 4);
+        let result = thumbhash_result(&data, "format=thumbhash", None);
+        assert!(!hash_has_alpha(&thumbhash_bytes(&result)));
+    }
+
+    #[test]
+    fn transform_thumbhash_of_transparent_source_sets_alpha_flag_and_matches_reference_vector() {
+        init();
+        let data = fixture("alpha_4x4.png");
+        let source = VipsImage::from_buffer(&data).unwrap();
+        assert_eq!(source.bands(), 4);
+        let pixels = source.write_to_memory().unwrap();
+        assert!(
+            pixels.chunks_exact(4).any(|px| px[3] < 255),
+            "the fixture must hold pixels with alpha below 255"
+        );
+        let result = thumbhash_result(&data, "format=thumbhash", None);
+        assert!(hash_has_alpha(&thumbhash_bytes(&result)));
+        // `rgbaToThumbHash` of thumbhash@0.1.1 on the same 4x4 RGBA pixels.
+        assert_eq!(
+            std::str::from_utf8(&result.data).unwrap(),
+            "JOmFLQ44l3eweHx3d7DGCOpJYnhwiJeIdw=="
+        );
+    }
+
+    #[test]
+    fn transform_thumbhash_of_cmyk_source_succeeds() {
+        init();
+        let data = fixture("cmyk.jpg");
+        let result = thumbhash_result(&data, "format=thumbhash", None);
+        assert_eq!(result.format, OutputFormat::Thumbhash);
+        let hash = thumbhash_bytes(&result);
+        assert!(HASH_BYTES.contains(&hash.len()));
+        assert!(
+            !hash_has_alpha(&hash),
+            "the K channel must not be read as alpha"
+        );
+    }
+
+    #[test]
+    fn transform_thumbhash_landscape_bit_matches_result_dimensions_for_exif_source() {
+        init();
+        let data = fixture("exif_orientation.jpg");
+        for params in [
+            "format=thumbhash",
+            "format=thumbhash,rotate=90",
+            "format=thumbhash,rotate=180",
+            "format=thumbhash,border=1",
+        ] {
+            let result = thumbhash_result(&data, params, None);
+            let hash = thumbhash_bytes(&result);
+            assert_eq!(
+                hash_is_landscape(&hash),
+                result.width > result.height,
+                "{params}: result is {}x{}",
+                result.width,
+                result.height
+            );
+            let png_params = params.replace("format=thumbhash", "format=png");
+            let png = thumbhash_result(&data, &png_params, None);
+            assert_eq!(
+                (result.width, result.height),
+                (png.width, png.height),
+                "{params}: hash and png results must report the same size"
+            );
+        }
+    }
+
+    fn hash_of_pixels_in(encoded: &[u8]) -> Vec<u8> {
+        let image = VipsImage::from_buffer(encoded).unwrap();
+        let (width, height) = (image.width() as u32, image.height() as u32);
+        let bytes = image.write_to_memory().unwrap();
+        let rgba = thumbhash::rgba_from_bands(&bytes, width, height, image.bands() as u32).unwrap();
+        thumbhash::encode(width, height, &rgba).unwrap()
+    }
+
+    #[test]
+    fn transform_thumbhash_landscape_bit_follows_the_hashed_thumbnail_for_near_square_output() {
+        init();
+        let data = nonsquare_fixture();
+        let landscape = |params: &str| {
+            let result = thumbhash_result(&data, params, None);
+            (
+                hash_is_landscape(&thumbhash_bytes(&result)),
+                result.width > result.height,
+            )
+        };
+        // The 100x100 thumbnail of a 4000x3999 output has equal sides, so
+        // the bit is clear although the result is wider than it is tall.
+        assert_eq!(
+            landscape("format=thumbhash,w=4000,h=3999,fit=fill"),
+            (false, true)
+        );
+        // The bit is never set for a result that is not wider than it is tall.
+        assert_eq!(
+            landscape("format=thumbhash,w=3999,h=4000,fit=fill"),
+            (false, false)
+        );
+        assert_eq!(
+            landscape("format=thumbhash,w=4000,h=4000,fit=fill"),
+            (false, false)
+        );
+        // The bit is set once the thumbnail keeps the order of the sides.
+        assert_eq!(
+            landscape("format=thumbhash,w=4000,h=3900,fit=fill"),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn transform_thumbhash_of_exif_source_hashes_the_pixels_other_formats_output() {
+        init();
+        let data = fixture("exif_orientation.jpg");
+        let png = thumbhash_result(&data, "format=png", None);
+        let result = thumbhash_result(&data, "format=thumbhash", None);
+        assert_eq!(thumbhash_bytes(&result), hash_of_pixels_in(&png.data));
+    }
+
+    #[test]
+    fn transform_thumbhash_of_image_under_100px_hashes_native_pixels() {
+        init();
+        let data = static_fixture();
+        let result = thumbhash_result(&data, "format=thumbhash", None);
+        assert_eq!(
+            thumbhash_bytes(&result),
+            hash_of_pixels_in(&data),
+            "a 4x4 image must hash its own pixels, not an upscaled copy"
+        );
+
+        let data = nonsquare_fixture();
+        let small = thumbhash_result(&data, "format=thumbhash,w=50,h=20,fit=fill", None);
+        assert_eq!((small.width, small.height), (50, 20));
+        let png = thumbhash_result(&data, "format=png,w=50,h=20,fit=fill", None);
+        assert_eq!(
+            thumbhash_bytes(&small),
+            hash_of_pixels_in(&png.data),
+            "a 50x20 output must hash its own pixels, not an upscaled copy"
+        );
+    }
+
+    #[test]
+    fn apply_draw_overlays_is_a_noop_for_thumbhash_result() {
+        init();
+        let data = nonsquare_fixture();
+        let base_result = thumbhash_result(&data, "format=thumbhash", None);
+        assert_eq!(base_result.format, OutputFormat::Thumbhash);
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            ..Default::default()
+        };
+        let result = apply_draw_overlays(
+            base_result.clone(),
+            std::slice::from_ref(&entry),
+            &[overlay_fixture()],
+            80,
+            MetadataMode::Strip,
+        )
+        .unwrap();
+        assert_eq!(result, base_result);
     }
 }

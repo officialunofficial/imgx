@@ -27,10 +27,11 @@ impl AcceptResult {
             OutputFormat::Auto => true,
             // Never reached via negotiate_format/negotiate_animated_format:
             // both short-circuit on any explicit non-Auto format before
-            // calling supports(), and Json is never itself negotiated
-            // against (pipeline.rs negotiates a real codec for the JSON
-            // response's "transformed" stats separately).
-            OutputFormat::Json => true,
+            // calling supports(). Json and Thumbhash are never themselves
+            // negotiated against. pipeline.rs negotiates a real codec for
+            // the JSON response's "transformed" stats separately, and
+            // Thumbhash returns text with no codec at all.
+            OutputFormat::Json | OutputFormat::Thumbhash => true,
         }
     }
 }
@@ -475,6 +476,14 @@ mod tests {
     fn negotiate_animated_format_explicit_jpeg_not_animated() {
         assert_eq!(
             negotiate_animated_format(Some("image/webp"), Some(OutputFormat::Jpeg)),
+            None
+        );
+    }
+
+    #[test]
+    fn negotiate_animated_format_explicit_thumbhash_is_not_animated() {
+        assert_eq!(
+            negotiate_animated_format(Some("image/webp,image/gif"), Some(OutputFormat::Thumbhash)),
             None
         );
     }
