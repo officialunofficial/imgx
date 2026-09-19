@@ -300,10 +300,12 @@ async fn handle_image_request(
             )));
         }
     };
-    if tp.validate().is_err() {
-        return error_response(HttpError::unprocessable_entity(Some(
-            "transform parameters out of range".to_string(),
-        )));
+    if let Err(e) = tp.validate() {
+        let detail = match e {
+            params::ParseError::DrawWithThumbhash => e.to_string(),
+            _ => "transform parameters out of range".to_string(),
+        };
+        return error_response(HttpError::unprocessable_entity(Some(detail)));
     }
     // Gap 11 -- `draw` overlays (docs/CLOUDFLARE_PARITY.md): the array
     // syntax parsing and compositing math
@@ -1086,6 +1088,7 @@ mod tests {
 
     const CORRUPT_JPEG_ORIGIN: &str =
         "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 12\r\n\r\nnot an image";
+    const THUMBHASH_DRAW_422_BODY: &str = "{\"error\":{\"status\":422,\"message\":\"Unprocessable Entity\",\"detail\":\"draw overlays cannot be combined with format=thumbhash\"}}";
     const THUMBHASH_422_BODY: &str = "{\"error\":{\"status\":422,\"message\":\"Unprocessable Entity\",\"detail\":\"source image could not be processed\"}}";
 
     #[tokio::test]
@@ -1606,7 +1609,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(body.contains("out of range"));
+        assert_eq!(body, THUMBHASH_DRAW_422_BODY);
         assert_eq!(metric_value(&state, "imgx_cache_misses_total"), 0.0);
     }
 
@@ -1619,8 +1622,17 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(body.contains("out of range"));
+        assert_eq!(body, THUMBHASH_DRAW_422_BODY);
         assert!(!body.contains("draw overlays are not enabled"));
+    }
+
+    #[tokio::test]
+    async fn invalid_draw_for_other_formats_keeps_the_generic_422_message() {
+        let router = build_router(test_state());
+        let (status, body) = get(router, "/image/format=webp,draw.0.width=10/photo.jpg").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("transform parameters out of range"));
+        assert!(!body.contains("thumbhash"));
     }
 
     #[tokio::test]

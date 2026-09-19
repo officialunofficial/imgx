@@ -58,6 +58,8 @@ pub enum ParseError {
     InvalidBorder,
     #[error("invalid draw overlay value")]
     InvalidDraw,
+    #[error("draw overlays cannot be combined with format=thumbhash")]
+    DrawWithThumbhash,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -702,7 +704,7 @@ impl TransformParams {
             }
         }
         if self.format == Some(OutputFormat::Thumbhash) && !self.draw.is_empty() {
-            return Err(ParseError::InvalidDraw);
+            return Err(ParseError::DrawWithThumbhash);
         }
         for entry in &self.draw {
             if entry.url.as_deref().is_none_or(str::is_empty) {
@@ -2034,9 +2036,9 @@ mod tests {
     #[test]
     fn validate_rejects_thumbhash_with_draw_overlay() {
         let p = parse("format=thumbhash,draw.0.url=https://example.com/a.png").unwrap();
-        assert_eq!(p.validate(), Err(ParseError::InvalidDraw));
+        assert_eq!(p.validate(), Err(ParseError::DrawWithThumbhash));
         let via_alias = parse("f=thumbhash,draw.0.url=https://example.com/a.png").unwrap();
-        assert_eq!(via_alias.validate(), Err(ParseError::InvalidDraw));
+        assert_eq!(via_alias.validate(), Err(ParseError::DrawWithThumbhash));
         let other_format = parse("format=webp,draw.0.url=https://example.com/a.png").unwrap();
         assert_eq!(other_format.validate(), Ok(()));
         let no_format = parse("draw.0.url=https://example.com/a.png").unwrap();
