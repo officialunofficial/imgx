@@ -23,6 +23,18 @@ pub struct VipsArea {
     _private: [u8; 0],
 }
 
+/// A `VipsBlob` is a `VipsArea` subclass. Release it with `vips_area_unref`.
+#[repr(C)]
+pub struct VipsBlob {
+    _private: [u8; 0],
+}
+
+/// A source of encoded image bytes. Release it with `g_object_unref`.
+#[repr(C)]
+pub struct VipsSource {
+    _private: [u8; 0],
+}
+
 pub type GQuark = u32;
 
 unsafe extern "C" {
@@ -37,15 +49,29 @@ unsafe extern "C" {
     pub fn vips_error_clear();
 
     // -- load --
-    // G_GNUC_NULL_TERMINATED varargs option list, e.g.
-    // vips_image_new_from_buffer(buf, len, "", NULL) or
-    // vips_image_new_from_buffer(buf, len, "", "n", -1, NULL).
-    pub fn vips_image_new_from_buffer(
-        buf: *const c_void,
-        len: size_t,
+    // Decoding starts from an owned in-memory source. It never uses
+    // `vips_image_new_from_buffer`, because that call borrows the caller's
+    // bytes and the safe wrapper cannot express the borrow.
+    // Signatures checked against libvips 8.18.4 `vips/type.h`,
+    // `vips/connection.h` and `vips/image.h`.
+    // `vips_blob_copy` copies the bytes into a reference-counted blob.
+    // `vips_source_new_from_blob` takes its own reference to that blob.
+    // The caller's bytes therefore need not outlive the call.
+    pub fn vips_blob_copy(data: *const c_void, length: size_t) -> *mut VipsBlob;
+    pub fn vips_source_new_from_blob(blob: *mut VipsBlob) -> *mut VipsSource;
+    // The option list ends with NULL (G_GNUC_NULL_TERMINATED), for example
+    // `vips_image_new_from_source(src, "n=-1", NULL)`.
+    pub fn vips_image_new_from_source(
+        source: *mut VipsSource,
         option_string: *const c_char,
         ...
     ) -> *mut VipsImage;
+
+    // -- raster export --
+    // Signature checked against libvips 8.18.4 `vips/image.h`. Not varargs.
+    // Returns a g_malloc buffer of `*size` bytes, or NULL on error. The caller
+    // frees it with g_free.
+    pub fn vips_image_write_to_memory(in_: *mut VipsImage, size: *mut size_t) -> *mut c_void;
 
     // -- header / metadata --
     pub fn vips_image_get_width(image: *const VipsImage) -> c_int;
@@ -57,9 +83,24 @@ unsafe extern "C" {
         name: *const c_char,
         out: *mut c_int,
     ) -> c_int;
+    // Signature checked against libvips 8.18.4 `vips/header.h`. The returned
+    // string belongs to the metadata of the image.
+    pub fn vips_image_get_string(
+        image: *const VipsImage,
+        name: *const c_char,
+        out: *mut *const c_char,
+    ) -> c_int;
     pub fn vips_image_set_int(image: *mut VipsImage, name: *const c_char, i: c_int);
 
     // -- resample --
+    // Signature checked against libvips 8.18.4 `vips/resample.h`. The output
+    // image keeps the source, and so the bytes, alive.
+    pub fn vips_thumbnail_source(
+        source: *mut VipsSource,
+        out: *mut *mut VipsImage,
+        width: c_int,
+        ...
+    ) -> c_int;
     pub fn vips_thumbnail_image(
         in_: *mut VipsImage,
         out: *mut *mut VipsImage,
@@ -78,6 +119,8 @@ unsafe extern "C" {
         ...
     ) -> c_int;
     pub fn vips_rot(in_: *mut VipsImage, out: *mut *mut VipsImage, angle: c_int, ...) -> c_int;
+    // Signature checked against libvips `vips/conversion.h`.
+    pub fn vips_autorot(in_: *mut VipsImage, out: *mut *mut VipsImage, ...) -> c_int;
     pub fn vips_flip(in_: *mut VipsImage, out: *mut *mut VipsImage, direction: c_int, ...)
     -> c_int;
     pub fn vips_find_trim(

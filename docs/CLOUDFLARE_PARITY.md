@@ -66,6 +66,24 @@ their own target box (`Cover`/`Fill`/`Crop`/`AspectCrop` are excluded — they
 require both dimensions to mean anything). See the `derived_height` comment
 in `pipeline.rs`'s `-- RESIZE --` section.
 
+**Second bug found and fixed:** `vips_thumbnail_*` applies the EXIF
+orientation before it fits the box. The derived side used the stored
+dimensions, so a source with orientation 5 to 8 (a 90 degree turn) got a wrong
+box. A stored 2000x1500 JPEG with orientation 6 displays as 1500x2000. Before
+the fix, `w=300` gave 169x225 instead of 300x400. The resize stage now derives the
+missing side from the oriented dimensions (`oriented_size` in `pipeline.rs`).
+Tests: `resize_width_only_derives_height_from_oriented_aspect_for_quarter_turn_exif`
+and `resize_height_only_derives_width_from_oriented_aspect_for_quarter_turn_exif`.
+
+`fit=aspect-crop` has the same fix. Its scale and ratio maths use the oriented
+dimensions. When the source is smaller than the target, the direct crop first
+calls `autorot` (`vips_autorot`). The crop then runs on upright pixels, and the
+output carries no orientation tag. Before the fix, orientation 5 to 8 gave the
+wrong crop size, and the output was not upright. Tests:
+`aspect_crop_uses_oriented_dimensions_for_quarter_turn_exif`,
+`aspect_crop_direct_crop_gives_the_documented_size_for_quarter_turn_exif`, and
+`aspect_crop_direct_crop_clears_the_orientation_tag_with_metadata_keep`.
+
 ## Gap 12 — gravity
 
 **Verified** against `developers.cloudflare.com/images/optimization/features/`
@@ -198,6 +216,14 @@ placeholders. `original.file_size` is the input byte length; there's no
 separate "source MIME type" field in this implementation (would require new
 loader-sniffing FFI beyond this pass's scope) — noted here as a schema
 simplification, not silently omitted.
+
+**`format=thumbhash` (imgx extension, not Cloudflare):** Cloudflare Images
+has no equivalent output format. imgx adds `format=thumbhash` as an opt-in
+extension. It returns the ThumbHash of the transformed image as base64 text
+with `Content-Type: text/plain; charset=utf-8`. A client decodes it with the
+MIT `thumbhash` JS package. This value does not change any Cloudflare-compatible
+behavior. See `apps/docs/src/pages/transforms.mdx` for the wire contract and
+`docs/INVARIANTS.md` INV-15 to INV-20 for the guarantees.
 
 ## Gap 7 — onerror
 

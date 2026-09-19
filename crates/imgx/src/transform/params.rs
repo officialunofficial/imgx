@@ -80,6 +80,10 @@ pub enum OutputFormat {
     /// bytes. See docs/CLOUDFLARE_PARITY.md for the (spec-derived) JSON
     /// schema pipeline.rs produces for this format.
     Json,
+    /// imgx extension, not Cloudflare. The response body is the base64
+    /// ThumbHash of the transformed image, as `text/plain`. A client
+    /// decodes it and paints a placeholder. See `transform/thumbhash.rs`.
+    Thumbhash,
 }
 
 impl OutputFormat {
@@ -91,6 +95,7 @@ impl OutputFormat {
             OutputFormat::Avif => "image/avif",
             OutputFormat::Gif => "image/gif",
             OutputFormat::Json => "application/json",
+            OutputFormat::Thumbhash => "text/plain; charset=utf-8",
             OutputFormat::Auto => "application/octet-stream",
         }
     }
@@ -103,6 +108,7 @@ impl OutputFormat {
             OutputFormat::Avif => "avif",
             OutputFormat::Gif => "gif",
             OutputFormat::Json => "json",
+            OutputFormat::Thumbhash => "txt",
             OutputFormat::Auto => "",
         }
     }
@@ -116,6 +122,7 @@ impl OutputFormat {
             "gif" => Ok(OutputFormat::Gif),
             "baseline-jpeg" => Ok(OutputFormat::BaselineJpeg),
             "json" => Ok(OutputFormat::Json),
+            "thumbhash" => Ok(OutputFormat::Thumbhash),
             "auto" => Ok(OutputFormat::Auto),
             _ => Err(ParseError::InvalidFormat),
         }
@@ -130,12 +137,17 @@ impl OutputFormat {
             OutputFormat::Gif => "gif",
             OutputFormat::BaselineJpeg => "baseline-jpeg",
             OutputFormat::Json => "json",
+            OutputFormat::Thumbhash => "thumbhash",
             OutputFormat::Auto => "auto",
         }
     }
 
     pub fn supports_animation(self) -> bool {
         matches!(self, OutputFormat::Gif | OutputFormat::Webp)
+    }
+
+    pub fn produces_text_body(self) -> bool {
+        matches!(self, OutputFormat::Json | OutputFormat::Thumbhash)
     }
 }
 
@@ -689,6 +701,9 @@ impl TransformParams {
                 return Err(ParseError::InvalidBorder);
             }
         }
+        if self.format == Some(OutputFormat::Thumbhash) && !self.draw.is_empty() {
+            return Err(ParseError::InvalidDraw);
+        }
         for entry in &self.draw {
             if entry.url.as_deref().is_none_or(str::is_empty) {
                 return Err(ParseError::InvalidDraw);
@@ -1187,6 +1202,14 @@ mod tests {
         assert_eq!(parse("format=png").unwrap().format, Some(OutputFormat::Png));
         assert_eq!(parse("fmt=jpeg").unwrap().format, Some(OutputFormat::Jpeg));
         assert_eq!(parse("f=avif").unwrap().format, Some(OutputFormat::Avif));
+        assert_eq!(
+            parse("f=thumbhash").unwrap().format,
+            Some(OutputFormat::Thumbhash)
+        );
+        assert_eq!(
+            parse("fmt=thumbhash").unwrap().format,
+            Some(OutputFormat::Thumbhash)
+        );
     }
 
     #[test]
@@ -1896,6 +1919,138 @@ mod tests {
         assert_eq!(OutputFormat::Json.content_type(), "application/json");
         assert_eq!(OutputFormat::Json.extension(), "json");
         assert!(!OutputFormat::Json.supports_animation());
+    }
+
+    #[test]
+    fn parse_format_thumbhash() {
+        assert_eq!(
+            parse("format=thumbhash").unwrap().format,
+            Some(OutputFormat::Thumbhash)
+        );
+        assert_eq!(
+            OutputFormat::parse_str("thumbhash"),
+            Ok(OutputFormat::Thumbhash)
+        );
+    }
+
+    #[test]
+    fn thumbhash_format_content_type_and_extension() {
+        assert_eq!(
+            OutputFormat::Thumbhash.content_type(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(OutputFormat::Thumbhash.extension(), "txt");
+        assert_eq!(OutputFormat::Thumbhash.as_str(), "thumbhash");
+    }
+
+    #[test]
+    fn produces_text_body_is_true_only_for_json_and_thumbhash() {
+        assert!(OutputFormat::Json.produces_text_body());
+        assert!(OutputFormat::Thumbhash.produces_text_body());
+        for format in [
+            OutputFormat::Auto,
+            OutputFormat::Jpeg,
+            OutputFormat::Png,
+            OutputFormat::Webp,
+            OutputFormat::Avif,
+            OutputFormat::Gif,
+            OutputFormat::BaselineJpeg,
+        ] {
+            assert!(!format.produces_text_body(), "{format:?}");
+        }
+    }
+
+    #[test]
+    fn output_format_thumbhash_does_not_support_animation() {
+        assert!(!OutputFormat::Thumbhash.supports_animation());
+    }
+
+    #[test]
+    fn cache_key_includes_f_thumbhash_in_canonical_position() {
+        assert_eq!(
+            parse("w=800,h=450,fit=cover,format=thumbhash")
+                .unwrap()
+                .to_cache_key(),
+            "w=800,h=450,q=80,f=thumbhash,fit=cover,g=center,dpr=1.0"
+        );
+        assert_eq!(
+            parse("format=thumbhash").unwrap().to_cache_key(),
+            "q=80,f=thumbhash,fit=contain,g=center,dpr=1.0"
+        );
+    }
+
+    #[test]
+    fn cache_key_for_thumbhash_is_order_independent() {
+        let a = parse("format=thumbhash,h=450,w=800,fit=cover").unwrap();
+        let b = parse("w=800,fit=cover,f=thumbhash,h=450").unwrap();
+        let c = parse("fmt=thumbhash,fit=cover,h=450,w=800").unwrap();
+        assert_eq!(a.to_cache_key(), b.to_cache_key());
+        assert_eq!(a.to_cache_key(), c.to_cache_key());
+    }
+
+    #[test]
+    fn cache_key_of_every_other_format_is_unchanged_by_thumbhash() {
+        let expected = [
+            ("jpeg", "q=80,f=jpeg,fit=contain,g=center,dpr=1.0"),
+            ("jpg", "q=80,f=jpeg,fit=contain,g=center,dpr=1.0"),
+            ("png", "q=80,f=png,fit=contain,g=center,dpr=1.0"),
+            ("webp", "q=80,f=webp,fit=contain,g=center,dpr=1.0"),
+            ("avif", "q=80,f=avif,fit=contain,g=center,dpr=1.0"),
+            ("gif", "q=80,f=gif,fit=contain,g=center,dpr=1.0"),
+            (
+                "baseline-jpeg",
+                "q=80,f=baseline-jpeg,fit=contain,g=center,dpr=1.0",
+            ),
+            ("json", "q=80,f=json,fit=contain,g=center,dpr=1.0"),
+            ("auto", "q=80,f=auto,fit=contain,g=center,dpr=1.0"),
+        ];
+        let thumbhash_key = parse("format=thumbhash").unwrap().to_cache_key();
+        for (format, key) in expected {
+            let actual = parse(&format!("format={format}")).unwrap().to_cache_key();
+            assert_eq!(actual, key, "format={format}");
+            assert_ne!(actual, thumbhash_key, "format={format}");
+        }
+        assert_eq!(
+            TransformParams::default().to_cache_key(),
+            "q=80,fit=contain,g=center,dpr=1.0"
+        );
+    }
+
+    #[test]
+    fn cache_key_of_thumbhash_changes_with_q_metadata_compression_anim_but_not_onerror() {
+        let base = parse("format=thumbhash,w=300").unwrap().to_cache_key();
+        for option in ["q=5", "metadata=keep", "compression=fast", "anim=static"] {
+            let key = parse(&format!("format=thumbhash,w=300,{option}"))
+                .unwrap()
+                .to_cache_key();
+            assert_ne!(key, base, "{option} must change the cache key");
+        }
+        let redirect = parse("format=thumbhash,w=300,onerror=redirect")
+            .unwrap()
+            .to_cache_key();
+        assert_eq!(redirect, base, "onerror never enters the cache key");
+    }
+
+    #[test]
+    fn validate_rejects_thumbhash_with_draw_overlay() {
+        let p = parse("format=thumbhash,draw.0.url=https://example.com/a.png").unwrap();
+        assert_eq!(p.validate(), Err(ParseError::InvalidDraw));
+        let via_alias = parse("f=thumbhash,draw.0.url=https://example.com/a.png").unwrap();
+        assert_eq!(via_alias.validate(), Err(ParseError::InvalidDraw));
+        let other_format = parse("format=webp,draw.0.url=https://example.com/a.png").unwrap();
+        assert_eq!(other_format.validate(), Ok(()));
+        let no_format = parse("draw.0.url=https://example.com/a.png").unwrap();
+        assert_eq!(no_format.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_accepts_thumbhash_with_resize_and_fit_params() {
+        let p = parse(
+            "format=thumbhash,w=800,h=450,fit=cover,g=smart,dpr=2,rotate=90,flip=h,bg=FF0000,\
+             blur=2,trim.left=4,border=3,frame=0",
+        )
+        .unwrap();
+        assert_eq!(p.validate(), Ok(()));
     }
 
     /// Gap 7 -- `onerror=redirect`: opt-in per-request parameter. Default
