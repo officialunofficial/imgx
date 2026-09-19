@@ -2056,7 +2056,7 @@ mod tests {
         assert_eq!(source.bands(), 4);
         let pixels = source.write_to_memory().unwrap();
         assert!(
-            pixels.chunks_exact(4).any(|px| px[3] < 255),
+            pixels.as_chunks::<4>().0.iter().any(|px| px[3] < 255),
             "the fixture must hold pixels with alpha below 255"
         );
         let result = thumbhash_result(&data, "format=thumbhash", None);
