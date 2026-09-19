@@ -1,5 +1,5 @@
 # --- Build stage ---
-FROM rust:alpine AS build
+FROM rust:1.98.1-alpine AS build
 
 ARG TARGETARCH
 

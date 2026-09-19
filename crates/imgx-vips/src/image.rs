@@ -3,7 +3,7 @@ use std::ptr;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use libc::{c_char, size_t};
+use libc::{c_char, c_int, size_t};
 
 use crate::error::{VipsError, last_vips_error};
 use crate::ffi;
@@ -26,6 +26,12 @@ pub fn init() -> Result<(), VipsError> {
         Err(VipsError::InitFailed(last_vips_error()))
     }
 }
+
+/// The AVIF encoder effort that libvips uses by default.
+pub const DEFAULT_AVIF_EFFORT: u8 = 4;
+
+/// The highest AVIF encoder effort that libvips accepts.
+pub const MAX_AVIF_EFFORT: u8 = 9;
 
 /// Shut down libvips. Call at most once, from `main` on process exit.
 /// Never call from tests (`bindings.zig` carries the same restriction).
@@ -53,6 +59,9 @@ pub struct ThumbnailOptions {
     pub crop: Option<i32>,
     /// Size constraint (`ffi::VIPS_SIZE_*`).
     pub size: Option<i32>,
+    /// Ignore the EXIF orientation tag. The output keeps the stored pixel
+    /// orientation.
+    pub no_rotate: bool,
 }
 
 impl Drop for VipsImage {
@@ -61,9 +70,88 @@ impl Drop for VipsImage {
     }
 }
 
+/// Expands to the `vips_thumbnail_*` call matching `$opts`. Each optional
+/// argument is a name/value pair in the C varargs list, so every
+/// combination needs its own call. `$call!` is a caller-local macro that
+/// appends the given varargs to the concrete thumbnail call.
+macro_rules! thumbnail_with_options {
+    ($opts:expr, $call:ident) => {
+        match ($opts.height, $opts.crop, $opts.size, $opts.no_rotate) {
+            (Some(h), Some(c), Some(s), false) => {
+                $call!(
+                    c"height".as_ptr(),
+                    h,
+                    c"crop".as_ptr(),
+                    c,
+                    c"size".as_ptr(),
+                    s
+                )
+            }
+            (Some(h), Some(c), None, false) => {
+                $call!(c"height".as_ptr(), h, c"crop".as_ptr(), c)
+            }
+            (Some(h), None, Some(s), false) => {
+                $call!(c"height".as_ptr(), h, c"size".as_ptr(), s)
+            }
+            (Some(h), None, None, false) => $call!(c"height".as_ptr(), h),
+            (None, Some(c), Some(s), false) => {
+                $call!(c"crop".as_ptr(), c, c"size".as_ptr(), s)
+            }
+            (None, Some(c), None, false) => $call!(c"crop".as_ptr(), c),
+            (None, None, Some(s), false) => $call!(c"size".as_ptr(), s),
+            (None, None, None, false) => $call!(),
+            (Some(h), Some(c), Some(s), true) => $call!(
+                c"height".as_ptr(),
+                h,
+                c"crop".as_ptr(),
+                c,
+                c"size".as_ptr(),
+                s,
+                c"no_rotate".as_ptr(),
+                1 as c_int
+            ),
+            (Some(h), Some(c), None, true) => $call!(
+                c"height".as_ptr(),
+                h,
+                c"crop".as_ptr(),
+                c,
+                c"no_rotate".as_ptr(),
+                1 as c_int
+            ),
+            (Some(h), None, Some(s), true) => $call!(
+                c"height".as_ptr(),
+                h,
+                c"size".as_ptr(),
+                s,
+                c"no_rotate".as_ptr(),
+                1 as c_int
+            ),
+            (Some(h), None, None, true) => {
+                $call!(c"height".as_ptr(), h, c"no_rotate".as_ptr(), 1 as c_int)
+            }
+            (None, Some(c), Some(s), true) => $call!(
+                c"crop".as_ptr(),
+                c,
+                c"size".as_ptr(),
+                s,
+                c"no_rotate".as_ptr(),
+                1 as c_int
+            ),
+            (None, Some(c), None, true) => {
+                $call!(c"crop".as_ptr(), c, c"no_rotate".as_ptr(), 1 as c_int)
+            }
+            (None, None, Some(s), true) => {
+                $call!(c"size".as_ptr(), s, c"no_rotate".as_ptr(), 1 as c_int)
+            }
+            (None, None, None, true) => $call!(c"no_rotate".as_ptr(), 1 as c_int),
+        }
+    };
+}
+
 impl VipsImage {
     /// Load an image from an in-memory buffer, first frame/page only
-    /// (the "probe" load — cheap, used to detect animation metadata).
+    /// (the "probe" load — cheap, used to detect animation metadata). The
+    /// bytes are copied, so `data` need not outlive the image.
     pub fn from_buffer(data: &[u8]) -> Result<Self, VipsError> {
         Self::from_buffer_with_option(data, "")
     }
@@ -80,10 +168,12 @@ impl VipsImage {
         let c_opts = CString::new(option_string).map_err(|_| {
             VipsError::LoadFailed("option string contained an interior NUL".to_string())
         })?;
+        let source = OwnedSource::copy_of(data).map_err(VipsError::LoadFailed)?;
+        // The loader takes its own reference to the source, so `source`
+        // may drop before the image does.
         let raw = unsafe {
-            ffi::vips_image_new_from_buffer(
-                data.as_ptr() as *const c_void,
-                data.len() as size_t,
+            ffi::vips_image_new_from_source(
+                source.ptr.as_ptr(),
                 c_opts.as_ptr(),
                 ptr::null::<c_char>(),
             )
@@ -120,6 +210,26 @@ impl VipsImage {
 
     pub fn has_alpha(&self) -> bool {
         unsafe { ffi::vips_image_hasalpha(self.ptr.as_ptr()) != 0 }
+    }
+
+    /// Return true when the decoder of this image can decode at reduced
+    /// size. This holds for JPEG and WebP. For those formats
+    /// `thumbnail_buffer` is faster than `thumbnail`. PNG and GIF decode at
+    /// full size either way, so `thumbnail_buffer` would only decode twice.
+    pub fn shrinks_on_load(&self) -> bool {
+        let mut out: *const c_char = ptr::null();
+        let rc = unsafe {
+            ffi::vips_image_get_string(self.ptr.as_ptr(), c"vips-loader".as_ptr(), &mut out)
+        };
+        if rc != 0 {
+            unsafe { ffi::vips_error_clear() };
+            return false;
+        }
+        if out.is_null() {
+            return false;
+        }
+        let loader = unsafe { std::ffi::CStr::from_ptr(out) }.to_bytes();
+        loader.starts_with(b"jpegload") || loader.starts_with(b"webpload")
     }
 
     /// Read an integer metadata field (e.g. "n-pages", "page-height").
@@ -215,14 +325,16 @@ impl VipsImage {
         save_result(rc, buf, len)
     }
 
-    /// Encode to AVIF (via the HEIF encoder). `quality` is 1-100.
+    /// Encode to AVIF (via the HEIF encoder). `quality` is 1-100. `effort`
+    /// is the encoder CPU effort. It runs from 0 (fastest, largest output)
+    /// to `MAX_AVIF_EFFORT` (slowest, smallest output).
     ///
     /// `compression` must be passed explicitly: vips_heifsave_buffer
     /// defaults to VIPS_FOREIGN_HEIF_COMPRESSION_HEVC (x265) when it's
     /// omitted, not AV1, silently producing HEVC-in-a-heif-container
     /// output mislabeled as AVIF (and erroring outright on runtimes,
     /// like Alpine's, that only ship an AV1 encoder plugin).
-    pub fn save_avif(&self, quality: i32, strip: bool) -> Result<Vec<u8>, VipsError> {
+    pub fn save_avif(&self, quality: i32, effort: u8, strip: bool) -> Result<Vec<u8>, VipsError> {
         const VIPS_FOREIGN_HEIF_COMPRESSION_AV1: i32 = 4;
         let mut buf: *mut c_void = ptr::null_mut();
         let mut len: size_t = 0;
@@ -235,6 +347,8 @@ impl VipsImage {
                 quality,
                 c"compression".as_ptr(),
                 VIPS_FOREIGN_HEIF_COMPRESSION_AV1,
+                c"effort".as_ptr(),
+                effort as c_int,
                 c"strip".as_ptr(),
                 bool_to_int(strip),
                 ptr::null::<c_char>(),
@@ -253,86 +367,65 @@ impl VipsImage {
         save_result(rc, buf, len)
     }
 
-    /// Resize to fit within `width` (and optionally the options' height)
-    /// via `vips_thumbnail_image`.
+    /// Render the whole image to a packed raster in memory. Rows follow in
+    /// order and bands interleave. Each sample uses the width of the image
+    /// band format, so the caller must check the length before it reads
+    /// the buffer as 8-bit samples.
+    pub fn write_to_memory(&self) -> Result<Vec<u8>, VipsError> {
+        let mut len: size_t = 0;
+        let buf = unsafe { ffi::vips_image_write_to_memory(self.ptr.as_ptr(), &mut len) };
+        if buf.is_null() {
+            return Err(VipsError::OperationFailed(last_vips_error()));
+        }
+        save_result(0, buf, len)
+    }
+
+    /// Resize to fit within `width` (and optionally the height in the
+    /// options) via `vips_thumbnail_image`. The image is already decoded at
+    /// full size. Use `thumbnail_buffer` to decode at reduced size.
     pub fn thumbnail(&self, width: i32, opts: ThumbnailOptions) -> Result<Self, VipsError> {
         let mut output: *mut ffi::VipsImage = ptr::null_mut();
-        let rc = unsafe {
-            match (opts.height, opts.crop, opts.size) {
-                (Some(h), Some(crop), Some(size)) => ffi::vips_thumbnail_image(
+        macro_rules! call {
+            ($($arg:expr),*) => {
+                ffi::vips_thumbnail_image(
                     self.ptr.as_ptr(),
                     &mut output,
                     width,
-                    c"height".as_ptr(),
-                    h,
-                    c"crop".as_ptr(),
-                    crop,
-                    c"size".as_ptr(),
-                    size,
+                    $($arg,)*
                     ptr::null::<c_char>(),
-                ),
-                (Some(h), Some(crop), None) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
+                )
+            };
+        }
+        let rc = unsafe { thumbnail_with_options!(opts, call) };
+        op_result(rc, output, VipsError::ResizeFailed)
+    }
+
+    /// Decode `data` and resize to fit within `width` in one step. This
+    /// calls `vips_thumbnail_source`. libvips tells the decoder the target
+    /// size, so JPEG and WebP decode at reduced size. JPEG uses scaling in
+    /// the DCT domain. The method decodes the first frame only. It copies
+    /// `data`, so `data` need not outlive the returned image. Do not use it
+    /// when a pixel operation must run on the full-size image before the
+    /// resize.
+    pub fn thumbnail_buffer(
+        data: &[u8],
+        width: i32,
+        opts: ThumbnailOptions,
+    ) -> Result<Self, VipsError> {
+        let source = OwnedSource::copy_of(data).map_err(VipsError::ResizeFailed)?;
+        let mut output: *mut ffi::VipsImage = ptr::null_mut();
+        macro_rules! call {
+            ($($arg:expr),*) => {
+                ffi::vips_thumbnail_source(
+                    source.ptr.as_ptr(),
                     &mut output,
                     width,
-                    c"height".as_ptr(),
-                    h,
-                    c"crop".as_ptr(),
-                    crop,
+                    $($arg,)*
                     ptr::null::<c_char>(),
-                ),
-                (Some(h), None, Some(size)) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
-                    &mut output,
-                    width,
-                    c"height".as_ptr(),
-                    h,
-                    c"size".as_ptr(),
-                    size,
-                    ptr::null::<c_char>(),
-                ),
-                (Some(h), None, None) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
-                    &mut output,
-                    width,
-                    c"height".as_ptr(),
-                    h,
-                    ptr::null::<c_char>(),
-                ),
-                (None, Some(crop), Some(size)) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
-                    &mut output,
-                    width,
-                    c"crop".as_ptr(),
-                    crop,
-                    c"size".as_ptr(),
-                    size,
-                    ptr::null::<c_char>(),
-                ),
-                (None, Some(crop), None) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
-                    &mut output,
-                    width,
-                    c"crop".as_ptr(),
-                    crop,
-                    ptr::null::<c_char>(),
-                ),
-                (None, None, Some(size)) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
-                    &mut output,
-                    width,
-                    c"size".as_ptr(),
-                    size,
-                    ptr::null::<c_char>(),
-                ),
-                (None, None, None) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
-                    &mut output,
-                    width,
-                    ptr::null::<c_char>(),
-                ),
-            }
-        };
+                )
+            };
+        }
+        let rc = unsafe { thumbnail_with_options!(opts, call) };
         op_result(rc, output, VipsError::ResizeFailed)
     }
 
@@ -358,6 +451,15 @@ impl VipsImage {
         let mut output: *mut ffi::VipsImage = ptr::null_mut();
         let rc =
             unsafe { ffi::vips_rot(self.ptr.as_ptr(), &mut output, angle, ptr::null::<c_char>()) };
+        op_result(rc, output, VipsError::OperationFailed)
+    }
+
+    /// Apply the EXIF orientation tag to the pixels and remove the tag. An
+    /// image without the tag comes back unchanged.
+    pub fn autorot(&self) -> Result<Self, VipsError> {
+        let mut output: *mut ffi::VipsImage = ptr::null_mut();
+        let rc =
+            unsafe { ffi::vips_autorot(self.ptr.as_ptr(), &mut output, ptr::null::<c_char>()) };
         op_result(rc, output, VipsError::OperationFailed)
     }
 
@@ -610,6 +712,35 @@ fn bool_to_int(v: bool) -> i32 {
     if v { 1 } else { 0 }
 }
 
+/// A `VipsSource` over a private copy of encoded image bytes. The copy
+/// lives in a reference-counted blob that decoders keep alive. A
+/// `VipsImage` can therefore outlive the source bytes.
+struct OwnedSource {
+    ptr: ptr::NonNull<ffi::VipsSource>,
+}
+
+impl OwnedSource {
+    fn copy_of(data: &[u8]) -> Result<Self, String> {
+        let blob =
+            unsafe { ffi::vips_blob_copy(data.as_ptr() as *const c_void, data.len() as size_t) };
+        if blob.is_null() {
+            return Err(last_vips_error());
+        }
+        let raw = unsafe { ffi::vips_source_new_from_blob(blob) };
+        // The source holds its own reference to the blob.
+        unsafe { ffi::vips_area_unref(blob as *mut ffi::VipsArea) };
+        ptr::NonNull::new(raw)
+            .map(|ptr| OwnedSource { ptr })
+            .ok_or_else(last_vips_error)
+    }
+}
+
+impl Drop for OwnedSource {
+    fn drop(&mut self) {
+        unsafe { ffi::g_object_unref(self.ptr.as_ptr() as *mut c_void) }
+    }
+}
+
 fn op_result(
     rc: i32,
     output: *mut ffi::VipsImage,
@@ -675,7 +806,9 @@ mod tests {
         init().expect("vips init");
         let data = fixture("test_4x4.png");
         let img = VipsImage::from_buffer(&data).expect("load png");
-        let avif = img.save_avif(80, true).expect("encode avif");
+        let avif = img
+            .save_avif(80, DEFAULT_AVIF_EFFORT, true)
+            .expect("encode avif");
         assert!(!avif.is_empty());
         // ISO BMFF ftyp box: the major brand must be "avif", confirming
         // AV1 compression was actually selected. Omitting `compression`
@@ -736,6 +869,27 @@ mod tests {
         assert_eq!(img.width(), 8);
         assert_eq!(img.height(), 4);
         assert_eq!(img.get_int("orientation"), Some(6));
+    }
+
+    #[test]
+    fn autorot_applies_the_exif_orientation_and_removes_the_tag() {
+        init().expect("vips init");
+        let data = fixture("exif_orientation.jpg");
+        let img = VipsImage::from_buffer(&data).expect("load exif-oriented jpeg");
+        assert_eq!((img.width(), img.height()), (8, 4));
+        let upright = img.autorot().expect("autorot");
+        assert_eq!((upright.width(), upright.height()), (4, 8));
+        assert_eq!(upright.get_int("orientation"), None);
+    }
+
+    #[test]
+    fn autorot_leaves_an_untagged_image_unchanged() {
+        init().expect("vips init");
+        let data = fixture("exif_orientation.jpg");
+        let img = VipsImage::from_buffer(&data).expect("load jpeg");
+        let upright = img.autorot().expect("autorot");
+        let again = upright.autorot().expect("autorot again");
+        assert_eq!((again.width(), again.height()), (4, 8));
     }
 
     #[test]
@@ -846,5 +1000,206 @@ mod tests {
         let tiled = overlay.tile_to_size(16, 12).expect("tile should succeed");
         assert_eq!(tiled.width(), 16);
         assert_eq!(tiled.height(), 12);
+    }
+
+    fn thumbnail_within_100px(img: &VipsImage, no_rotate: bool) -> VipsImage {
+        img.thumbnail(
+            100,
+            ThumbnailOptions {
+                height: Some(100),
+                crop: None,
+                size: Some(crate::ffi::VIPS_SIZE_DOWN),
+                no_rotate,
+            },
+        )
+        .expect("thumbnail")
+    }
+
+    fn assert_write_to_memory_matches_dimensions(img: &VipsImage) {
+        let bytes = img.write_to_memory().expect("write to memory");
+        let expected = img.width() as usize * img.height() as usize * img.bands() as usize;
+        assert_eq!(bytes.len(), expected);
+    }
+
+    #[test]
+    fn write_to_memory_returns_width_times_height_times_bands_bytes() {
+        init().expect("vips init");
+        let data = fixture("test_4x4.png");
+        let img = VipsImage::from_buffer(&data).expect("load png");
+        assert_write_to_memory_matches_dimensions(&img);
+    }
+
+    #[test]
+    fn write_to_memory_of_thumbnailed_image_matches_its_reported_dimensions() {
+        init().expect("vips init");
+        let data = fixture("bench_2000x1500.png");
+        let img = VipsImage::from_buffer(&data).expect("load png");
+        let small = thumbnail_within_100px(&img, false);
+        assert_eq!((small.width(), small.height()), (100, 75));
+        assert_write_to_memory_matches_dimensions(&small);
+    }
+
+    #[test]
+    fn write_to_memory_of_exif_rotated_thumbnail_reports_upright_dimensions() {
+        init().expect("vips init");
+        let data = fixture("exif_orientation.jpg");
+        let img = VipsImage::from_buffer(&data).expect("load jpeg");
+        assert_eq!((img.width(), img.height()), (8, 4));
+        let small = thumbnail_within_100px(&img, false);
+        assert_eq!((small.width(), small.height()), (4, 8));
+        assert_write_to_memory_matches_dimensions(&small);
+    }
+
+    #[test]
+    fn thumbnail_with_no_rotate_keeps_stored_pixel_orientation() {
+        init().expect("vips init");
+        let data = fixture("exif_orientation.jpg");
+        let img = VipsImage::from_buffer(&data).expect("load jpeg");
+        assert_eq!((img.width(), img.height()), (8, 4));
+        let small = thumbnail_within_100px(&img, true);
+        assert_eq!((small.width(), small.height()), (8, 4));
+        assert_write_to_memory_matches_dimensions(&small);
+    }
+
+    #[test]
+    fn thumbnail_with_no_rotate_false_still_applies_exif_orientation() {
+        init().expect("vips init");
+        let data = fixture("exif_orientation.jpg");
+        let img = VipsImage::from_buffer(&data).expect("load jpeg");
+        let small = img
+            .thumbnail(
+                100,
+                ThumbnailOptions {
+                    size: Some(crate::ffi::VIPS_SIZE_DOWN),
+                    ..Default::default()
+                },
+            )
+            .expect("thumbnail");
+        assert_eq!((small.width(), small.height()), (4, 8));
+    }
+
+    #[test]
+    fn write_to_memory_returns_error_when_pixel_decode_fails() {
+        init().expect("vips init");
+        let mut data = fixture("bench_2000x1500.png");
+        // Cut the file inside the pixel data. The header still loads. By
+        // default libvips accepts a short PNG, and its tolerance differs
+        // between versions. With `fail_on=warning` the cut is an error on
+        // every version, and it surfaces when `write_to_memory` decodes.
+        data.truncate(data.len() * 6 / 10);
+        let img = VipsImage::from_buffer_with_option(&data, "fail_on=warning")
+            .expect("the header still loads");
+        assert!(matches!(
+            img.write_to_memory(),
+            Err(VipsError::OperationFailed(_))
+        ));
+    }
+
+    fn down_100px_options(no_rotate: bool) -> ThumbnailOptions {
+        ThumbnailOptions {
+            height: Some(100),
+            size: Some(crate::ffi::VIPS_SIZE_DOWN),
+            no_rotate,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn thumbnail_buffer_matches_thumbnail_dimensions_for_exif_source() {
+        init().expect("vips init");
+        let data = fixture("exif_orientation.jpg");
+        let img = VipsImage::from_buffer(&data).expect("load jpeg");
+        for no_rotate in [false, true] {
+            let opts = down_100px_options(no_rotate);
+            let full = img.thumbnail(100, opts).expect("thumbnail");
+            let direct = VipsImage::thumbnail_buffer(&data, 100, opts).expect("thumbnail_buffer");
+            assert_eq!(
+                (direct.width(), direct.height()),
+                (full.width(), full.height()),
+                "no_rotate={no_rotate}"
+            );
+        }
+    }
+
+    #[test]
+    fn thumbnail_buffer_of_large_jpeg_matches_thumbnail_dimensions() {
+        init().expect("vips init");
+        // 2000x1500 -> 100 wide is a shrink factor of 20, so the JPEG loader
+        // decodes at 1/8 scale and libvips resizes the rest of the way.
+        let png_bytes = fixture("bench_2000x1500.png");
+        let png = VipsImage::from_buffer(&png_bytes).expect("load png");
+        let jpeg = png.save_jpeg(85, true).expect("encode jpeg");
+        let opts = down_100px_options(false);
+        let jpeg_img = VipsImage::from_buffer(&jpeg).expect("load jpeg");
+        let full = jpeg_img.thumbnail(100, opts).expect("thumbnail");
+        let direct = VipsImage::thumbnail_buffer(&jpeg, 100, opts).expect("thumbnail_buffer");
+        assert_eq!(
+            (direct.width(), direct.height()),
+            (full.width(), full.height())
+        );
+        assert_eq!((direct.width(), direct.height()), (100, 75));
+    }
+
+    #[test]
+    fn thumbnail_buffer_of_garbage_returns_resize_failed() {
+        init().expect("vips init");
+        assert!(matches!(
+            VipsImage::thumbnail_buffer(b"not an image", 100, ThumbnailOptions::default()),
+            Err(VipsError::ResizeFailed(_))
+        ));
+    }
+
+    #[test]
+    fn from_buffer_image_outlives_its_source_bytes() {
+        init().expect("vips init");
+        let mut data = fixture("bench_2000x1500.png");
+        let img = VipsImage::from_buffer(&data).expect("load png");
+        data.fill(0);
+        drop(data);
+        let out = img
+            .save_jpeg(85, true)
+            .expect("encode after source overwritten");
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn thumbnail_buffer_image_outlives_its_source_bytes() {
+        init().expect("vips init");
+        let mut data = fixture("bench_2000x1500.png");
+        let small = VipsImage::thumbnail_buffer(&data, 100, ThumbnailOptions::default())
+            .expect("thumbnail_buffer");
+        data.fill(0);
+        drop(data);
+        let out = small
+            .save_jpeg(85, true)
+            .expect("encode after source overwritten");
+        assert!(!out.is_empty());
+        assert_eq!(small.width(), 100);
+    }
+
+    #[test]
+    fn shrinks_on_load_is_true_for_jpeg_and_webp_only() {
+        init().expect("vips init");
+        for (name, expected) in [
+            ("exif_orientation.jpg", true),
+            ("static.webp", true),
+            ("test_4x4.png", false),
+            ("loading.gif", false),
+        ] {
+            let data = fixture(name);
+            let img = VipsImage::from_buffer(&data).expect("load");
+            assert_eq!(img.shrinks_on_load(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn save_avif_accepts_the_full_effort_range() {
+        init().expect("vips init");
+        let data = fixture("test_4x4.png");
+        let img = VipsImage::from_buffer(&data).expect("load png");
+        for effort in [0, DEFAULT_AVIF_EFFORT, MAX_AVIF_EFFORT] {
+            let avif = img.save_avif(80, effort, true).expect("encode avif");
+            assert_eq!(&avif[8..12], b"avif", "effort={effort}");
+        }
     }
 }
