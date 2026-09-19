@@ -3,7 +3,7 @@ use std::ptr;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use libc::{c_char, size_t};
+use libc::{c_char, c_int, size_t};
 
 use crate::error::{VipsError, last_vips_error};
 use crate::ffi;
@@ -53,6 +53,9 @@ pub struct ThumbnailOptions {
     pub crop: Option<i32>,
     /// Size constraint (`ffi::VIPS_SIZE_*`).
     pub size: Option<i32>,
+    /// Ignore the EXIF orientation tag. The output keeps the stored pixel
+    /// orientation.
+    pub no_rotate: bool,
 }
 
 impl Drop for VipsImage {
@@ -257,83 +260,71 @@ impl VipsImage {
     /// via `vips_thumbnail_image`.
     pub fn thumbnail(&self, width: i32, opts: ThumbnailOptions) -> Result<Self, VipsError> {
         let mut output: *mut ffi::VipsImage = ptr::null_mut();
+        // Each optional argument is a name/value pair in the C varargs list,
+        // so every combination needs its own call. `call!` appends the
+        // `no_rotate` pair to the pairs that the arm passes.
+        macro_rules! call {
+            ($($pair:expr),*) => {
+                if opts.no_rotate {
+                    ffi::vips_thumbnail_image(
+                        self.ptr.as_ptr(),
+                        &mut output,
+                        width,
+                        $($pair,)*
+                        c"no_rotate".as_ptr(),
+                        1 as c_int,
+                        ptr::null::<c_char>(),
+                    )
+                } else {
+                    ffi::vips_thumbnail_image(
+                        self.ptr.as_ptr(),
+                        &mut output,
+                        width,
+                        $($pair,)*
+                        ptr::null::<c_char>(),
+                    )
+                }
+            };
+        }
         let rc = unsafe {
             match (opts.height, opts.crop, opts.size) {
-                (Some(h), Some(crop), Some(size)) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
-                    &mut output,
-                    width,
+                (Some(h), Some(crop), Some(size)) => call!(
                     c"height".as_ptr(),
                     h,
                     c"crop".as_ptr(),
                     crop,
                     c"size".as_ptr(),
-                    size,
-                    ptr::null::<c_char>(),
+                    size
                 ),
-                (Some(h), Some(crop), None) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
-                    &mut output,
-                    width,
-                    c"height".as_ptr(),
-                    h,
-                    c"crop".as_ptr(),
-                    crop,
-                    ptr::null::<c_char>(),
-                ),
-                (Some(h), None, Some(size)) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
-                    &mut output,
-                    width,
-                    c"height".as_ptr(),
-                    h,
-                    c"size".as_ptr(),
-                    size,
-                    ptr::null::<c_char>(),
-                ),
-                (Some(h), None, None) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
-                    &mut output,
-                    width,
-                    c"height".as_ptr(),
-                    h,
-                    ptr::null::<c_char>(),
-                ),
-                (None, Some(crop), Some(size)) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
-                    &mut output,
-                    width,
-                    c"crop".as_ptr(),
-                    crop,
-                    c"size".as_ptr(),
-                    size,
-                    ptr::null::<c_char>(),
-                ),
-                (None, Some(crop), None) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
-                    &mut output,
-                    width,
-                    c"crop".as_ptr(),
-                    crop,
-                    ptr::null::<c_char>(),
-                ),
-                (None, None, Some(size)) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
-                    &mut output,
-                    width,
-                    c"size".as_ptr(),
-                    size,
-                    ptr::null::<c_char>(),
-                ),
-                (None, None, None) => ffi::vips_thumbnail_image(
-                    self.ptr.as_ptr(),
-                    &mut output,
-                    width,
-                    ptr::null::<c_char>(),
-                ),
+                (Some(h), Some(crop), None) => {
+                    call!(c"height".as_ptr(), h, c"crop".as_ptr(), crop)
+                }
+                (Some(h), None, Some(size)) => {
+                    call!(c"height".as_ptr(), h, c"size".as_ptr(), size)
+                }
+                (Some(h), None, None) => call!(c"height".as_ptr(), h),
+                (None, Some(crop), Some(size)) => {
+                    call!(c"crop".as_ptr(), crop, c"size".as_ptr(), size)
+                }
+                (None, Some(crop), None) => call!(c"crop".as_ptr(), crop),
+                (None, None, Some(size)) => call!(c"size".as_ptr(), size),
+                (None, None, None) => call!(),
             }
         };
         op_result(rc, output, VipsError::ResizeFailed)
+    }
+
+    /// Render the whole image to a packed raster in memory. Rows follow in
+    /// order and bands interleave. Each sample uses the width of the image
+    /// band format, so the caller must check the length before it reads
+    /// the buffer as 8-bit samples.
+    pub fn write_to_memory(&self) -> Result<Vec<u8>, VipsError> {
+        let mut len: size_t = 0;
+        let buf = unsafe { ffi::vips_image_write_to_memory(self.ptr.as_ptr(), &mut len) };
+        if buf.is_null() {
+            return Err(VipsError::OperationFailed(last_vips_error()));
+        }
+        save_result(0, buf, len)
     }
 
     /// Extract a rectangular sub-region.
@@ -846,5 +837,118 @@ mod tests {
         let tiled = overlay.tile_to_size(16, 12).expect("tile should succeed");
         assert_eq!(tiled.width(), 16);
         assert_eq!(tiled.height(), 12);
+    }
+
+    fn options_down_to_100px(no_rotate: bool) -> ThumbnailOptions {
+        ThumbnailOptions {
+            height: Some(100),
+            size: Some(crate::ffi::VIPS_SIZE_DOWN),
+            no_rotate,
+            ..Default::default()
+        }
+    }
+
+    fn thumbnail_within_100px(img: &VipsImage, no_rotate: bool) -> VipsImage {
+        img.thumbnail(100, options_down_to_100px(no_rotate))
+            .expect("thumbnail")
+    }
+
+    fn assert_write_to_memory_matches_dimensions(img: &VipsImage) {
+        let bytes = img.write_to_memory().expect("write to memory");
+        let expected = img.width() as usize * img.height() as usize * img.bands() as usize;
+        assert_eq!(bytes.len(), expected);
+    }
+
+    #[test]
+    fn write_to_memory_returns_width_times_height_times_bands_bytes() {
+        init().expect("vips init");
+        let data = fixture("test_4x4.png");
+        let img = VipsImage::from_buffer(&data).expect("load png");
+        assert_write_to_memory_matches_dimensions(&img);
+    }
+
+    #[test]
+    fn write_to_memory_of_thumbnailed_image_matches_its_reported_dimensions() {
+        init().expect("vips init");
+        let data = fixture("bench_2000x1500.png");
+        let img = VipsImage::from_buffer(&data).expect("load png");
+        let small = thumbnail_within_100px(&img, false);
+        assert_eq!((small.width(), small.height()), (100, 75));
+        assert_write_to_memory_matches_dimensions(&small);
+    }
+
+    #[test]
+    fn write_to_memory_of_exif_rotated_thumbnail_reports_upright_dimensions() {
+        init().expect("vips init");
+        let data = fixture("exif_orientation.jpg");
+        let img = VipsImage::from_buffer(&data).expect("load jpeg");
+        assert_eq!((img.width(), img.height()), (8, 4));
+        let small = thumbnail_within_100px(&img, false);
+        assert_eq!((small.width(), small.height()), (4, 8));
+        assert_write_to_memory_matches_dimensions(&small);
+    }
+
+    #[test]
+    fn thumbnail_with_no_rotate_keeps_stored_pixel_orientation() {
+        init().expect("vips init");
+        let data = fixture("exif_orientation.jpg");
+        let img = VipsImage::from_buffer(&data).expect("load jpeg");
+        assert_eq!((img.width(), img.height()), (8, 4));
+        let small = thumbnail_within_100px(&img, true);
+        assert_eq!((small.width(), small.height()), (8, 4));
+        assert_write_to_memory_matches_dimensions(&small);
+    }
+
+    #[test]
+    fn thumbnail_with_no_rotate_false_still_applies_exif_orientation() {
+        init().expect("vips init");
+        let data = fixture("exif_orientation.jpg");
+        let img = VipsImage::from_buffer(&data).expect("load jpeg");
+        let small = thumbnail_within_100px(&img, false);
+        assert_eq!((small.width(), small.height()), (4, 8));
+    }
+
+    #[test]
+    fn thumbnail_with_no_rotate_works_for_every_option_combination() {
+        init().expect("vips init");
+        // The stored pixels are 8x4 (landscape). The EXIF tag turns them
+        // upright (portrait).
+        let data = fixture("exif_orientation.jpg");
+        let img = VipsImage::from_buffer(&data).expect("load jpeg");
+        for height in [None, Some(100)] {
+            for crop in [None, Some(crate::ffi::VIPS_INTERESTING_CENTRE)] {
+                for size in [None, Some(crate::ffi::VIPS_SIZE_DOWN)] {
+                    let opts = ThumbnailOptions {
+                        height,
+                        crop,
+                        size,
+                        no_rotate: false,
+                    };
+                    let rotated = img.thumbnail(100, opts).expect("thumbnail");
+                    assert!(rotated.width() <= rotated.height(), "{opts:?}");
+                    let opts = ThumbnailOptions {
+                        no_rotate: true,
+                        ..opts
+                    };
+                    let stored = img.thumbnail(100, opts).expect("thumbnail");
+                    assert!(stored.width() >= stored.height(), "{opts:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn write_to_memory_returns_error_when_pixel_decode_fails() {
+        init().expect("vips init");
+        let mut data = fixture("static.webp");
+        // Byte 26 holds the low byte of the VP8 frame width. The header
+        // still loads, but the pixel data no longer matches it, so the
+        // decode fails when `write_to_memory` reads the pixels.
+        data[26] = 0xFF;
+        let img = VipsImage::from_buffer(&data).expect("the header still loads");
+        assert!(matches!(
+            img.write_to_memory(),
+            Err(VipsError::OperationFailed(_))
+        ));
     }
 }

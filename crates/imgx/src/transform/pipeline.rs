@@ -358,6 +358,7 @@ pub fn transform(
                     height: Some(th),
                     crop: Some(map_gravity_to_crop(tp.gravity)),
                     size: Some(consts::VIPS_SIZE_DOWN),
+                    ..Default::default()
                 };
                 current = current.thumbnail(tw, opts)?;
             }

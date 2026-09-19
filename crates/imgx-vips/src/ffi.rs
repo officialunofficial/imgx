@@ -47,6 +47,12 @@ unsafe extern "C" {
         ...
     ) -> *mut VipsImage;
 
+    // -- raster export --
+    // Signature checked against libvips 8.18.4 `vips/image.h`. Not varargs.
+    // Returns a g_malloc buffer of `*size` bytes, or NULL on error. The caller
+    // frees it with g_free.
+    pub fn vips_image_write_to_memory(in_: *mut VipsImage, size: *mut size_t) -> *mut c_void;
+
     // -- header / metadata --
     pub fn vips_image_get_width(image: *const VipsImage) -> c_int;
     pub fn vips_image_get_height(image: *const VipsImage) -> c_int;
