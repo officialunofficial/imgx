@@ -300,10 +300,12 @@ async fn handle_image_request(
             )));
         }
     };
-    if tp.validate().is_err() {
-        return error_response(HttpError::unprocessable_entity(Some(
-            "transform parameters out of range".to_string(),
-        )));
+    if let Err(e) = tp.validate() {
+        let detail = match e {
+            params::ParseError::DrawWithThumbhash => e.to_string(),
+            _ => "transform parameters out of range".to_string(),
+        };
+        return error_response(HttpError::unprocessable_entity(Some(detail)));
     }
     // Gap 11 -- `draw` overlays (docs/CLOUDFLARE_PARITY.md): the array
     // syntax parsing and compositing math
@@ -1086,6 +1088,7 @@ mod tests {
 
     const CORRUPT_JPEG_ORIGIN: &str =
         "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 12\r\n\r\nnot an image";
+    const THUMBHASH_DRAW_422_BODY: &str = "{\"error\":{\"status\":422,\"message\":\"Unprocessable Entity\",\"detail\":\"draw overlays cannot be combined with format=thumbhash\"}}";
     const THUMBHASH_422_BODY: &str = "{\"error\":{\"status\":422,\"message\":\"Unprocessable Entity\",\"detail\":\"source image could not be processed\"}}";
 
     #[tokio::test]
@@ -1266,6 +1269,122 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(headers.get(header::LOCATION).is_none());
         assert_eq!(String::from_utf8(body).unwrap(), THUMBHASH_422_BODY);
+    }
+
+    /// An app whose origin serves `bytes` as they are.
+    async fn state_with_bytes_origin(bytes: Vec<u8>) -> Arc<AppState> {
+        init_vips();
+        let mut cfg = Config::defaults();
+        cfg.origin.base_url = serve_fixture_repeatedly(bytes).await;
+        Arc::new(AppState::new(cfg))
+    }
+
+    /// Real fixtures, cut inside their first frame. A default libvips load
+    /// decodes each one to a partly blank image without an error.
+    fn truncated_origin_sources() -> Vec<(&'static str, Vec<u8>)> {
+        // The re-encode below uses libvips. It needs the init first.
+        init_vips();
+        let png = fixture("bench_2000x1500.png");
+        let jpeg = imgx_vips::VipsImage::from_buffer(&png)
+            .unwrap()
+            .save_jpeg(85, true)
+            .unwrap();
+        let gif = fixture("loading.gif");
+        vec![
+            ("png", png[..png.len() / 2].to_vec()),
+            ("jpeg", jpeg[..jpeg.len() / 2].to_vec()),
+            ("gif", gif[..355].to_vec()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn thumbhash_of_truncated_source_returns_422_envelope_not_origin_bytes() {
+        for (label, bytes) in truncated_origin_sources() {
+            let router = build_router(state_with_bytes_origin(bytes.clone()).await);
+            let (status, headers, body) =
+                get_full(router, "/image/format=thumbhash/photo.png", &[]).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}");
+            assert_eq!(
+                headers.get(header::CONTENT_TYPE).unwrap(),
+                "application/json",
+                "{label}"
+            );
+            assert_ne!(body, bytes, "{label}: served the raw origin bytes");
+            assert_eq!(
+                String::from_utf8(body).unwrap(),
+                THUMBHASH_422_BODY,
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn thumbhash_of_truncated_source_is_never_cached() {
+        for (label, bytes) in truncated_origin_sources() {
+            let state = state_with_bytes_origin(bytes).await;
+            let router = build_router(Arc::clone(&state));
+            for expected_misses in [1.0, 2.0] {
+                let (status, _) = get(router.clone(), "/image/format=thumbhash/photo.png").await;
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}");
+                assert_eq!(
+                    metric_value(&state, "imgx_cache_misses_total"),
+                    expected_misses,
+                    "{label}"
+                );
+                assert_eq!(
+                    metric_value(&state, "imgx_cache_hits_total"),
+                    0.0,
+                    "{label}"
+                );
+                assert_eq!(state.cache.size().await, 0, "{label}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn thumbhash_of_truncated_source_ignores_onerror_redirect() {
+        for (label, bytes) in truncated_origin_sources() {
+            let router = build_router(state_with_bytes_origin(bytes).await);
+            let (status, headers, body) = get_full(
+                router,
+                "/image/format=thumbhash,onerror=redirect/photo.png",
+                &[],
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}");
+            assert!(headers.get(header::LOCATION).is_none(), "{label}");
+            assert_eq!(
+                String::from_utf8(body).unwrap(),
+                THUMBHASH_422_BODY,
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_format_of_truncated_source_is_still_served_and_cached() {
+        // Control: only `format=thumbhash` loads strictly. Every other
+        // format still encodes the partly decoded pixels and caches the
+        // result, as before.
+        for (label, bytes) in truncated_origin_sources() {
+            for (path, content_type) in [
+                ("/image/format=png/photo.png", "image/png"),
+                ("/image/format=jpeg,w=100/photo.png", "image/jpeg"),
+                ("/image/format=json/photo.png", "application/json"),
+            ] {
+                let state = state_with_bytes_origin(bytes.clone()).await;
+                let router = build_router(Arc::clone(&state));
+                let (status, headers, body) = get_full(router, path, &[]).await;
+                assert_eq!(status, StatusCode::OK, "{label} {path}");
+                assert_eq!(
+                    headers.get(header::CONTENT_TYPE).unwrap(),
+                    content_type,
+                    "{label} {path}"
+                );
+                assert_ne!(body, bytes, "{label} {path}: served the raw origin bytes");
+                assert_eq!(state.cache.size().await, 1, "{label} {path}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1490,7 +1609,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(body.contains("out of range"));
+        assert_eq!(body, THUMBHASH_DRAW_422_BODY);
         assert_eq!(metric_value(&state, "imgx_cache_misses_total"), 0.0);
     }
 
@@ -1503,8 +1622,17 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(body.contains("out of range"));
+        assert_eq!(body, THUMBHASH_DRAW_422_BODY);
         assert!(!body.contains("draw overlays are not enabled"));
+    }
+
+    #[tokio::test]
+    async fn invalid_draw_for_other_formats_keeps_the_generic_422_message() {
+        let router = build_router(test_state());
+        let (status, body) = get(router, "/image/format=webp,draw.0.width=10/photo.jpg").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("transform parameters out of range"));
+        assert!(!body.contains("thumbhash"));
     }
 
     #[tokio::test]

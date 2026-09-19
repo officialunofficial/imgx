@@ -11,6 +11,10 @@ use crate::ffi;
 static VIPS_INIT: Once = Once::new();
 static VIPS_INIT_OK: AtomicBool = AtomicBool::new(false);
 
+/// Load option that sets the `fail_on` property of the libvips loader to
+/// `VIPS_FAIL_ON_ERROR` (nickname `error`, from `vips/foreign.h`).
+const STRICT_OPTION: &str = "fail_on=error";
+
 /// Initialize libvips. Safe to call more than once (subsequent calls are
 /// no-ops); mirrors `bindings.zig`'s `init()`. Must be paired with at most
 /// one `shutdown()` call, from `main`, never from tests.
@@ -161,6 +165,24 @@ impl VipsImage {
     /// multi-page formats (GIF/animated WebP).
     pub fn from_buffer_animated(data: &[u8], n: i32) -> Result<Self, VipsError> {
         let option = format!("n={n}");
+        Self::from_buffer_with_option(data, &option)
+    }
+
+    /// Load an image from an in-memory buffer, first frame/page only, and
+    /// fail on the first decode error. `from_buffer` uses the libvips
+    /// default `fail_on=none`. A truncated or partly corrupt source then
+    /// decodes without an error, and the missing pixels come back blank or
+    /// partial. This load sets `fail_on=error`, so reading such a source
+    /// returns an error instead. The error can appear here or when a later
+    /// call, such as `write_to_memory`, reads the pixels.
+    pub fn from_buffer_strict(data: &[u8]) -> Result<Self, VipsError> {
+        Self::from_buffer_with_option(data, STRICT_OPTION)
+    }
+
+    /// Like `from_buffer_animated`, with the strictness of
+    /// `from_buffer_strict`.
+    pub fn from_buffer_animated_strict(data: &[u8], n: i32) -> Result<Self, VipsError> {
+        let option = format!("n={n},{STRICT_OPTION}");
         Self::from_buffer_with_option(data, &option)
     }
 
@@ -1201,5 +1223,174 @@ mod tests {
             let avif = img.save_avif(80, effort, true).expect("encode avif");
             assert_eq!(&avif[8..12], b"avif", "effort={effort}");
         }
+    }
+
+    /// Cut points that fall inside the pixel data of the first frame, or
+    /// inside its headers, of each fixture. Truncated JPEG and WebP sources
+    /// also come from a re-encoded copy of the large PNG fixture, so the cut
+    /// lands inside real entropy-coded data.
+    fn truncated_sources() -> Vec<(String, Vec<u8>)> {
+        let big_png = fixture("bench_2000x1500.png");
+        let big = VipsImage::from_buffer(&big_png).expect("load bench png");
+        let big_jpeg = big.save_jpeg(85, true).expect("encode jpeg");
+        let big_webp = big.save_webp(80, true).expect("encode webp");
+        let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut cut = |label: &str, data: &[u8], at: usize| {
+            cases.push((format!("{label} cut at {at}"), data[..at].to_vec()));
+        };
+        for at in [big_png.len() / 4, big_png.len() / 2, big_png.len() * 3 / 4] {
+            cut("bench_2000x1500.png", &big_png, at);
+        }
+        let cmyk = fixture("cmyk.jpg");
+        cut("cmyk.jpg", &cmyk, 281);
+        let exif = fixture("exif_orientation.jpg");
+        cut("exif_orientation.jpg", &exif, 657);
+        for at in [big_jpeg.len() / 4, big_jpeg.len() / 2] {
+            cut("re-encoded jpeg", &big_jpeg, at);
+        }
+        let gif = fixture("loading.gif");
+        for at in [101, 355, 800] {
+            cut("loading.gif", &gif, at);
+        }
+        let webp = fixture("static.webp");
+        cut("static.webp", &webp, 32);
+        cut("static.webp", &webp, 63);
+        for at in [big_webp.len() / 2, big_webp.len() - 100] {
+            cut("re-encoded webp", &big_webp, at);
+        }
+        cases
+    }
+
+    /// Sources whose tail is overwritten, not cut, so the length stays
+    /// valid.
+    fn corrupted_tail_sources() -> Vec<(String, Vec<u8>)> {
+        let big_png = fixture("bench_2000x1500.png");
+        let big = VipsImage::from_buffer(&big_png).expect("load bench png");
+        let big_jpeg = big.save_jpeg(85, true).expect("encode jpeg");
+        [
+            ("bench_2000x1500.png", big_png),
+            ("re-encoded jpeg", big_jpeg),
+        ]
+        .into_iter()
+        .map(|(label, mut bytes)| {
+            let from = bytes.len() / 2;
+            bytes[from..].fill(0xAA);
+            (format!("{label} tail overwritten from {from}"), bytes)
+        })
+        .collect()
+    }
+
+    fn valid_fixtures() -> Vec<(&'static str, Vec<u8>)> {
+        [
+            "test_4x4.png",
+            "alpha_4x4.png",
+            "bench_2000x1500.png",
+            "cmyk.jpg",
+            "exif_orientation.jpg",
+            "loading.gif",
+            "static.webp",
+        ]
+        .into_iter()
+        .map(|name| (name, fixture(name)))
+        .collect()
+    }
+
+    /// Fail with the label of every source that a strict load decodes to
+    /// pixels without an error.
+    fn assert_strict_read_fails(sources: Vec<(String, Vec<u8>)>) {
+        let decoded: Vec<String> = sources
+            .into_iter()
+            .filter(|(_, data)| {
+                VipsImage::from_buffer_strict(data)
+                    .and_then(|img| img.write_to_memory())
+                    .is_ok()
+            })
+            .map(|(label, _)| label)
+            .collect();
+        assert!(
+            decoded.is_empty(),
+            "strict load returned pixels for: {decoded:#?}"
+        );
+    }
+
+    #[test]
+    fn strict_load_of_truncated_source_returns_error_when_reading_pixels() {
+        init().expect("vips init");
+        assert_strict_read_fails(truncated_sources());
+    }
+
+    #[test]
+    fn strict_load_of_source_with_corrupted_tail_returns_error_when_reading_pixels() {
+        init().expect("vips init");
+        assert_strict_read_fails(corrupted_tail_sources());
+    }
+
+    #[test]
+    fn strict_load_of_valid_source_matches_the_default_load() {
+        init().expect("vips init");
+        for (name, data) in valid_fixtures() {
+            let lax = VipsImage::from_buffer(&data).expect(name);
+            let strict = VipsImage::from_buffer_strict(&data).expect(name);
+            assert_eq!(
+                (strict.width(), strict.height(), strict.bands()),
+                (lax.width(), lax.height(), lax.bands()),
+                "{name}"
+            );
+            assert_eq!(strict.n_pages(), lax.n_pages(), "{name}");
+            assert_eq!(
+                strict.write_to_memory().expect(name),
+                lax.write_to_memory().expect(name),
+                "{name}: strict and default loads decode different pixels"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_animated_load_of_truncated_gif_returns_error_when_reading_pixels() {
+        init().expect("vips init");
+        let gif = fixture("loading.gif");
+        let decoded: Vec<usize> = [101, 355, 800]
+            .into_iter()
+            .filter(|&at| {
+                VipsImage::from_buffer_animated_strict(&gif[..at], -1)
+                    .and_then(|img| img.write_to_memory())
+                    .is_ok()
+            })
+            .collect();
+        assert!(
+            decoded.is_empty(),
+            "strict animated load returned pixels for loading.gif cut at {decoded:?}"
+        );
+    }
+
+    #[test]
+    fn strict_animated_load_of_valid_gif_matches_the_default_animated_load() {
+        init().expect("vips init");
+        let gif = fixture("loading.gif");
+        let lax = VipsImage::from_buffer_animated(&gif, -1).expect("load gif");
+        let strict = VipsImage::from_buffer_animated_strict(&gif, -1).expect("load gif");
+        assert_eq!(
+            (strict.width(), strict.height()),
+            (lax.width(), lax.height())
+        );
+        assert_eq!(strict.n_pages(), lax.n_pages());
+        assert_eq!(
+            strict.write_to_memory().expect("pixels"),
+            lax.write_to_memory().expect("pixels")
+        );
+    }
+
+    #[test]
+    fn default_load_of_truncated_png_still_returns_pixels() {
+        init().expect("vips init");
+        // Pins the behaviour of every output format other than thumbhash:
+        // the default load stays lenient, so a partly decoded PNG still
+        // gives an image.
+        let data = fixture("bench_2000x1500.png");
+        let img = VipsImage::from_buffer(&data[..data.len() / 2]).expect("header loads");
+        let pixels = img
+            .write_to_memory()
+            .expect("default load tolerates the cut");
+        assert_eq!(pixels.len(), 2000 * 1500 * 3);
     }
 }

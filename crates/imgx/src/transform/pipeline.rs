@@ -115,10 +115,14 @@ pub fn transform(
     let settings = settings.unwrap_or_default();
     let encode_options = EncodeOptions::new(tp, settings.encoder);
     let compression_fast = tp.compression == Some(CompressionMode::Fast);
+    // Only `format=thumbhash` loads the source strictly (INV-19): a hash of
+    // the blank pixels of a partly decoded source is wrong. Every other
+    // format keeps the default load.
+    let strict = tp.format == Some(OutputFormat::Thumbhash);
 
     // -- PROBE --
     // Load first frame only (cheap) to detect animation metadata.
-    let mut current = VipsImage::from_buffer(input_data)?;
+    let mut current = load_first_frame(input_data, strict)?;
 
     // Captured for `format=json`'s "original" stats (gap 5) -- the raw
     // probed dimensions before any rotate/resize/crop touches them.
@@ -187,9 +191,9 @@ pub fn transform(
         let effective_pages = effective_pages.expect("invariant: animated_output implies Some");
         let n_pages = n_pages.expect("invariant: animated_output implies Some");
         current = if effective_pages < n_pages {
-            VipsImage::from_buffer_animated(input_data, effective_pages)?
+            load_pages(input_data, effective_pages, strict)?
         } else {
-            VipsImage::from_buffer_animated(input_data, -1)?
+            load_pages(input_data, -1, strict)?
         };
     }
 
@@ -199,7 +203,7 @@ pub fn transform(
     // in this case, since DECIDE required tp.frame.is_none()).
     if let (Some(frame_idx), true) = (tp.frame, is_animated) {
         if !animated_output {
-            current = VipsImage::from_buffer_animated(input_data, -1)?;
+            current = load_pages(input_data, -1, strict)?;
         }
         let page_height = page_height_of(&current).unwrap_or_else(|| current.height());
         let actual_pages = n_pages.unwrap_or(1);
@@ -655,6 +659,28 @@ fn thumbhash_rgba(image: &VipsImage) -> Result<(u32, u32, Vec<u8>), TransformErr
     Ok((width, height, rgba))
 }
 
+/// Load the first frame of `data`. With `strict`, libvips stops at the
+/// first decode error instead of returning blank pixels for the part of the
+/// source that it cannot decode. The pixels are read later from this same
+/// image, so the strict setting covers them.
+fn load_first_frame(data: &[u8], strict: bool) -> Result<VipsImage, VipsError> {
+    if strict {
+        VipsImage::from_buffer_strict(data)
+    } else {
+        VipsImage::from_buffer(data)
+    }
+}
+
+/// Load `n` pages of `data` (`n = -1` loads all), with the same `strict`
+/// meaning as `load_first_frame`.
+fn load_pages(data: &[u8], n: i32, strict: bool) -> Result<VipsImage, VipsError> {
+    if strict {
+        VipsImage::from_buffer_animated_strict(data, n)
+    } else {
+        VipsImage::from_buffer_animated(data, n)
+    }
+}
+
 /// `n-pages` metadata, guarding against the < 1 sentinel the same way
 /// bindings.zig's `getNPages` does.
 fn n_pages_of(img: &VipsImage) -> Option<i32> {
@@ -693,8 +719,14 @@ fn bg_color_from_params(background: Option<[u8; 3]>) -> [f64; 3] {
 /// Return true when no stage before the resize changes `current`. The
 /// resize can then decode the source bytes again, at reduced size. Keep this
 /// list in step with the stages of `transform` that run before the resize.
+///
+/// `format=thumbhash` never reads the source again. That second decode uses
+/// the default lenient load, so a truncated JPEG or WebP would give blank
+/// pixels and a wrong hash. The strict load of `current` already covers the
+/// full-size resize (INV-19).
 fn resize_reads_source(tp: &TransformParams, animated_output: bool) -> bool {
-    !animated_output
+    tp.format != Some(OutputFormat::Thumbhash)
+        && !animated_output
         && tp.frame.is_none()
         && tp.trim.is_none()
         && tp.trim_top.is_none()
@@ -2447,6 +2479,15 @@ mod tests {
                     ..base.clone()
                 },
             ),
+            // The second decode is lenient, so a truncated source would
+            // give blank pixels (INV-19).
+            (
+                "format=thumbhash",
+                TransformParams {
+                    format: Some(OutputFormat::Thumbhash),
+                    ..base.clone()
+                },
+            ),
         ];
         for (name, tp) in blockers {
             assert!(!resize_reads_source(&tp, false), "{name}");
@@ -2902,5 +2943,189 @@ mod tests {
         }
         let untagged = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
         assert_eq!(oriented_size(&untagged), (2000, 1500));
+    }
+
+    /// Sources that a strict libvips load rejects but the default load
+    /// accepts. Each is a real fixture, cut inside its first frame or its
+    /// headers. The JPEG and WebP sources are re-encoded copies of the large
+    /// PNG fixture, so the cut lands inside real entropy-coded data.
+    fn truncated_sources() -> Vec<(String, Vec<u8>)> {
+        let png = fixture("bench_2000x1500.png");
+        let image = VipsImage::from_buffer(&png).unwrap();
+        let jpeg = image.save_jpeg(85, true).unwrap();
+        let webp = image.save_webp(80, true).unwrap();
+        let cmyk = fixture("cmyk.jpg");
+        let exif = fixture("exif_orientation.jpg");
+        let gif = fixture("loading.gif");
+        let small_webp = fixture("static.webp");
+        let cuts: [(&str, &Vec<u8>, usize); 14] = [
+            ("png", &png, png.len() / 4),
+            ("png", &png, png.len() / 2),
+            ("png", &png, png.len() * 3 / 4),
+            ("jpeg", &jpeg, jpeg.len() / 4),
+            ("jpeg", &jpeg, jpeg.len() / 2),
+            ("cmyk jpeg", &cmyk, 281),
+            ("exif jpeg", &exif, 657),
+            ("gif", &gif, 101),
+            ("gif", &gif, 355),
+            ("gif", &gif, 800),
+            ("webp", &webp, webp.len() / 2),
+            ("webp", &webp, webp.len() - 100),
+            ("small webp", &small_webp, 32),
+            ("small webp", &small_webp, 63),
+        ];
+        cuts.into_iter()
+            .map(|(label, data, at)| (format!("{label} cut at {at}"), data[..at].to_vec()))
+            .collect()
+    }
+
+    /// Sources whose tail is overwritten, so the length stays valid.
+    fn corrupted_tail_sources() -> Vec<(String, Vec<u8>)> {
+        let png = fixture("bench_2000x1500.png");
+        let jpeg = VipsImage::from_buffer(&png)
+            .unwrap()
+            .save_jpeg(85, true)
+            .unwrap();
+        [("png", png), ("jpeg", jpeg)]
+            .into_iter()
+            .map(|(label, mut bytes)| {
+                let from = bytes.len() / 2;
+                bytes[from..].fill(0xAA);
+                (format!("{label} tail overwritten from {from}"), bytes)
+            })
+            .collect()
+    }
+
+    /// The label of every case for which `transform` did not fail with a
+    /// libvips error.
+    fn cases_without_vips_error(sources: Vec<(String, Vec<u8>)>, params: &[&str]) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for (label, data) in &sources {
+            for params in params {
+                let p = parse(params).unwrap();
+                match transform(data, &p, None, None) {
+                    Err(TransformError::Vips(_)) => {}
+                    Ok(result) => offenders.push(format!(
+                        "{label} [{params}]: got {} hash {:?}",
+                        result.format.as_str(),
+                        String::from_utf8_lossy(&result.data)
+                    )),
+                    Err(other) => offenders.push(format!("{label} [{params}]: {other:?}")),
+                }
+            }
+        }
+        offenders
+    }
+
+    #[test]
+    fn transform_thumbhash_of_truncated_source_returns_error_not_a_hash() {
+        init();
+        let offenders = cases_without_vips_error(
+            truncated_sources(),
+            &[
+                "format=thumbhash",
+                "format=thumbhash,w=50",
+                "format=thumbhash,w=300,h=200,fit=cover",
+                "format=thumbhash,rotate=90,frame=1",
+            ],
+        );
+        assert!(offenders.is_empty(), "no error for: {offenders:#?}");
+    }
+
+    #[test]
+    fn transform_thumbhash_of_source_with_corrupted_tail_returns_error_not_a_hash() {
+        init();
+        let offenders = cases_without_vips_error(
+            corrupted_tail_sources(),
+            &["format=thumbhash", "format=thumbhash,w=50"],
+        );
+        assert!(offenders.is_empty(), "no error for: {offenders:#?}");
+    }
+
+    #[test]
+    fn transform_thumbhash_of_truncated_source_over_budget_returns_budget_error_first() {
+        init();
+        // INV-20: the pixel budget check runs before any pixel decode, so
+        // an over-budget source that is also truncated reports the budget.
+        let settings = TransformSettings {
+            limits: TransformLimits {
+                max_pixels: 1_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let png = fixture("bench_2000x1500.png");
+        let jpeg = VipsImage::from_buffer(&png)
+            .unwrap()
+            .save_jpeg(85, true)
+            .unwrap();
+        let p = parse("format=thumbhash").unwrap();
+        for data in [&png[..png.len() / 2], &jpeg[..jpeg.len() / 2]] {
+            let err = transform(data, &p, None, Some(settings)).expect_err("over budget");
+            assert!(
+                matches!(err, TransformError::ExceedsMaxPixels(3_000_000, 1_000)),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transform_of_truncated_source_still_succeeds_for_every_other_format() {
+        init();
+        // Control: only `format=thumbhash` loads strictly. Every other
+        // output format keeps the default load, which accepts a partly
+        // decodable source and encodes the pixels it got.
+        let png = fixture("bench_2000x1500.png");
+        let jpeg = VipsImage::from_buffer(&png)
+            .unwrap()
+            .save_jpeg(85, true)
+            .unwrap();
+        let sources = [
+            ("png", png[..png.len() / 2].to_vec()),
+            ("jpeg", jpeg[..jpeg.len() / 2].to_vec()),
+            ("gif", fixture("loading.gif")[..355].to_vec()),
+        ];
+        let mut failures = Vec::new();
+        for (label, data) in &sources {
+            for params in [
+                "",
+                "format=png",
+                "format=jpeg,w=100",
+                "format=webp,w=64,h=64,fit=cover",
+                "format=json",
+                "format=gif",
+            ] {
+                let p = parse(params).unwrap();
+                if let Err(err) = transform(data, &p, None, None) {
+                    failures.push(format!("{label} [{params}]: {err:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "unexpected errors: {failures:#?}");
+    }
+
+    #[test]
+    fn transform_thumbhash_of_complete_source_is_unchanged_by_the_strict_load() {
+        init();
+        // The strict load accepts every valid fixture, and it hashes the
+        // same pixels as the default load: `format=png` output of the same
+        // request decodes to the same hash.
+        for name in [
+            "bench_2000x1500.png",
+            "cmyk.jpg",
+            "exif_orientation.jpg",
+            "loading.gif",
+            "static.webp",
+            "alpha_4x4.png",
+        ] {
+            let data = fixture(name);
+            let thumb = thumbhash_result(&data, "format=thumbhash,w=50", None);
+            let png = thumbhash_result(&data, "format=png,w=50", None);
+            assert_eq!(
+                thumbhash_bytes(&thumb),
+                hash_of_pixels_in(&png.data),
+                "{name}"
+            );
+        }
     }
 }
