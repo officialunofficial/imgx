@@ -940,12 +940,16 @@ mod tests {
     #[test]
     fn write_to_memory_returns_error_when_pixel_decode_fails() {
         init().expect("vips init");
-        let mut data = fixture("static.webp");
-        // Byte 26 holds the low byte of the VP8 frame width. The header
-        // still loads, but the pixel data no longer matches it, so the
-        // decode fails when `write_to_memory` reads the pixels.
-        data[26] = 0xFF;
-        let img = VipsImage::from_buffer(&data).expect("the header still loads");
+        let data = fixture("bench_2000x1500.png");
+        // Cut the PNG in half, inside its pixel data. The header still
+        // loads, but the decode fails when `write_to_memory` reads the
+        // pixels.
+        let img = VipsImage::from_buffer_with_option(&data[..data.len() / 2], "fail_on=error")
+            .expect("the header still loads");
+        // With the default `fail_on=none`, libvips reports a failed decode
+        // as a warning and returns blank pixels, so the result depends on
+        // the libvips version and on thread timing. `fail_on=error` makes
+        // every libvips version return the error.
         assert!(matches!(
             img.write_to_memory(),
             Err(VipsError::OperationFailed(_))
