@@ -19,7 +19,7 @@ name = "imgx"
 path = "src/lib.rs"
 
 [dependencies]
-imgx-vips = { path = "../imgx-vips", version = "0.1.4" }
+imgx-vips = { path = "../imgx-vips", version = "0.1.5" }
 tracing = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }

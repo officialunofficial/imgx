@@ -3,6 +3,19 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.1.5] - 2026-09-19
+
+### Bug Fixes
+
+- *(transform)* Apply EXIF orientation to derived resize sides(ed78126)
+- Satisfy stable clippy and libvips 8.15 in CI(60010f0)
+- *(transform)* Fail format=thumbhash when the source decodes only in part(b2b7fbc)
+
+### Features
+
+- *(transform)* Add thumbhash format, shrink-on-load resize, AVIF effort(ca6da0a)
+
+
 ## [0.1.4] - 2026-07-14
 
 ### Miscellaneous
