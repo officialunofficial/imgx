@@ -39,7 +39,7 @@ Output height in pixels.
 /image/w=400,h=300/photo.jpg
 ```
 
-When you specify only one dimension, imgx derives the other from the source aspect ratio.
+When you specify only one dimension, imgx derives the other from the source aspect ratio. The ratio uses the image as displayed. A JPEG with EXIF orientation 5 to 8 turns by 90 degrees, so `w=300` on a stored 2000x1500 image gives 300x400.
 
 ### `dpr`
 

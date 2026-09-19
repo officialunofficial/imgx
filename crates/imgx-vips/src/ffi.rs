@@ -119,6 +119,8 @@ unsafe extern "C" {
         ...
     ) -> c_int;
     pub fn vips_rot(in_: *mut VipsImage, out: *mut *mut VipsImage, angle: c_int, ...) -> c_int;
+    // Signature checked against libvips `vips/conversion.h`.
+    pub fn vips_autorot(in_: *mut VipsImage, out: *mut *mut VipsImage, ...) -> c_int;
     pub fn vips_flip(in_: *mut VipsImage, out: *mut *mut VipsImage, direction: c_int, ...)
     -> c_int;
     pub fn vips_find_trim(

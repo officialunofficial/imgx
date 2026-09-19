@@ -38,14 +38,12 @@ pub struct TransformResult {
 
 /// Safety limits enforced during transform execution -- a general
 /// decompression-bomb guard on any source image (`max_pixels`) plus the
-/// animated-specific budget (`max_frames`, `max_animated_pixels`) -- and
-/// the server-wide `avif_effort` encoder setting.
+/// animated-specific budget (`max_frames`, `max_animated_pixels`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TransformLimits {
     pub max_pixels: u64,
     pub max_frames: u32,
     pub max_animated_pixels: u64,
-    pub avif_effort: u8,
 }
 
 impl Default for TransformLimits {
@@ -54,7 +52,42 @@ impl Default for TransformLimits {
             max_pixels: 71_000_000,
             max_frames: 100,
             max_animated_pixels: 50_000_000,
+        }
+    }
+}
+
+/// Server-wide encoder settings. They apply to every request and no
+/// request parameter changes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderSettings {
+    pub avif_effort: u8,
+}
+
+impl Default for EncoderSettings {
+    fn default() -> Self {
+        Self {
             avif_effort: DEFAULT_AVIF_EFFORT,
+        }
+    }
+}
+
+/// The settings that `encode_image` uses for one image. They hold the
+/// request `quality` and `metadata` mode, and the server-wide `avif_effort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeOptions {
+    pub quality: u8,
+    pub avif_effort: u8,
+    pub metadata: MetadataMode,
+}
+
+impl EncodeOptions {
+    /// Build the options for one request. `quality` and `metadata` come from
+    /// the request. `avif_effort` comes from the server-wide `encoder`.
+    pub fn new(tp: &TransformParams, encoder: EncoderSettings) -> Self {
+        Self {
+            quality: tp.quality,
+            avif_effort: encoder.avif_effort,
+            metadata: tp.metadata,
         }
     }
 }
@@ -63,14 +96,17 @@ impl Default for TransformLimits {
 ///
 /// `input_data` is the raw bytes of the source image. `tp` controls the
 /// resize/effect/encode behavior. `accept_header` is used for format
-/// negotiation when `tp.format` is `None`/`Auto`.
+/// negotiation when `tp.format` is `None`/`Auto`. `None` for `limits` or
+/// `encoder` selects the defaults.
 pub fn transform(
     input_data: &[u8],
     tp: &TransformParams,
     accept_header: Option<&str>,
     limits: Option<TransformLimits>,
+    encoder: Option<EncoderSettings>,
 ) -> Result<TransformResult, TransformError> {
     let limits = limits.unwrap_or_default();
+    let encode_options = EncodeOptions::new(tp, encoder.unwrap_or_default());
     let compression_fast = tp.compression == Some(CompressionMode::Fast);
 
     // -- PROBE --
@@ -239,6 +275,9 @@ pub fn transform(
     if eff_w.is_some() || eff_h.is_some() {
         let source_w = current.width();
         let source_h = current.height();
+        // The thumbnail box applies to the image after the EXIF orientation,
+        // so a derived side needs the oriented aspect ratio.
+        let (oriented_w, oriented_h) = oriented_size(&current);
 
         let effective_fit = if tp.fit == FitMode::Pad {
             FitMode::Contain
@@ -252,7 +291,7 @@ pub fn transform(
                 // invariant: the outer `if eff_w.is_some() || eff_h.is_some()`
                 // guarantees eff_h is Some whenever eff_w is None.
                 let h = eff_h.expect("invariant: eff_w.is_none() implies eff_h.is_some()");
-                let ratio = source_w as f64 / source_h as f64;
+                let ratio = oriented_w as f64 / oriented_h as f64;
                 let derived = h as f64 * ratio;
                 (derived.min(8192.0) as i32).max(1)
             }
@@ -271,14 +310,15 @@ pub fn transform(
         // missing height is now derived from the *current* (i.e.
         // already-rotated/flipped) aspect ratio before the thumbnail call,
         // rather than left as `None` for vips to silently square-box.
+        // That ratio uses the oriented dimensions (see `oriented_size`).
         let derived_height = if eff_h.is_none()
             && !matches!(
                 effective_fit,
                 FitMode::Cover | FitMode::Fill | FitMode::Crop | FitMode::AspectCrop
             )
-            && source_w > 0
+            && oriented_w > 0
         {
-            let ratio = source_h as f64 / source_w as f64;
+            let ratio = oriented_h as f64 / oriented_w as f64;
             Some(((thumb_width as f64 * ratio).round().min(8192.0) as i32).max(1))
         } else {
             eff_h
@@ -345,25 +385,31 @@ pub fn transform(
             // the source is smaller, it must NOT be upscaled -- instead
             // the *original-size* image is cropped directly to the
             // target aspect ratio.
-            let hscale = tw as f64 / source_w as f64;
-            let vscale = th as f64 / source_h as f64;
+            //
+            // The scale and the crop use the oriented dimensions, because
+            // `vips_thumbnail_*` applies the EXIF orientation first. The
+            // direct crop turns the pixels upright first, so the crop runs on
+            // the displayed image and the output carries no orientation tag.
+            let hscale = tw as f64 / oriented_w as f64;
+            let vscale = th as f64 / oriented_h as f64;
             let scale = hscale.max(vscale);
             if scale > 1.0 {
+                current = current.autorot()?;
                 let target_ratio = tw as f64 / th as f64;
-                let source_ratio = source_w as f64 / source_h as f64;
+                let source_ratio = oriented_w as f64 / oriented_h as f64;
                 let (crop_w, crop_h) = if source_ratio > target_ratio {
-                    let new_w = ((source_h as f64 * target_ratio).round() as i32)
-                        .min(source_w)
+                    let new_w = ((oriented_h as f64 * target_ratio).round() as i32)
+                        .min(oriented_w)
                         .max(1);
-                    (new_w, source_h)
+                    (new_w, oriented_h)
                 } else {
-                    let new_h = ((source_w as f64 / target_ratio).round() as i32)
-                        .min(source_h)
+                    let new_h = ((oriented_w as f64 / target_ratio).round() as i32)
+                        .min(oriented_h)
                         .max(1);
-                    (source_w, new_h)
+                    (oriented_w, new_h)
                 };
-                let crop_left = (source_w - crop_w) / 2;
-                let crop_top = (source_h - crop_h) / 2;
+                let crop_left = (oriented_w - crop_w) / 2;
+                let crop_top = (oriented_h - crop_h) / 2;
                 current = current.crop(crop_left, crop_top, crop_w, crop_h)?;
             } else {
                 let opts = ThumbnailOptions {
@@ -506,13 +552,7 @@ pub fn transform(
         } else {
             negotiate::apply_compression_fast(negotiated, compression_fast)
         };
-        let encoded = encode_image(
-            &current,
-            negotiated,
-            tp.quality,
-            limits.avif_effort,
-            tp.metadata,
-        )?;
+        let encoded = encode_image(&current, negotiated, &encode_options)?;
         let json = format!(
             "{{\"original\":{{\"width\":{original_width},\"height\":{original_height},\"file_size\":{}}},\"transformed\":{{\"width\":{out_width},\"height\":{out_height},\"format\":\"{}\",\"file_size\":{}}}}}",
             input_data.len(),
@@ -565,13 +605,7 @@ pub fn transform(
         negotiate::apply_compression_fast(output_format, compression_fast)
     };
 
-    let data = encode_image(
-        &current,
-        output_format,
-        tp.quality,
-        limits.avif_effort,
-        tp.metadata,
-    )?;
+    let data = encode_image(&current, output_format, &encode_options)?;
 
     Ok(TransformResult {
         data,
@@ -624,6 +658,20 @@ fn n_pages_of(img: &VipsImage) -> Option<i32> {
 /// bindings.zig's `getPageHeight` does.
 fn page_height_of(img: &VipsImage) -> Option<i32> {
     img.page_height().filter(|&n| n >= 1)
+}
+
+/// Return the width and height of `image` after libvips applies the EXIF
+/// orientation. `vips_thumbnail_*` applies it first, so a resize box fits the
+/// turned image. Orientations 5 to 8 turn the image by 90 degrees, so they
+/// swap the sides. The resize stage always applies the tag: the request has
+/// no `no_rotate` option. The `aspect-crop` direct crop calls `autorot` to
+/// match.
+fn oriented_size(image: &VipsImage) -> (i32, i32) {
+    let (width, height) = (image.width(), image.height());
+    match image.get_int("orientation") {
+        Some(5..=8) => (height, width),
+        _ => (width, height),
+    }
 }
 
 /// Convert an optional RGB byte triplet to an f64 background array.
@@ -829,16 +877,14 @@ pub fn composite_draw_overlay(
 pub(crate) fn encode_image(
     image: &VipsImage,
     format: OutputFormat,
-    quality: u8,
-    avif_effort: u8,
-    metadata: MetadataMode,
+    options: &EncodeOptions,
 ) -> Result<Vec<u8>, VipsError> {
-    let q = quality as i32;
+    let q = options.quality as i32;
     // Strip -> strip all metadata; Keep/Copyright -> preserve metadata
     // (libvips has no "copyright-only" mode, so Copyright is treated the
     // same as Keep for now, matching the Zig implementation's known
     // future-enhancement note).
-    let do_strip = metadata == MetadataMode::Strip;
+    let do_strip = options.metadata == MetadataMode::Strip;
     match format {
         // BaselineJpeg shares Jpeg's encode path exactly: libvips'
         // vips_jpegsave_buffer already defaults `interlace` to FALSE
@@ -849,7 +895,7 @@ pub(crate) fn encode_image(
         }
         OutputFormat::Png => image.save_png(6, do_strip),
         OutputFormat::Webp => image.save_webp(q, do_strip),
-        OutputFormat::Avif => image.save_avif(q, avif_effort, do_strip),
+        OutputFormat::Avif => image.save_avif(q, options.avif_effort, do_strip),
         OutputFormat::Gif => encode_gif(image),
         // Never reached: `transform()` intercepts `format == Json` and
         // `format == Thumbhash` before calling `encode_image` and builds a
@@ -878,9 +924,7 @@ pub fn apply_draw_overlays(
     result: TransformResult,
     draw: &[DrawOverlay],
     overlay_bytes: &[Vec<u8>],
-    quality: u8,
-    avif_effort: u8,
-    metadata: MetadataMode,
+    options: &EncodeOptions,
 ) -> Result<TransformResult, TransformError> {
     if draw.is_empty() || overlay_bytes.is_empty() || result.is_animated {
         return Ok(result);
@@ -901,7 +945,7 @@ pub fn apply_draw_overlays(
         base = composite_draw_overlay(&base, bytes, entry)?;
     }
 
-    let data = encode_image(&base, result.format, quality, avif_effort, metadata)?;
+    let data = encode_image(&base, result.format, options)?;
     Ok(TransformResult { data, ..result })
 }
 
@@ -939,6 +983,14 @@ mod tests {
         VIPS_INIT.call_once(|| imgx_vips::init().expect("vips init"));
     }
 
+    fn test_encode_options() -> EncodeOptions {
+        EncodeOptions {
+            quality: 80,
+            avif_effort: DEFAULT_AVIF_EFFORT,
+            metadata: MetadataMode::Strip,
+        }
+    }
+
     fn fixture(name: &str) -> Vec<u8> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test/fixtures")
@@ -959,7 +1011,7 @@ mod tests {
     fn transform_with_default_params_preserves_image() {
         init();
         let data = static_fixture();
-        let result = transform(&data, &TransformParams::default(), None, None).unwrap();
+        let result = transform(&data, &TransformParams::default(), None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.width, 4);
         assert_eq!(result.height, 4);
@@ -973,7 +1025,7 @@ mod tests {
             max_pixels: 10,
             ..Default::default()
         };
-        let err = transform(&data, &TransformParams::default(), None, Some(limits))
+        let err = transform(&data, &TransformParams::default(), None, Some(limits), None)
             .expect_err("16-pixel source must be rejected under a 10-pixel budget");
         assert!(matches!(err, TransformError::ExceedsMaxPixels(16, 10)));
     }
@@ -986,7 +1038,7 @@ mod tests {
             max_pixels: 16,
             ..Default::default()
         };
-        assert!(transform(&data, &TransformParams::default(), None, Some(limits)).is_ok());
+        assert!(transform(&data, &TransformParams::default(), None, Some(limits), None).is_ok());
     }
 
     #[test]
@@ -997,7 +1049,7 @@ mod tests {
             width: Some(2),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.width, 2);
     }
@@ -1010,7 +1062,7 @@ mod tests {
             format: Some(OutputFormat::Jpeg),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.format, OutputFormat::Jpeg);
     }
@@ -1023,7 +1075,7 @@ mod tests {
             format: Some(OutputFormat::Webp),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.format, OutputFormat::Webp);
     }
@@ -1036,7 +1088,7 @@ mod tests {
             format: Some(OutputFormat::Png),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.format, OutputFormat::Png);
     }
@@ -1049,7 +1101,7 @@ mod tests {
             format: Some(OutputFormat::Auto),
             ..Default::default()
         };
-        let result = transform(&data, &p, Some("image/webp"), None).unwrap();
+        let result = transform(&data, &p, Some("image/webp"), None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.format, OutputFormat::Webp);
     }
@@ -1062,7 +1114,7 @@ mod tests {
             sharpen: Some(1.5),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.width, 4);
         assert_eq!(result.height, 4);
@@ -1076,7 +1128,7 @@ mod tests {
             blur: Some(2.0),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.width, 4);
         assert_eq!(result.height, 4);
@@ -1092,7 +1144,7 @@ mod tests {
             fit: FitMode::Cover,
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.width, 2);
         assert_eq!(result.height, 2);
@@ -1108,7 +1160,7 @@ mod tests {
             fit: FitMode::Fill,
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.width, 2);
         assert_eq!(result.height, 3);
@@ -1122,7 +1174,7 @@ mod tests {
             rotate: Some(Rotation::Deg90),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.width, 4);
         assert_eq!(result.height, 4);
@@ -1136,7 +1188,7 @@ mod tests {
             flip: Some(FlipMode::H),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.width, 4);
         assert_eq!(result.height, 4);
@@ -1150,7 +1202,7 @@ mod tests {
             brightness: Some(1.5),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.width, 4);
     }
@@ -1163,7 +1215,7 @@ mod tests {
             contrast: Some(0.8),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
     }
 
@@ -1175,7 +1227,7 @@ mod tests {
             gamma: Some(2.2),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
     }
 
@@ -1187,7 +1239,7 @@ mod tests {
             saturation: Some(0.5),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.width, 4);
         assert_eq!(result.height, 4);
@@ -1204,7 +1256,7 @@ mod tests {
             background: Some([255, 0, 0]),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.width, 8);
         assert_eq!(result.height, 8);
@@ -1219,7 +1271,7 @@ mod tests {
             format: Some(OutputFormat::Png),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
     }
 
@@ -1233,7 +1285,7 @@ mod tests {
             format: Some(OutputFormat::Gif),
             ..Default::default()
         };
-        let result = transform(&data, &p, Some("image/gif"), None).unwrap();
+        let result = transform(&data, &p, Some("image/gif"), None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.format, OutputFormat::Gif);
         assert!(result.is_animated);
@@ -1250,7 +1302,7 @@ mod tests {
             format: Some(OutputFormat::Png),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert!(!result.is_animated);
         // Single frame: height should be 128 (one frame), not 1536 (stacked).
@@ -1268,7 +1320,7 @@ mod tests {
             format: Some(OutputFormat::Png),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(!result.data.is_empty());
         assert!(!result.is_animated);
         assert_eq!(result.width, 128);
@@ -1285,7 +1337,7 @@ mod tests {
             format: Some(OutputFormat::Webp),
             ..Default::default()
         };
-        let result = transform(&data, &p, Some("image/webp"), None).unwrap();
+        let result = transform(&data, &p, Some("image/webp"), None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.format, OutputFormat::Webp);
         assert!(result.is_animated);
@@ -1302,7 +1354,7 @@ mod tests {
             format: Some(OutputFormat::Gif),
             ..Default::default()
         };
-        let result = transform(&data, &p, Some("image/gif"), None).unwrap();
+        let result = transform(&data, &p, Some("image/gif"), None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.format, OutputFormat::Gif);
         assert!(result.is_animated);
@@ -1324,7 +1376,7 @@ mod tests {
             format: Some(OutputFormat::Gif),
             ..Default::default()
         };
-        let result = transform(&data, &p, Some("image/gif"), None).unwrap();
+        let result = transform(&data, &p, Some("image/gif"), None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.format, OutputFormat::Gif);
         assert!(result.is_animated);
@@ -1343,7 +1395,7 @@ mod tests {
             format: Some(OutputFormat::Gif),
             ..Default::default()
         };
-        let result = transform(&data, &p, Some("image/gif"), None).unwrap();
+        let result = transform(&data, &p, Some("image/gif"), None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.format, OutputFormat::Gif);
     }
@@ -1360,7 +1412,7 @@ mod tests {
             format: Some(OutputFormat::Gif),
             ..Default::default()
         };
-        let result = transform(&data, &p, Some("image/gif"), None).unwrap();
+        let result = transform(&data, &p, Some("image/gif"), None, None).unwrap();
         assert!(!result.data.is_empty());
         assert_eq!(result.format, OutputFormat::Gif);
         assert!(result.is_animated);
@@ -1370,7 +1422,7 @@ mod tests {
     fn static_image_is_not_marked_as_animated() {
         init();
         let data = static_fixture();
-        let result = transform(&data, &TransformParams::default(), None, None).unwrap();
+        let result = transform(&data, &TransformParams::default(), None, None, None).unwrap();
         assert!(!result.is_animated);
         assert_eq!(result.frame_count, None);
     }
@@ -1390,7 +1442,7 @@ mod tests {
             max_frames: 100,
             ..Default::default()
         };
-        let result = transform(&data, &p, Some("image/gif"), Some(cfg)).unwrap();
+        let result = transform(&data, &p, Some("image/gif"), Some(cfg), None).unwrap();
         assert!(!result.data.is_empty());
         assert!(!result.is_animated);
         assert_eq!(result.height, 128);
@@ -1411,7 +1463,7 @@ mod tests {
             max_animated_pixels: 50_000_000,
             ..Default::default()
         };
-        let result = transform(&data, &p, Some("image/gif"), Some(cfg)).unwrap();
+        let result = transform(&data, &p, Some("image/gif"), Some(cfg), None).unwrap();
         assert!(!result.data.is_empty());
         assert!(result.is_animated);
         assert_eq!(result.width, 128);
@@ -1425,7 +1477,7 @@ mod tests {
         init();
         let data = static_fixture();
         let parsed = parse("").unwrap();
-        let result = transform(&data, &parsed, None, None).unwrap();
+        let result = transform(&data, &parsed, None, None, None).unwrap();
         assert_eq!(result.width, 4);
         assert_eq!(result.height, 4);
     }
@@ -1459,7 +1511,7 @@ mod tests {
             rotate: Some(Rotation::Deg90),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert_eq!(result.width, 200);
         // 1500x2000 (post-rotation) resized to width=200 preserves aspect
         // ratio => height = 200 * (2000/1500) = 266.67 -> 266 or 267.
@@ -1484,7 +1536,7 @@ mod tests {
         let squeeze = parse("w=2,h=3,fit=squeeze").unwrap();
         let fill = parse("w=2,h=3,fit=fill").unwrap();
         assert_eq!(squeeze.fit, fill.fit);
-        let result = transform(&data, &squeeze, None, None).unwrap();
+        let result = transform(&data, &squeeze, None, None, None).unwrap();
         assert_eq!(result.width, 2);
         assert_eq!(result.height, 3);
     }
@@ -1499,7 +1551,7 @@ mod tests {
         init();
         let data = static_fixture(); // 4x4
         let p = parse("w=2,h=2,fit=scale-up").unwrap();
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert_eq!(
             result.width, 4,
             "scale-up must never downscale below source size"
@@ -1514,7 +1566,7 @@ mod tests {
         init();
         let data = static_fixture(); // 4x4
         let p = parse("w=8,h=8,fit=crop").unwrap();
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(
             result.width <= 4 && result.height <= 4,
             "fit=crop must never upscale a source smaller than the \
@@ -1529,7 +1581,7 @@ mod tests {
         init();
         let data = nonsquare_fixture(); // 2000x1500
         let p = parse("w=100,h=100,fit=crop").unwrap();
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert_eq!(result.width, 100);
         assert_eq!(result.height, 100);
     }
@@ -1545,7 +1597,7 @@ mod tests {
         // Target ratio 2:1 -- source stays <= 4 wide/tall (no upscale)
         // but must be cropped so width:height is 2:1, not left at 4:4.
         let p = parse("w=200,h=100,fit=aspect-crop").unwrap();
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert!(result.width <= 4 && result.height <= 4);
         assert_eq!(
             result.width, 4,
@@ -1559,7 +1611,7 @@ mod tests {
         init();
         let data = nonsquare_fixture(); // 2000x1500, ratio 4:3
         let p = parse("w=100,h=100,fit=aspect-crop").unwrap();
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert_eq!(result.width, 100);
         assert_eq!(result.height, 100);
     }
@@ -1574,7 +1626,7 @@ mod tests {
         init();
         let data = nonsquare_fixture(); // 2000x1500
         let p = parse("trim.top=100,trim.left=200").unwrap();
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert_eq!(result.width, 2000 - 200);
         assert_eq!(result.height, 1500 - 100);
     }
@@ -1584,7 +1636,7 @@ mod tests {
         init();
         let data = nonsquare_fixture(); // 2000x1500
         let p = parse("trim.left=0.1,trim.right=0.1").unwrap();
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         // 10% off each side horizontally: 2000 - 200 - 200 = 1600.
         assert_eq!(result.width, 1600);
         assert_eq!(result.height, 1500);
@@ -1598,7 +1650,7 @@ mod tests {
             trim: Some(50.0),
             ..Default::default()
         };
-        let result = transform(&data, &p, None, None);
+        let result = transform(&data, &p, None, None, None);
         assert!(result.is_ok());
     }
 
@@ -1611,7 +1663,7 @@ mod tests {
         init();
         let data = nonsquare_fixture(); // 2000x1500
         let p = parse("w=100,format=json").unwrap();
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert_eq!(result.format, OutputFormat::Json);
         let body = String::from_utf8(result.data).expect("json response must be valid utf8");
         let json: serde_json::Value = serde_json::from_str(&body).expect("must be valid json");
@@ -1630,7 +1682,7 @@ mod tests {
         init();
         let data = static_fixture();
         let p = parse("compression=fast").unwrap();
-        let result = transform(&data, &p, Some("image/avif,image/webp"), None).unwrap();
+        let result = transform(&data, &p, Some("image/avif,image/webp"), None, None).unwrap();
         assert_eq!(result.format, OutputFormat::Jpeg);
     }
 
@@ -1639,7 +1691,7 @@ mod tests {
         init();
         let data = static_fixture();
         let p = TransformParams::default();
-        let result = transform(&data, &p, Some("image/avif,image/webp"), None).unwrap();
+        let result = transform(&data, &p, Some("image/avif,image/webp"), None, None).unwrap();
         assert_eq!(result.format, OutputFormat::Avif);
     }
 
@@ -1648,7 +1700,7 @@ mod tests {
         init();
         let data = static_fixture();
         let p = parse("compression=fast,format=png").unwrap();
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert_eq!(result.format, OutputFormat::Png);
     }
 
@@ -1660,7 +1712,7 @@ mod tests {
         init();
         let data = static_fixture();
         let p = parse("compression=fast,format=avif").unwrap();
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert_eq!(result.format, OutputFormat::Jpeg);
     }
 
@@ -1673,7 +1725,7 @@ mod tests {
         init();
         let data = static_fixture(); // 4x4
         let p = parse("border=2").unwrap();
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert_eq!(result.width, 8);
         assert_eq!(result.height, 8);
     }
@@ -1683,7 +1735,7 @@ mod tests {
         init();
         let data = static_fixture(); // 4x4
         let p = parse("border.top=1,border.left=2,border.right=3,border.bottom=4").unwrap();
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         assert_eq!(result.width, 4 + 2 + 3);
         assert_eq!(result.height, 4 + 1 + 4);
     }
@@ -1692,7 +1744,7 @@ mod tests {
     fn transform_without_border_leaves_dimensions_unchanged() {
         init();
         let data = static_fixture();
-        let result = transform(&data, &TransformParams::default(), None, None).unwrap();
+        let result = transform(&data, &TransformParams::default(), None, None, None).unwrap();
         assert_eq!(result.width, 4);
         assert_eq!(result.height, 4);
     }
@@ -1702,7 +1754,7 @@ mod tests {
         init();
         let data = nonsquare_fixture(); // 2000x1500
         let p = parse("w=100,border=5").unwrap();
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         // Resized to w=100 (h derived as 75), then a 5px uniform border.
         assert_eq!(result.width, 100 + 10);
         assert_eq!(result.height, 75 + 10);
@@ -1713,7 +1765,7 @@ mod tests {
         init();
         let data = static_fixture(); // 4x4
         let p = parse("border=2,dpr=2").unwrap();
-        let result = transform(&data, &p, None, None).unwrap();
+        let result = transform(&data, &p, None, None, None).unwrap();
         // Border scales with dpr: 2px * dpr 2 = 4px each side.
         assert_eq!(result.width, 4 + 8);
         assert_eq!(result.height, 4 + 8);
@@ -1855,7 +1907,7 @@ mod tests {
     fn apply_draw_overlays_composites_and_reencodes_preserving_dimensions() {
         init();
         let data = nonsquare_fixture();
-        let base_result = transform(&data, &TransformParams::default(), None, None).unwrap();
+        let base_result = transform(&data, &TransformParams::default(), None, None, None).unwrap();
         let entry = DrawOverlay {
             url: Some("https://example.com/logo.png".to_string()),
             ..Default::default()
@@ -1864,9 +1916,7 @@ mod tests {
             base_result.clone(),
             std::slice::from_ref(&entry),
             &[overlay_fixture()],
-            80,
-            DEFAULT_AVIF_EFFORT,
-            MetadataMode::Strip,
+            &test_encode_options(),
         )
         .unwrap();
         assert_eq!(composited.width, base_result.width);
@@ -1882,16 +1932,9 @@ mod tests {
     fn apply_draw_overlays_is_a_no_op_with_no_overlays() {
         init();
         let data = nonsquare_fixture();
-        let base_result = transform(&data, &TransformParams::default(), None, None).unwrap();
-        let result = apply_draw_overlays(
-            base_result.clone(),
-            &[],
-            &[],
-            80,
-            DEFAULT_AVIF_EFFORT,
-            MetadataMode::Strip,
-        )
-        .unwrap();
+        let base_result = transform(&data, &TransformParams::default(), None, None, None).unwrap();
+        let result =
+            apply_draw_overlays(base_result.clone(), &[], &[], &test_encode_options()).unwrap();
         assert_eq!(result.data, base_result.data);
     }
 
@@ -1903,7 +1946,7 @@ mod tests {
             width: Some(50),
             ..Default::default()
         };
-        let base_result = transform(&data, &p, Some("image/gif"), None).unwrap();
+        let base_result = transform(&data, &p, Some("image/gif"), None, None).unwrap();
         assert!(base_result.is_animated);
         let entry = DrawOverlay {
             url: Some("https://example.com/logo.png".to_string()),
@@ -1913,9 +1956,7 @@ mod tests {
             base_result.clone(),
             std::slice::from_ref(&entry),
             &[overlay_fixture()],
-            80,
-            DEFAULT_AVIF_EFFORT,
-            MetadataMode::Strip,
+            &test_encode_options(),
         )
         .unwrap();
         assert_eq!(result.data, base_result.data);
@@ -1929,7 +1970,7 @@ mod tests {
             format: Some(OutputFormat::Json),
             ..Default::default()
         };
-        let base_result = transform(&data, &p, None, None).unwrap();
+        let base_result = transform(&data, &p, None, None, None).unwrap();
         assert_eq!(base_result.format, OutputFormat::Json);
         let entry = DrawOverlay {
             url: Some("https://example.com/logo.png".to_string()),
@@ -1939,9 +1980,7 @@ mod tests {
             base_result.clone(),
             std::slice::from_ref(&entry),
             &[overlay_fixture()],
-            80,
-            DEFAULT_AVIF_EFFORT,
-            MetadataMode::Strip,
+            &test_encode_options(),
         )
         .unwrap();
         assert_eq!(result.data, base_result.data);
@@ -1949,7 +1988,7 @@ mod tests {
 
     fn thumbhash_result(data: &[u8], params: &str, accept: Option<&str>) -> TransformResult {
         let p = parse(params).unwrap();
-        transform(data, &p, accept, None).unwrap()
+        transform(data, &p, accept, None, None).unwrap()
     }
 
     fn thumbhash_bytes(result: &TransformResult) -> Vec<u8> {
@@ -2012,7 +2051,7 @@ mod tests {
             ..Default::default()
         };
         let p = parse("format=thumbhash").unwrap();
-        let err = transform(&data, &p, None, Some(limits))
+        let err = transform(&data, &p, None, Some(limits), None)
             .expect_err("16-pixel source must be rejected under a 10-pixel budget");
         assert!(matches!(err, TransformError::ExceedsMaxPixels(16, 10)));
     }
@@ -2026,7 +2065,7 @@ mod tests {
             ..Default::default()
         };
         let p = parse("format=thumbhash").unwrap();
-        let result = transform(&data, &p, None, Some(limits)).unwrap();
+        let result = transform(&data, &p, None, Some(limits), None).unwrap();
         assert_eq!(result.format, OutputFormat::Thumbhash);
         assert!(HASH_BYTES.contains(&thumbhash_bytes(&result).len()));
     }
@@ -2261,9 +2300,7 @@ mod tests {
             base_result.clone(),
             std::slice::from_ref(&entry),
             &[overlay_fixture()],
-            80,
-            DEFAULT_AVIF_EFFORT,
-            MetadataMode::Strip,
+            &test_encode_options(),
         )
         .unwrap();
         assert_eq!(result, base_result);
@@ -2362,7 +2399,7 @@ mod tests {
             rotate: Some(Rotation::Deg90),
             ..Default::default()
         };
-        let result = transform(&nonsquare_jpeg(), &p, None, None).unwrap();
+        let result = transform(&nonsquare_jpeg(), &p, None, None, None).unwrap();
         assert_eq!(result.width, 200);
         assert!(
             result.height > result.width,
@@ -2382,7 +2419,7 @@ mod tests {
             trim_left: Some(0.5),
             ..Default::default()
         };
-        let result = transform(&nonsquare_jpeg(), &p, None, None).unwrap();
+        let result = transform(&nonsquare_jpeg(), &p, None, None, None).unwrap();
         assert_eq!((result.width, result.height), (100, 150));
     }
 
@@ -2409,8 +2446,8 @@ mod tests {
                 rotate: Some(Rotation::Deg0),
                 ..fast.clone()
             };
-            let a = transform(&jpeg, &fast, None, None).unwrap();
-            let b = transform(&jpeg, &full, None, None).unwrap();
+            let a = transform(&jpeg, &fast, None, None, None).unwrap();
+            let b = transform(&jpeg, &full, None, None, None).unwrap();
             assert_eq!((a.width, a.height), (b.width, b.height), "fit={fit:?}");
         }
     }
@@ -2427,8 +2464,371 @@ mod tests {
             rotate: Some(Rotation::Deg0),
             ..fast.clone()
         };
-        let a = transform(&data, &fast, None, None).unwrap();
-        let b = transform(&data, &full, None, None).unwrap();
+        let a = transform(&data, &fast, None, None, None).unwrap();
+        let b = transform(&data, &full, None, None, None).unwrap();
         assert_eq!((a.width, a.height), (b.width, b.height));
+    }
+
+    /// A JPEG with the given EXIF orientation tag. It stores 2000x1500
+    /// pixels, or 1500x2000 pixels when `stored_portrait` is set.
+    fn oriented_jpeg(orientation: i32, stored_portrait: bool) -> Vec<u8> {
+        let mut image = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+        if stored_portrait {
+            image = image.rot(consts::VIPS_ANGLE_D90).unwrap();
+        }
+        image.set_int("orientation", orientation);
+        let jpeg = image.save_jpeg(85, false).unwrap();
+        let reloaded = VipsImage::from_buffer(&jpeg).unwrap();
+        assert_eq!(reloaded.get_int("orientation"), Some(orientation));
+        let stored = if stored_portrait {
+            (1500, 2000)
+        } else {
+            (2000, 1500)
+        };
+        assert_eq!((reloaded.width(), reloaded.height()), stored);
+        jpeg
+    }
+
+    /// Run a width-only or height-only request on the fast path (JPEG
+    /// source, shrink-on-load) and on the full-decode path. `rotate=0` is a
+    /// no-op that forces the full decode. Both paths must agree.
+    fn resize_dimensions_on_both_paths(
+        data: &[u8],
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> (u32, u32) {
+        let fast = TransformParams {
+            width,
+            height,
+            ..Default::default()
+        };
+        let full = TransformParams {
+            rotate: Some(Rotation::Deg0),
+            ..fast.clone()
+        };
+        let a = transform(data, &fast, None, None, None).unwrap();
+        let b = transform(data, &full, None, None, None).unwrap();
+        assert_eq!(
+            (a.width, a.height),
+            (b.width, b.height),
+            "fast and full-decode paths must agree"
+        );
+        (a.width, a.height)
+    }
+
+    /// Each case pairs a stored shape with the expected output size. The
+    /// flag is true for a stored portrait image. A stored 2000x1500 image
+    /// with a quarter-turn tag displays as 1500x2000. A stored 1500x2000
+    /// image displays as 2000x1500.
+    const QUARTER_TURN_CASES: [(bool, (u32, u32)); 2] = [(false, (300, 400)), (true, (300, 225))];
+
+    #[test]
+    fn resize_width_only_derives_height_from_oriented_aspect_for_quarter_turn_exif() {
+        init();
+        for (stored_portrait, expected) in QUARTER_TURN_CASES {
+            for orientation in [5, 6, 7, 8] {
+                let data = oriented_jpeg(orientation, stored_portrait);
+                assert_eq!(
+                    resize_dimensions_on_both_paths(&data, Some(300), None),
+                    expected,
+                    "orientation {orientation}, stored portrait {stored_portrait}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resize_height_only_derives_width_from_oriented_aspect_for_quarter_turn_exif() {
+        init();
+        for (stored_portrait, expected) in QUARTER_TURN_CASES {
+            for orientation in [5, 6, 7, 8] {
+                let data = oriented_jpeg(orientation, stored_portrait);
+                assert_eq!(
+                    resize_dimensions_on_both_paths(&data, None, Some(expected.1)),
+                    expected,
+                    "orientation {orientation}, stored portrait {stored_portrait}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resize_derives_missing_side_from_stored_aspect_when_exif_is_not_a_quarter_turn() {
+        init();
+        let untagged = {
+            let png = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+            png.save_jpeg(85, false).unwrap()
+        };
+        let mut sources = vec![("none".to_string(), untagged)];
+        for orientation in [1, 2, 3, 4] {
+            sources.push((orientation.to_string(), oriented_jpeg(orientation, false)));
+        }
+        for (label, data) in sources {
+            assert_eq!(
+                resize_dimensions_on_both_paths(&data, Some(300), None),
+                (300, 225),
+                "orientation {label}, width only"
+            );
+            assert_eq!(
+                resize_dimensions_on_both_paths(&data, None, Some(225)),
+                (300, 225),
+                "orientation {label}, height only"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_derives_missing_side_from_oriented_aspect_for_other_fit_modes() {
+        init();
+        for fit in [
+            FitMode::Contain,
+            FitMode::Inside,
+            FitMode::Pad,
+            FitMode::Crop,
+        ] {
+            for (stored_portrait, expected) in QUARTER_TURN_CASES {
+                let data = oriented_jpeg(6, stored_portrait);
+                for (width, height) in [(Some(expected.0), None), (None, Some(expected.1))] {
+                    // `crop` needs a height to define its box.
+                    if fit == FitMode::Crop && height.is_none() {
+                        continue;
+                    }
+                    let p = TransformParams {
+                        width,
+                        height,
+                        fit,
+                        ..Default::default()
+                    };
+                    let result = transform(&data, &p, None, None, None).unwrap();
+                    assert_eq!(
+                        (result.width, result.height),
+                        expected,
+                        "fit={fit:?}, stored portrait {stored_portrait}, w={width:?}, h={height:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resize_applies_exif_orientation_after_an_explicit_rotate() {
+        init();
+        let p = TransformParams {
+            width: Some(300),
+            rotate: Some(Rotation::Deg90),
+            ..Default::default()
+        };
+        // rotate=90 turns the stored 1500x2000 into 2000x1500. The tag then
+        // turns it back to 1500x2000, so w=300 gives 300x400. The stored
+        // ratio would give 300x225.
+        let data = oriented_jpeg(6, true);
+        let result = transform(&data, &p, None, None, None).unwrap();
+        assert_eq!((result.width, result.height), (300, 400));
+        // rotate=90 turns the stored 2000x1500 into 1500x2000. The tag then
+        // turns it back to 2000x1500, so w=300 gives 300x225.
+        let data = oriented_jpeg(6, false);
+        let result = transform(&data, &p, None, None, None).unwrap();
+        assert_eq!((result.width, result.height), (300, 225));
+    }
+
+    /// An untagged JPEG that is 1500x2000 when `portrait` is set and
+    /// 2000x1500 otherwise. It has the displayed shape of a tagged source.
+    fn untagged_jpeg(portrait: bool) -> Vec<u8> {
+        let mut image = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+        if portrait {
+            image = image.rot(consts::VIPS_ANGLE_D90).unwrap();
+        }
+        image.save_jpeg(85, false).unwrap()
+    }
+
+    fn aspect_crop_size(data: &[u8], width: u32, height: u32, fast_path: bool) -> (u32, u32) {
+        let p = TransformParams {
+            width: Some(width),
+            height: Some(height),
+            fit: FitMode::AspectCrop,
+            rotate: (!fast_path).then_some(Rotation::Deg0),
+            ..Default::default()
+        };
+        let result = transform(data, &p, None, None, None).unwrap();
+        (result.width, result.height)
+    }
+
+    /// The tagged source displays with the sides swapped, so `aspect-crop`
+    /// must give the size of an untagged image with that displayed shape.
+    /// The requests cover the downscale branch and the direct-crop branch.
+    #[test]
+    fn aspect_crop_uses_oriented_dimensions_for_quarter_turn_exif() {
+        init();
+        let requests = [(1000, 1600), (3000, 2500), (1600, 1000), (300, 400)];
+        for stored_portrait in [false, true] {
+            let untagged = untagged_jpeg(!stored_portrait);
+            for orientation in [5, 6, 7, 8] {
+                let tagged = oriented_jpeg(orientation, stored_portrait);
+                for (width, height) in requests {
+                    for fast_path in [true, false] {
+                        assert_eq!(
+                            aspect_crop_size(&tagged, width, height, fast_path),
+                            aspect_crop_size(&untagged, width, height, true),
+                            "orientation {orientation}, stored portrait {stored_portrait}, \
+                             {width}x{height}, fast path {fast_path}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aspect_crop_direct_crop_gives_the_documented_size_for_quarter_turn_exif() {
+        init();
+        // Displayed 1500x2000. The request 3000x2500 needs an upscale, so the
+        // image crops to the 6:5 ratio at the original size.
+        let data = oriented_jpeg(6, false);
+        assert_eq!(aspect_crop_size(&data, 3000, 2500, true), (1500, 1250));
+        // The request 1000x1600 fits without an upscale.
+        assert_eq!(aspect_crop_size(&data, 1000, 1600, true), (1000, 1600));
+    }
+
+    #[test]
+    fn aspect_crop_direct_crop_clears_the_orientation_tag_with_metadata_keep() {
+        init();
+        for orientation in 1..=8 {
+            let data = oriented_jpeg(orientation, false);
+            let p = TransformParams {
+                width: Some(3000),
+                height: Some(2500),
+                fit: FitMode::AspectCrop,
+                format: Some(OutputFormat::Jpeg),
+                metadata: MetadataMode::Keep,
+                ..Default::default()
+            };
+            let result = transform(&data, &p, None, None, None).unwrap();
+            let reloaded = VipsImage::from_buffer(&result.data).unwrap();
+            assert!(
+                matches!(reloaded.get_int("orientation"), None | Some(1)),
+                "orientation {orientation} left a turn tag on the output"
+            );
+            assert_eq!(
+                (reloaded.width() as u32, reloaded.height() as u32),
+                (result.width, result.height),
+                "orientation {orientation}"
+            );
+        }
+    }
+
+    fn encoded_len(data: &[u8], params: &str, encoder: Option<EncoderSettings>) -> usize {
+        let tp = parse(params).unwrap();
+        transform(data, &tp, None, None, encoder)
+            .unwrap()
+            .data
+            .len()
+    }
+
+    #[test]
+    fn transform_uses_encoder_settings_avif_effort() {
+        init();
+        let data = nonsquare_fixture();
+        let params = "format=avif,w=300";
+        let slow = encoded_len(&data, params, Some(EncoderSettings { avif_effort: 9 }));
+        let fast = encoded_len(&data, params, Some(EncoderSettings { avif_effort: 0 }));
+        assert!(
+            fast > slow,
+            "effort 0 must give larger AVIF output than effort 9 ({fast} vs {slow})"
+        );
+        assert_eq!(
+            encoded_len(&data, params, None),
+            encoded_len(&data, params, Some(EncoderSettings::default())),
+            "None must select the default encoder settings"
+        );
+    }
+
+    #[test]
+    fn transform_quality_reaches_the_jpeg_encoder() {
+        init();
+        let data = nonsquare_fixture();
+        let low = encoded_len(&data, "format=jpeg,w=300,quality=10", None);
+        let high = encoded_len(&data, "format=jpeg,w=300,quality=90", None);
+        assert!(
+            low < high,
+            "quality=10 must give fewer bytes ({low} vs {high})"
+        );
+    }
+
+    #[test]
+    fn transform_metadata_keep_preserves_exif_and_strip_removes_it() {
+        init();
+        let data = oriented_jpeg(6, false);
+        let orientation_of = |metadata: &str| {
+            let tp = parse(&format!("format=jpeg,metadata={metadata}")).unwrap();
+            let result = transform(&data, &tp, None, None, None).unwrap();
+            VipsImage::from_buffer(&result.data)
+                .unwrap()
+                .get_int("orientation")
+        };
+        assert_eq!(orientation_of("keep"), Some(6));
+        assert_eq!(orientation_of("strip"), None);
+    }
+
+    #[test]
+    fn apply_draw_overlays_honours_encode_options_quality() {
+        init();
+        let data = nonsquare_fixture();
+        let tp = parse("format=jpeg,w=600").unwrap();
+        let base_result = transform(&data, &tp, None, None, None).unwrap();
+        let entry = DrawOverlay {
+            url: Some("https://example.com/logo.png".to_string()),
+            ..Default::default()
+        };
+        let len_at = |quality: u8| {
+            let options = EncodeOptions {
+                quality,
+                ..test_encode_options()
+            };
+            apply_draw_overlays(
+                base_result.clone(),
+                std::slice::from_ref(&entry),
+                &[overlay_fixture()],
+                &options,
+            )
+            .unwrap()
+            .data
+            .len()
+        };
+        let (low, high) = (len_at(10), len_at(90));
+        assert!(
+            low < high,
+            "quality 10 must give fewer bytes ({low} vs {high})"
+        );
+    }
+
+    #[test]
+    fn encode_options_new_copies_request_fields_and_encoder_effort() {
+        let tp = parse("quality=33,metadata=keep").unwrap();
+        let options = EncodeOptions::new(&tp, EncoderSettings { avif_effort: 3 });
+        assert_eq!(
+            options,
+            EncodeOptions {
+                quality: 33,
+                avif_effort: 3,
+                metadata: MetadataMode::Keep,
+            }
+        );
+    }
+
+    #[test]
+    fn oriented_size_swaps_the_sides_only_for_quarter_turn_orientations() {
+        init();
+        for orientation in 1..=8 {
+            let png = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+            png.set_int("orientation", orientation);
+            let expected = if (5..=8).contains(&orientation) {
+                (1500, 2000)
+            } else {
+                (2000, 1500)
+            };
+            assert_eq!(oriented_size(&png), expected, "orientation {orientation}");
+        }
+        let untagged = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+        assert_eq!(oriented_size(&untagged), (2000, 1500));
     }
 }

@@ -454,6 +454,15 @@ impl VipsImage {
         op_result(rc, output, VipsError::OperationFailed)
     }
 
+    /// Apply the EXIF orientation tag to the pixels and remove the tag. An
+    /// image without the tag comes back unchanged.
+    pub fn autorot(&self) -> Result<Self, VipsError> {
+        let mut output: *mut ffi::VipsImage = ptr::null_mut();
+        let rc =
+            unsafe { ffi::vips_autorot(self.ptr.as_ptr(), &mut output, ptr::null::<c_char>()) };
+        op_result(rc, output, VipsError::OperationFailed)
+    }
+
     /// Flip horizontally or vertically (`ffi::VIPS_DIRECTION_*`).
     pub fn flip(&self, direction: i32) -> Result<Self, VipsError> {
         let mut output: *mut ffi::VipsImage = ptr::null_mut();
@@ -860,6 +869,27 @@ mod tests {
         assert_eq!(img.width(), 8);
         assert_eq!(img.height(), 4);
         assert_eq!(img.get_int("orientation"), Some(6));
+    }
+
+    #[test]
+    fn autorot_applies_the_exif_orientation_and_removes_the_tag() {
+        init().expect("vips init");
+        let data = fixture("exif_orientation.jpg");
+        let img = VipsImage::from_buffer(&data).expect("load exif-oriented jpeg");
+        assert_eq!((img.width(), img.height()), (8, 4));
+        let upright = img.autorot().expect("autorot");
+        assert_eq!((upright.width(), upright.height()), (4, 8));
+        assert_eq!(upright.get_int("orientation"), None);
+    }
+
+    #[test]
+    fn autorot_leaves_an_untagged_image_unchanged() {
+        init().expect("vips init");
+        let data = fixture("exif_orientation.jpg");
+        let img = VipsImage::from_buffer(&data).expect("load jpeg");
+        let upright = img.autorot().expect("autorot");
+        let again = upright.autorot().expect("autorot again");
+        assert_eq!((again.width(), again.height()), (4, 8));
     }
 
     #[test]

@@ -449,6 +449,8 @@ async fn handle_image_request(
         max_pixels: state.config.transform.max_pixels,
         max_frames: state.config.transform.max_frames,
         max_animated_pixels: state.config.transform.max_animated_pixels,
+    };
+    let encoder_settings = pipeline::EncoderSettings {
         avif_effort: state.config.transform.avif_effort,
     };
 
@@ -470,20 +472,15 @@ async fn handle_image_request(
             &tp_for_task,
             accept_owned.as_deref(),
             Some(transform_limits),
+            Some(encoder_settings),
         )?;
+        let encode_options = pipeline::EncodeOptions::new(&tp_for_task, encoder_settings);
         // Gap 11: composite already-fetched draw overlays onto the
         // transformed base image, then re-encode. Kept inside this same
         // spawn_blocking task (rather than after `.await`) since
         // compositing is more libvips FFI work and must stay off the
         // async runtime thread, same as `transform()` itself.
-        pipeline::apply_draw_overlays(
-            result,
-            &tp_for_task.draw,
-            &overlay_bytes,
-            tp_for_task.quality,
-            transform_limits.avif_effort,
-            tp_for_task.metadata,
-        )
+        pipeline::apply_draw_overlays(result, &tp_for_task.draw, &overlay_bytes, &encode_options)
     });
 
     match transform_task.await {
