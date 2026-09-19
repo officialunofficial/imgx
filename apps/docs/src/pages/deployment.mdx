@@ -47,7 +47,7 @@ docker run -p 8080:8080 -e IMGX_ORIGIN_BASE_URL=https://images.example.com imgx
 
 The Dockerfile uses a two-stage build:
 
-1. **Build stage** — `rust:alpine` with **vips-dev**, `cargo build --release`
+1. **Build stage** — `rust:1.98.1-alpine` with **vips-dev**, `cargo build --release`
 2. **Runtime stage** — Alpine with only the **vips** runtime library
 
 ---
@@ -80,7 +80,7 @@ services:
 ## Build from source
 
 Requirements:
-- Rust (stable)
+- Rust 1.98.1 (pinned in `rust-toolchain.toml`)
 - libvips 8.14.0 or later (with development headers)
 
 ### macOS

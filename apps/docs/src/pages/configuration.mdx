@@ -46,6 +46,7 @@ Required when `IMGX_ORIGIN_TYPE=r2`. All fields must be non-empty.
 | `IMGX_TRANSFORM_STRIP_METADATA` | `bool` | `true` | Strip EXIF and other metadata from output. Accepts `true`/`1` or `false`/`0`. |
 | `IMGX_TRANSFORM_MAX_FRAMES` | `u32` | `100` | Maximum frames to load from animated images. Excess frames are truncated. |
 | `IMGX_TRANSFORM_MAX_ANIMATED_PIXELS` | `u64` | `50000000` | Maximum total pixels across all frames. Animated images exceeding this budget are served as a static first frame. |
+| `IMGX_TRANSFORM_AVIF_EFFORT` | `u8` | `4` | AVIF encoder effort, `0` to `9`. A lower value encodes faster and writes larger files. The default is the libvips default. The cache key does not include this setting. A cached variant keeps the effort it had when imgx encoded it. |
 
 ## Cache
 

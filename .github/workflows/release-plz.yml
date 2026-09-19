@@ -39,14 +39,12 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1
 
-      - name: Install libvips (cached)
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        with:
-          packages: libvips-dev
-          version: "1.0"
-          execute_install_scripts: true
+      - name: Install libvips
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvips-dev
 
       - name: Run release-plz
         uses: release-plz/action@v0.5
@@ -84,7 +82,7 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1
 
       - name: Install release-plz
         uses: taiki-e/install-action@v2

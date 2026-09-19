@@ -40,6 +40,7 @@ metrics = { version = "0.24.6", default-features = false }
 # through our existing axum router below. `default-features = false`
 # leaves just PrometheusBuilder/PrometheusHandle::render().
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+libm = "0.2"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.7"

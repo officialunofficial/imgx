@@ -14,6 +14,8 @@ cargo fmt --all -- --check                                # format check (CI enf
 cargo clippy --workspace --all-targets -- -D warnings     # lint (CI enforced, see clippy.toml)
 ```
 
+The Rust toolchain is pinned to 1.98.1 in `rust-toolchain.toml`. `rustup` installs it on the first `cargo` run. The same version appears in `rust-version` (`Cargo.toml`), `msrv` (`clippy.toml`), the CI workflows, and the `Dockerfile`. Change all of them together.
+
 Requires libvips and glib headers. On macOS: `brew install vips`. On Alpine: `apk add vips-dev musl-dev pkgconfig` (see `.cargo/config.toml` for the musl `crt-static` workaround needed for dynamic libvips linking).
 
 ## Workspace layout
@@ -22,7 +24,7 @@ Two crates:
 - `crates/imgx-vips/` — hand-rolled libvips FFI (the crate's `unsafe`/audit boundary). Raw `extern "C"` declarations in `ffi.rs`, a safe RAII wrapper in `image.rs`.
 - `crates/imgx/` — the binary. `#![forbid(unsafe_code)]` — all `unsafe` stays quarantined in `imgx-vips`.
 
-Module tree inside `crates/imgx/src/` mirrors the domain: `config`, `router`, `server`, `http/{errors,response}`, `cache/{mod,memory,noop,r2,tiered}`, `origin/{source,fetcher,r2}`, `s3/client`, `transform/{params,negotiate,pipeline}`.
+Module tree inside `crates/imgx/src/` mirrors the domain: `config`, `router`, `server`, `http/{errors,response}`, `cache/{mod,memory,noop,r2,tiered}`, `origin/{source,fetcher,r2}`, `s3/client`, `transform/{params,negotiate,pipeline,thumbhash}`.
 
 See `docs/INVARIANTS.md` for behaviors that must never change without a conscious, documented decision.
 
