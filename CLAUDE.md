@@ -14,6 +14,8 @@ cargo fmt --all -- --check                                # format check (CI enf
 cargo clippy --workspace --all-targets -- -D warnings     # lint (CI enforced, see clippy.toml)
 ```
 
+The Rust toolchain is pinned to 1.98.1 in `rust-toolchain.toml`. `rustup` installs it on the first `cargo` run. The same version appears in `rust-version` (`Cargo.toml`), `msrv` (`clippy.toml`), the CI workflows, and the `Dockerfile`. Change all of them together.
+
 Requires libvips and glib headers. On macOS: `brew install vips`. On Alpine: `apk add vips-dev musl-dev pkgconfig` (see `.cargo/config.toml` for the musl `crt-static` workaround needed for dynamic libvips linking).
 
 ## Workspace layout

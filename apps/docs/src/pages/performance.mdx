@@ -125,4 +125,4 @@ samply record ./target/profiling/imgx
 # samply opens the trace in your browser automatically.
 ```
 
-For a production-like build under the profiler, run it in a container matching the Dockerfile's build (`cargo build --profile profiling` inside `rust:alpine`, then copy the binary out) so libvips is linked the same way it is in production.
+For a production-like build under the profiler, run it in a container matching the Dockerfile's build (`cargo build --profile profiling` inside `rust:1.98.1-alpine`, then copy the binary out) so libvips is linked the same way it is in production.

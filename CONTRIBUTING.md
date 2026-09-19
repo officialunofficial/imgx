@@ -2,7 +2,7 @@
 
 ## Setup
 
-Requires Rust (stable) and libvips 8.14+ (`brew install vips` on macOS, `apt-get install libvips-dev` on Debian/Ubuntu).
+Requires Rust 1.98.1 (pinned in `rust-toolchain.toml`) and libvips 8.14+ (`brew install vips` on macOS, `apt-get install libvips-dev` on Debian/Ubuntu).
 
 ```sh
 cargo build --workspace
