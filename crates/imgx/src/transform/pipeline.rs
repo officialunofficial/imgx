@@ -15,6 +15,7 @@ use super::params::{
 };
 use super::thumbhash::{self, ThumbhashError};
 
+/// Why `transform` failed.
 #[derive(Debug, Error)]
 pub enum TransformError {
     #[error(transparent)]
@@ -34,6 +35,9 @@ pub struct TransformResult {
     pub height: u32,
     pub is_animated: bool,
     pub frame_count: Option<u32>,
+    /// True when the resize ran the reduced decode of the source bytes.
+    /// Tests read it. No response header or body carries it. See INV-21.
+    pub decoded_at_reduced_size: bool,
 }
 
 /// Safety limits enforced during transform execution -- a general
@@ -280,6 +284,7 @@ pub fn transform(
         .then_some(input_data);
 
     // -- RESIZE --
+    let mut decoded_at_reduced_size = false;
     let eff_w = tp.effective_width().map(|w| w as i32);
     let eff_h = tp.effective_height().map(|h| h as i32);
 
@@ -429,11 +434,18 @@ pub fn transform(
                     size: Some(consts::VIPS_SIZE_DOWN),
                     ..Default::default()
                 };
-                current = resize(&current, resize_source, tw, opts)?;
+                (current, decoded_at_reduced_size) =
+                    resize(&current, resize_source, None, tw, opts)?;
             }
         } else {
             let opts = build_thumbnail_options(effective_fit, tp.gravity, derived_height);
-            current = resize(&current, resize_source, thumb_width, opts)?;
+            (current, decoded_at_reduced_size) = resize(
+                &current,
+                resize_source,
+                Some((oriented_w, oriented_h)),
+                thumb_width,
+                opts,
+            )?;
 
             // After resize, refresh page-height metadata for animated
             // images so the GIF/WebP encoder splits frames correctly.
@@ -581,6 +593,7 @@ pub fn transform(
             } else {
                 None
             },
+            decoded_at_reduced_size,
         });
     }
 
@@ -599,6 +612,7 @@ pub fn transform(
             height: out_height,
             is_animated: false,
             frame_count: None,
+            decoded_at_reduced_size,
         });
     }
 
@@ -629,6 +643,7 @@ pub fn transform(
         } else {
             None
         },
+        decoded_at_reduced_size,
     })
 }
 
@@ -716,40 +731,137 @@ fn bg_color_from_params(background: Option<[u8; 3]>) -> [f64; 3] {
     }
 }
 
-/// Return true when no stage before the resize changes `current`. The
-/// resize can then decode the source bytes again, at reduced size. Keep this
-/// list in step with the stages of `transform` that run before the resize.
+/// Return true when the resize can decode the source bytes again, at reduced
+/// size. That is only right when no stage before the resize changes
+/// `current`, and when the crop window does not depend on the pixels that the
+/// reduced decode changes. Keep this list in step with the stages of
+/// `transform` that run before the resize.
 ///
-/// `format=thumbhash` never reads the source again. That second decode uses
-/// the default lenient load, so a truncated JPEG or WebP would give blank
-/// pixels and a wrong hash. The strict load of `current` already covers the
-/// full-size resize (INV-19).
+/// `format=thumbhash` never runs the reduced decode. It decodes the source at
+/// full size, with the strict load of INV-19. A strict reduced decode is not
+/// reliable: on libvips 8.15.1, `fail_on=error` in `vips_thumbnail_source` can
+/// let a truncated JPEG through. A hash of blank pixels then follows.
+///
+/// A parameter whose value leaves the image as it is does not stop the
+/// reduced decode. These are `rotate=0` and a per-side trim of exactly 0. A
+/// numeric `trim`, a `flip`, and a `frame` stay blockers for every value:
+/// `trim` removes a uniform border at any threshold, a `flip` always turns
+/// the image, and `frame` is a no-op only for a source with one frame,
+/// which this function cannot tell.
+///
+/// `gravity=smart` and `gravity=attention` pick the crop window from the
+/// image content. A reduced decode of a WebP source changes that content,
+/// and the window can move by tens of pixels. These requests decode at full
+/// size. The gravity matters only for the fits that crop.
 fn resize_reads_source(tp: &TransformParams, animated_output: bool) -> bool {
     tp.format != Some(OutputFormat::Thumbhash)
         && !animated_output
         && tp.frame.is_none()
         && tp.trim.is_none()
-        && tp.trim_top.is_none()
-        && tp.trim_right.is_none()
-        && tp.trim_bottom.is_none()
-        && tp.trim_left.is_none()
-        && tp.rotate.is_none()
+        && !trims_a_side(tp)
+        && tp.rotate.is_none_or(|rotation| rotation == Rotation::Deg0)
         && tp.flip.is_none()
+        && !crops_by_content(tp)
 }
 
-/// Resize `current` to fit `width`. With `source` set, decode those bytes
-/// again at reduced size (`VipsImage::thumbnail_buffer`). Otherwise shrink
-/// the full-size `current`.
+/// Return true when a per-side trim removes at least one pixel row or
+/// column. A value of exactly 0 removes nothing, whatever the image size.
+fn trims_a_side(tp: &TransformParams) -> bool {
+    [tp.trim_top, tp.trim_right, tp.trim_bottom, tp.trim_left]
+        .into_iter()
+        .flatten()
+        .any(|value| value != 0.0)
+}
+
+/// Return true when the fit crops to the box and the gravity picks the crop
+/// window from the image content.
+fn crops_by_content(tp: &TransformParams) -> bool {
+    matches!(tp.fit, FitMode::Cover | FitMode::Crop | FitMode::AspectCrop)
+        && matches!(tp.gravity, Gravity::Smart | Gravity::Attention)
+}
+
+/// Return the size that `vips_thumbnail_image` gives a `contain` box on a
+/// full-size image. `source` is the size of the image after the EXIF
+/// orientation. `target` is the box, and it sets the sides of the box in
+/// the same space. This is the size of the full decode for `contain`,
+/// `inside`, and `pad`.
+///
+/// libvips picks one shrink factor for both sides: the larger of the two
+/// ratios, and at least 1. It clamps the factor to each side. Then it gives
+/// each side to its reduce step as the reciprocal of a reciprocal, and rounds
+/// the result to the nearest integer. The steps below follow that maths,
+/// including the two divisions, so the rounding matches bit for bit.
+fn contain_size(source: (i32, i32), target: (i32, i32)) -> (i32, i32) {
+    let shrink = (source.0 as f64 / target.0 as f64)
+        .max(source.1 as f64 / target.1 as f64)
+        .max(1.0);
+    (
+        reduced_side(source.0, shrink),
+        reduced_side(source.1, shrink),
+    )
+}
+
+fn reduced_side(length: i32, shrink: f64) -> i32 {
+    let length = length as f64;
+    let reduce = 1.0 / (1.0 / shrink.min(length));
+    (length / reduce + 0.5) as i32
+}
+
+/// Return the size that the full decode gives when the fit is `contain`,
+/// `inside`, or `pad`, and `None` for every other request. `cover` and `crop`
+/// crop to the box, and `fill` and `outside` give the same size on both
+/// decode paths. A request without a box height has no box to check, so it
+/// also gives `None`. `oriented` is the size of the source after the EXIF
+/// orientation. The pipeline never sets `no_rotate`, so the box holds
+/// oriented dimensions.
+fn full_decode_size(
+    oriented: (i32, i32),
+    width: i32,
+    opts: ThumbnailOptions,
+) -> Option<(i32, i32)> {
+    if opts.crop.is_some() || opts.size != Some(consts::VIPS_SIZE_DOWN) {
+        return None;
+    }
+    Some(contain_size(oriented, (width, opts.height?)))
+}
+
+/// Resize `current` to fit `width`. With `source` set, run the reduced
+/// decode of those bytes (`VipsImage::thumbnail_buffer`). Otherwise shrink
+/// the full-size `current`. The flag in the result is true when the resize
+/// decoded `source`. `oriented` is the size of `current` after the EXIF
+/// orientation. A caller that needs no size check passes `None`.
+///
+/// A reduced decode measures its shrink factor on the smaller image that the
+/// decoder returns, so a `contain` request can land 1 px away from the full
+/// decode. The size of a lazy image is known before libvips reads any pixel.
+/// When it differs from `full_decode_size`, the resize runs again with `size`
+/// set to `force` and the exact size. A request that already has the right
+/// size keeps its bytes.
 fn resize(
     current: &VipsImage,
     source: Option<&[u8]>,
+    oriented: Option<(i32, i32)>,
     width: i32,
     opts: ThumbnailOptions,
-) -> Result<VipsImage, VipsError> {
-    match source {
-        Some(bytes) => VipsImage::thumbnail_buffer(bytes, width, opts),
-        None => current.thumbnail(width, opts),
-    }
+) -> Result<(VipsImage, bool), VipsError> {
+    let Some(bytes) = source else {
+        return current.thumbnail(width, opts).map(|image| (image, false));
+    };
+    let image = VipsImage::thumbnail_buffer(bytes, width, opts)?;
+    let image = match oriented.and_then(|size| full_decode_size(size, width, opts)) {
+        Some((box_width, box_height))
+            if (image.width(), image.height()) != (box_width, box_height) =>
+        {
+            let exact = ThumbnailOptions {
+                height: Some(box_height),
+                size: Some(consts::VIPS_SIZE_FORCE),
+                ..opts
+            };
+            VipsImage::thumbnail_buffer(bytes, box_width, exact)?
+        }
+        _ => image,
+    };
+    Ok((image, true))
 }
 
 /// Map FitMode + Gravity to vips ThumbnailOptions.
@@ -2470,21 +2582,21 @@ mod tests {
                     ..base.clone()
                 },
             ),
-            // The dimension tests below use `rotate=0` as their full-decode
-            // control, so it must keep disabling the fast path.
-            (
-                "rotate=0",
-                TransformParams {
-                    rotate: Some(Rotation::Deg0),
-                    ..base.clone()
-                },
-            ),
-            // The second decode is lenient, so a truncated source would
-            // give blank pixels (INV-19).
+            // The reduced decode is lenient. A truncated source then gives
+            // blank pixels (INV-19).
             (
                 "format=thumbhash",
                 TransformParams {
                     format: Some(OutputFormat::Thumbhash),
+                    ..base.clone()
+                },
+            ),
+            // The tests below use `frame=0` as their full-decode control, so
+            // it must keep disabling the reduced decode.
+            (
+                "frame=0",
+                TransformParams {
+                    frame: Some(0),
                     ..base.clone()
                 },
             ),
@@ -2515,8 +2627,8 @@ mod tests {
     #[test]
     fn jpeg_source_trim_is_applied_before_resize() {
         init();
-        // Trimming half of 2000 px leaves 1000x1500. A resize that skipped
-        // the trim would give 100x75.
+        // Trimming half of 2000 px leaves 1000x1500. A resize that skips
+        // the trim gives 100x75.
         let p = TransformParams {
             width: Some(100),
             trim_left: Some(0.5),
@@ -2526,8 +2638,8 @@ mod tests {
         assert_eq!((result.width, result.height), (100, 150));
     }
 
-    /// `rotate=0` is a no-op that still disables shrink-on-load, so it
-    /// gives the full-decode result to compare against.
+    /// `frame=0` is a no-op on a static source that still disables the
+    /// reduced decode, so it gives the full decode to compare against.
     #[test]
     fn shrink_on_load_resize_matches_full_decode_dimensions() {
         init();
@@ -2546,7 +2658,7 @@ mod tests {
                 ..Default::default()
             };
             let full = TransformParams {
-                rotate: Some(Rotation::Deg0),
+                frame: Some(0),
                 ..fast.clone()
             };
             let a = transform(&jpeg, &fast, None, None).unwrap();
@@ -2564,7 +2676,7 @@ mod tests {
             ..Default::default()
         };
         let full = TransformParams {
-            rotate: Some(Rotation::Deg0),
+            frame: Some(0),
             ..fast.clone()
         };
         let a = transform(&data, &fast, None, None).unwrap();
@@ -2592,9 +2704,9 @@ mod tests {
         jpeg
     }
 
-    /// Run a width-only or height-only request on the fast path (JPEG
-    /// source, shrink-on-load) and on the full-decode path. `rotate=0` is a
-    /// no-op that forces the full decode. Both paths must agree.
+    /// Run a width-only or height-only request with the reduced decode (JPEG
+    /// source) and with the full decode. `frame=0` is a no-op that forces the
+    /// full decode. Both decodes must agree.
     fn resize_dimensions_on_both_paths(
         data: &[u8],
         width: Option<u32>,
@@ -2606,7 +2718,7 @@ mod tests {
             ..Default::default()
         };
         let full = TransformParams {
-            rotate: Some(Rotation::Deg0),
+            frame: Some(0),
             ..fast.clone()
         };
         let a = transform(data, &fast, None, None).unwrap();
@@ -2614,7 +2726,7 @@ mod tests {
         assert_eq!(
             (a.width, a.height),
             (b.width, b.height),
-            "fast and full-decode paths must agree"
+            "the reduced decode and the full decode must agree"
         );
         (a.width, a.height)
     }
@@ -2749,7 +2861,7 @@ mod tests {
             width: Some(width),
             height: Some(height),
             fit: FitMode::AspectCrop,
-            rotate: (!fast_path).then_some(Rotation::Deg0),
+            frame: (!fast_path).then_some(0),
             ..Default::default()
         };
         let result = transform(data, &p, None, None).unwrap();
@@ -3126,6 +3238,1522 @@ mod tests {
                 hash_of_pixels_in(&png.data),
                 "{name}"
             );
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Decode path: which requests run the reduced decode (INV-21 to INV-26)
+    // ----------------------------------------------------------------
+
+    fn nonsquare_webp() -> Vec<u8> {
+        VipsImage::from_buffer(&nonsquare_fixture())
+            .unwrap()
+            .save_webp(80, true)
+            .unwrap()
+    }
+
+    fn transform_params(data: &[u8], params: &str) -> TransformResult {
+        let p = parse(params).unwrap_or_else(|e| panic!("parse [{params}]: {e:?}"));
+        transform(data, &p, None, None).unwrap_or_else(|e| panic!("transform [{params}]: {e:?}"))
+    }
+
+    /// Run `params` as given, then again with `frame=0`. `frame=0` is a
+    /// no-op on a static source that forces the full decode. Each run must take the path that
+    /// its name says.
+    fn both_paths(data: &[u8], params: &str) -> (TransformResult, TransformResult) {
+        let reduced = transform_params(data, params);
+        let full = transform_params(data, &format!("{params},frame=0"));
+        assert!(
+            reduced.decoded_at_reduced_size,
+            "[{params}] must decode at reduced size"
+        );
+        assert!(
+            !full.decoded_at_reduced_size,
+            "[{params},frame=0] must decode at full size"
+        );
+        (reduced, full)
+    }
+
+    /// An animated WebP of the 12 frames of `loading.gif`.
+    fn animated_webp() -> Vec<u8> {
+        let gif = fixture("loading.gif");
+        let frames = VipsImage::from_buffer_animated(&gif, -1).unwrap();
+        let webp = frames.save_webp(80, true).unwrap();
+        let probe = VipsImage::from_buffer(&webp).unwrap();
+        assert_eq!(probe.n_pages(), Some(12), "the encoder keeps every frame");
+        webp
+    }
+
+    struct Raster {
+        width: i32,
+        height: i32,
+        bands: i32,
+        pixels: Vec<u8>,
+    }
+
+    fn raster(encoded: &[u8]) -> Raster {
+        let image = VipsImage::from_buffer(encoded).unwrap();
+        Raster {
+            width: image.width(),
+            height: image.height(),
+            bands: image.bands(),
+            pixels: image.write_to_memory().unwrap(),
+        }
+    }
+
+    fn mean_abs_diff(a: &Raster, b: &Raster) -> f64 {
+        assert_eq!(
+            (a.width, a.height, a.bands),
+            (b.width, b.height, b.bands),
+            "rasters must have the same shape"
+        );
+        let total: u64 = a
+            .pixels
+            .iter()
+            .zip(&b.pixels)
+            .map(|(x, y)| x.abs_diff(*y) as u64)
+            .sum();
+        total as f64 / a.pixels.len() as f64
+    }
+
+    fn flipped(image: &Raster, horizontal: bool, vertical: bool) -> Raster {
+        let (w, h, bands) = (
+            image.width as usize,
+            image.height as usize,
+            image.bands as usize,
+        );
+        let mut pixels = Vec::with_capacity(image.pixels.len());
+        for y in 0..h {
+            let src_y = if vertical { h - 1 - y } else { y };
+            for x in 0..w {
+                let src_x = if horizontal { w - 1 - x } else { x };
+                let at = (src_y * w + src_x) * bands;
+                pixels.extend_from_slice(&image.pixels[at..at + bands]);
+            }
+        }
+        Raster {
+            pixels,
+            width: image.width,
+            height: image.height,
+            bands: image.bands,
+        }
+    }
+
+    #[test]
+    fn transform_reports_reduced_decode_for_jpeg_and_webp_resize() {
+        init();
+        let sources = [("jpeg", nonsquare_jpeg()), ("webp", nonsquare_webp())];
+        let requests = [
+            "w=100",
+            "h=100",
+            "w=100,h=80",
+            "w=100,h=80,fit=contain",
+            "w=100,h=80,fit=inside",
+            "w=100,h=80,fit=cover",
+            "w=100,h=80,fit=fill",
+            "w=100,h=80,fit=outside",
+            "w=100,h=80,fit=pad",
+            "w=100,h=80,fit=crop",
+            "w=100,h=80,fit=aspect-crop",
+            "w=100,h=80,fit=cover,g=center",
+            "w=100,h=80,fit=cover,g=north",
+            "w=100,h=80,fit=contain,g=smart",
+            "w=100,h=80,fit=pad,g=attention",
+            "w=100,f=jpeg",
+            "w=100,f=png",
+            "w=100,f=webp",
+            "w=100,f=json",
+            "w=50,dpr=2",
+            "w=100,sharpen=1,blur=1,brightness=1.1,gamma=1.2,saturation=0.8",
+            "w=100,bg=ff0000,border=2,q=50,metadata=keep,compression=fast",
+        ];
+        let mut misses = Vec::new();
+        for (label, data) in &sources {
+            for params in requests {
+                if !transform_params(data, params).decoded_at_reduced_size {
+                    misses.push(format!("{label} [{params}]"));
+                }
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "these requests must decode at reduced size: {misses:#?}"
+        );
+    }
+
+    #[test]
+    fn transform_reports_full_decode_when_the_resize_cannot_read_the_source() {
+        init();
+        let png = nonsquare_fixture();
+        let gif = fixture("loading.gif");
+        let small_png = VipsImage::from_buffer(&png)
+            .unwrap()
+            .thumbnail(64, ThumbnailOptions::default())
+            .unwrap();
+        // The libheif of some builds, such as Alpine, has no AVIF encoder.
+        let avif = small_png.save_avif(50, 0, true).ok();
+        let jpeg = nonsquare_jpeg();
+        let webp = nonsquare_webp();
+        let mut cases: Vec<(&str, &[u8], &str)> = vec![
+            // PNG, GIF, and AVIF have no reduced decode.
+            ("png", &png, "w=100"),
+            ("png", &png, "w=100,h=80,fit=cover"),
+            ("png", &png, "w=100,h=80,fit=aspect-crop"),
+            ("gif", &gif, "w=64,anim=static"),
+            ("gif", &gif, "w=64,frame=1"),
+            ("animated gif", &gif, "w=64"),
+            ("animated gif", &gif, "w=64,h=64,fit=cover"),
+            // No resize runs, so no reduced decode runs.
+            ("jpeg", &jpeg, "f=png"),
+            ("jpeg", &jpeg, "sharpen=1"),
+            ("jpeg", &jpeg, "f=json"),
+            ("webp", &webp, "f=png"),
+            ("webp", &webp, "f=json"),
+            // An `aspect-crop` that upscales crops the full image.
+            ("jpeg", &jpeg, "w=3000,h=2500,fit=aspect-crop"),
+            ("webp", &webp, "w=3000,h=2500,fit=aspect-crop"),
+            // `format=thumbhash` keeps the strict full decode (INV-19).
+            ("jpeg", &jpeg, "w=100,f=thumbhash"),
+            ("jpeg", &jpeg, "w=100,h=80,fit=cover,f=thumbhash"),
+            ("webp", &webp, "w=100,f=thumbhash"),
+            ("webp", &webp, "w=100,h=80,fit=cover,f=thumbhash"),
+            // Content-aware gravity picks the crop window from the full image.
+            ("jpeg", &jpeg, "w=100,h=80,fit=cover,g=smart"),
+            ("jpeg", &jpeg, "w=100,h=80,fit=crop,g=attention"),
+            ("jpeg", &jpeg, "w=100,h=80,fit=aspect-crop,g=smart"),
+            ("webp", &webp, "w=100,h=80,fit=cover,g=smart"),
+            ("webp", &webp, "w=100,h=80,fit=cover,g=attention"),
+            ("webp", &webp, "w=100,h=80,fit=crop,g=smart"),
+            ("webp", &webp, "w=100,h=80,fit=aspect-crop,g=attention"),
+        ];
+        if let Some(avif) = &avif {
+            cases.push(("avif", avif, "w=32"));
+        }
+        let mut wrong = Vec::new();
+        for (label, data, params) in cases {
+            if transform_params(data, params).decoded_at_reduced_size {
+                wrong.push(format!("{label} [{params}]"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "these requests must decode at full size: {wrong:#?}"
+        );
+    }
+
+    #[test]
+    fn rotate_takes_effect_and_disables_reduced_decode() {
+        init();
+        for (label, data) in [("jpeg", nonsquare_jpeg()), ("webp", nonsquare_webp())] {
+            for (rotate, expected) in [(90, (100, 133)), (180, (100, 75)), (270, (100, 133))] {
+                let params = format!("w=100,rotate={rotate}");
+                let result = transform_params(&data, &params);
+                assert!(!result.decoded_at_reduced_size, "{label} [{params}]");
+                assert_eq!(
+                    (result.width, result.height),
+                    expected,
+                    "{label} [{params}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flip_takes_effect_and_disables_reduced_decode() {
+        init();
+        for (label, data) in [("jpeg", nonsquare_jpeg()), ("webp", nonsquare_webp())] {
+            let (_, control) = both_paths(&data, "w=100,f=png");
+            let control = raster(&control.data);
+            for (mode, horizontal, vertical) in
+                [("h", true, false), ("v", false, true), ("hv", true, true)]
+            {
+                let params = format!("w=100,f=png,flip={mode}");
+                let result = transform_params(&data, &params);
+                assert!(!result.decoded_at_reduced_size, "{label} [{params}]");
+                let out = raster(&result.data);
+                let expected = flipped(&control, horizontal, vertical);
+                assert!(
+                    mean_abs_diff(&out, &expected) < 4.0,
+                    "{label} [{params}] must equal the flipped control"
+                );
+                assert!(
+                    mean_abs_diff(&out, &control) > 20.0,
+                    "{label} [{params}] must differ from the unflipped control"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn per_side_trim_takes_effect_and_disables_reduced_decode() {
+        init();
+        // The source is 2000x1500. Each request keeps the size in the range
+        // below. A resize that skips the trim gives 100x75.
+        let cases = [
+            ("trim.top=750", (100, 37..=38)),
+            ("trim.bottom=750", (100, 37..=38)),
+            ("trim.right=1000", (100, 150..=150)),
+            ("trim.left=0.5", (100, 150..=150)),
+        ];
+        for (label, data) in [("jpeg", nonsquare_jpeg()), ("webp", nonsquare_webp())] {
+            for (trim, (width, heights)) in &cases {
+                let params = format!("w=100,{trim}");
+                let result = transform_params(&data, &params);
+                assert!(!result.decoded_at_reduced_size, "{label} [{params}]");
+                assert_eq!(result.width, *width, "{label} [{params}]");
+                assert!(
+                    heights.contains(&result.height),
+                    "{label} [{params}]: height {}",
+                    result.height
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_trim_takes_effect_and_disables_reduced_decode() {
+        init();
+        // A white border 500 px wide on the left of the 2000x1500 image.
+        let bordered = VipsImage::from_buffer(&nonsquare_fixture())
+            .unwrap()
+            .embed(500, 0, 2500, 1500, [255.0, 255.0, 255.0])
+            .unwrap();
+        let sources = [
+            ("jpeg", bordered.save_jpeg(90, true).unwrap()),
+            ("webp", bordered.save_webp(90, true).unwrap()),
+        ];
+        for (label, data) in sources {
+            let untrimmed = transform_params(&data, "w=100");
+            assert!(untrimmed.decoded_at_reduced_size, "{label}");
+            assert_eq!(untrimmed.height, 60, "{label}: 2500x1500 gives 100x60");
+            let trimmed = transform_params(&data, "w=100,trim=10");
+            assert!(!trimmed.decoded_at_reduced_size, "{label}");
+            assert!(
+                (74..=76).contains(&trimmed.height),
+                "{label}: the trim leaves about 2000x1500, got height {}",
+                trimmed.height
+            );
+        }
+    }
+
+    #[test]
+    fn frame_takes_effect_and_disables_reduced_decode_on_animated_webp() {
+        init();
+        let data = animated_webp();
+        let first = transform_params(&data, "w=64,f=png,anim=static");
+        assert!(
+            first.decoded_at_reduced_size,
+            "a static request reads the first frame from the source"
+        );
+        let second = transform_params(&data, "w=64,f=png,frame=1");
+        assert!(!second.decoded_at_reduced_size);
+        assert_eq!((second.width, second.height), (64, 64));
+        assert_ne!(first.data, second.data, "frame 1 differs from frame 0");
+    }
+
+    #[test]
+    fn animated_output_disables_reduced_decode_and_keeps_every_frame() {
+        init();
+        let result = transform_params(&animated_webp(), "w=64,f=webp");
+        assert!(!result.decoded_at_reduced_size);
+        assert!(result.is_animated);
+        assert_eq!(result.frame_count, Some(12));
+        assert_eq!(result.width, 64);
+    }
+
+    #[test]
+    fn frame_zero_is_the_full_decode_control() {
+        init();
+        for (label, data) in [("jpeg", nonsquare_jpeg()), ("webp", nonsquare_webp())] {
+            let result = transform_params(&data, "w=100,frame=0");
+            assert!(!result.decoded_at_reduced_size, "{label}");
+            assert_eq!((result.width, result.height), (100, 75), "{label}");
+        }
+    }
+
+    fn max_pixels_settings(max_pixels: u64) -> Option<TransformSettings> {
+        Some(TransformSettings {
+            limits: TransformLimits {
+                max_pixels,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn transform_rejects_jpeg_and_webp_over_budget_for_every_resize_request() {
+        init();
+        let settings = max_pixels_settings(2_999_999);
+        for (label, data) in [("jpeg", nonsquare_jpeg()), ("webp", nonsquare_webp())] {
+            for params in [
+                "w=100",
+                "w=100,f=jpeg",
+                "w=100,f=webp",
+                "w=100,f=png",
+                "w=100,f=json",
+                "w=100,h=80,fit=cover,f=jpeg",
+                "w=100,h=80,fit=aspect-crop,f=jpeg",
+            ] {
+                let p = parse(params).unwrap();
+                let err = transform(&data, &p, None, settings)
+                    .expect_err(&format!("{label} [{params}] is over the budget"));
+                assert!(
+                    matches!(err, TransformError::ExceedsMaxPixels(3_000_000, 2_999_999)),
+                    "{label} [{params}]: {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transform_accepts_jpeg_and_webp_at_exactly_max_pixels() {
+        init();
+        let settings = max_pixels_settings(3_000_000);
+        for (label, data) in [("jpeg", nonsquare_jpeg()), ("webp", nonsquare_webp())] {
+            let p = parse("w=100,f=jpeg").unwrap();
+            let result = transform(&data, &p, None, settings).unwrap();
+            assert!(result.decoded_at_reduced_size, "{label}");
+            assert_eq!((result.width, result.height), (100, 75), "{label}");
+        }
+    }
+
+    #[test]
+    fn transform_checks_the_budget_before_the_reduced_decode_of_a_damaged_source() {
+        init();
+        // The reduced decode is lenient, so it accepts these sources.
+        // The budget error must come first, for every format. A WebP cut
+        // short fails at the probe, so its tail is overwritten instead.
+        let settings = max_pixels_settings(1_000);
+        let jpeg = nonsquare_jpeg();
+        let mut webp = nonsquare_webp();
+        let from = webp.len() / 2;
+        webp[from..].fill(0xAA);
+        let sources = [
+            ("jpeg cut", jpeg[..jpeg.len() / 2].to_vec()),
+            ("webp", webp),
+        ];
+        for (label, data) in &sources {
+            for params in ["w=100,f=jpeg", "w=100,f=png", "w=100,f=json", "w=100"] {
+                let p = parse(params).unwrap();
+                let err = transform(data, &p, None, settings)
+                    .expect_err(&format!("{label} [{params}] is over the budget"));
+                assert!(
+                    matches!(err, TransformError::ExceedsMaxPixels(3_000_000, 1_000)),
+                    "{label} [{params}]: {err:?}"
+                );
+            }
+        }
+    }
+
+    /// Damaged copies of `data`: cut short, tail overwritten, and a window
+    /// of bytes inverted. Every copy keeps the file header.
+    fn mutated_sources(label: &str, data: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let len = data.len();
+        let mut out = Vec::new();
+        for k in 1..16 {
+            out.push((
+                format!("{label} cut at {k}/16"),
+                data[..len * k / 16].to_vec(),
+            ));
+        }
+        for k in 1..8 {
+            let mut bytes = data.to_vec();
+            bytes[len * k / 8..].fill(0xAA);
+            out.push((format!("{label} tail from {k}/8 overwritten"), bytes));
+        }
+        for k in 1..10 {
+            let mut bytes = data.to_vec();
+            let at = len * k / 10;
+            for byte in &mut bytes[at..at + 16] {
+                *byte ^= 0xFF;
+            }
+            out.push((format!("{label} bytes at {k}/10 inverted"), bytes));
+        }
+        out
+    }
+
+    fn outcome(result: &Result<TransformResult, TransformError>) -> &'static str {
+        match result {
+            Ok(_) => "ok",
+            Err(TransformError::Vips(_)) => "libvips error",
+            Err(TransformError::ExceedsMaxPixels(..)) => "budget error",
+            Err(TransformError::Thumbhash(_)) => "thumbhash error",
+        }
+    }
+
+    /// Run `params` with the reduced decode and with the full decode
+    /// (`frame=0`).
+    fn transform_both_paths(
+        data: &[u8],
+        params: &str,
+    ) -> (
+        Result<TransformResult, TransformError>,
+        Result<TransformResult, TransformError>,
+    ) {
+        let reduced = transform(data, &parse(params).unwrap(), None, None);
+        let full = transform(
+            data,
+            &parse(&format!("{params},frame=0")).unwrap(),
+            None,
+            None,
+        );
+        (reduced, full)
+    }
+
+    const DAMAGED_SOURCE_REQUESTS: [&str; 2] = ["w=100", "w=300,h=200,fit=cover"];
+
+    #[test]
+    fn reduced_and_full_decode_agree_on_success_or_failure_for_damaged_jpeg_sources() {
+        init();
+        // A WebP cut short fails at the probe on both paths, so it joins the
+        // JPEG sources here. The other damaged WebP sources have their own test.
+        let mut sources = mutated_sources("jpeg", &nonsquare_jpeg());
+        let webp = nonsquare_webp();
+        sources.extend(
+            mutated_sources("webp", &webp)
+                .into_iter()
+                .filter(|(label, _)| label.contains("cut at")),
+        );
+        let mut mismatches = Vec::new();
+        let (mut both_ok, mut both_err, mut reduced_ok) = (0, 0, 0);
+        for (label, data) in &sources {
+            for params in DAMAGED_SOURCE_REQUESTS {
+                let (reduced, full) = transform_both_paths(data, params);
+                let (a, b) = (outcome(&reduced), outcome(&full));
+                if a != b {
+                    mismatches.push(format!("{label} [{params}]: reduced {a}, full {b}"));
+                } else if a == "ok" {
+                    both_ok += 1;
+                    if reduced.as_ref().is_ok_and(|r| r.decoded_at_reduced_size) {
+                        reduced_ok += 1;
+                    }
+                } else {
+                    both_err += 1;
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "paths disagree: {mismatches:#?}");
+        assert!(
+            both_ok > 0 && both_err > 0,
+            "ok {both_ok}, error {both_err}"
+        );
+        assert!(reduced_ok > 0, "no damaged source took the reduced decode");
+    }
+
+    /// On libvips 8.15.1, a WebP with a damaged bitstream can succeed with the
+    /// reduced decode while the full decode fails. The libwebp scaler accepts
+    /// data that the plain decode rejects. libvips 8.18.4 gives the same
+    /// class for both decodes. The reduced decode must never fail where the
+    /// full decode succeeds.
+    #[test]
+    fn reduced_decode_never_fails_where_the_full_decode_succeeds_for_damaged_webp_sources() {
+        init();
+        let sources: Vec<_> = mutated_sources("webp", &nonsquare_webp())
+            .into_iter()
+            .filter(|(label, _)| !label.contains("cut at"))
+            .collect();
+        let mut turned_to_failure = Vec::new();
+        let mut full_failures = 0;
+        for (label, data) in &sources {
+            for params in DAMAGED_SOURCE_REQUESTS {
+                let (reduced, full) = transform_both_paths(data, params);
+                if reduced.is_err() && full.is_ok() {
+                    turned_to_failure.push(format!("{label} [{params}]"));
+                }
+                if full.is_err() {
+                    full_failures += 1;
+                }
+            }
+        }
+        assert!(
+            turned_to_failure.is_empty(),
+            "the reduced decode fails where the full decode succeeds: {turned_to_failure:#?}"
+        );
+        assert!(full_failures > 0, "the damage never reached the decoder");
+    }
+
+    #[test]
+    fn truncated_jpeg_fills_the_missing_rows_with_gray_on_both_paths() {
+        init();
+        let jpeg = nonsquare_jpeg();
+        let cut = &jpeg[..jpeg.len() / 2];
+        for params in ["w=200,f=png", "w=200,f=png,frame=0"] {
+            let result = transform(cut, &parse(params).unwrap(), None, None).unwrap();
+            let image = raster(&result.data);
+            let row = image.width as usize * image.bands as usize;
+            let last = &image.pixels[image.pixels.len() - row..];
+            assert!(
+                last.iter().all(|v| (120..=136).contains(v)),
+                "[{params}] the last row must be gray, got {:?}",
+                &last[..12]
+            );
+        }
+    }
+
+    /// The container-level metadata of an encoded image: every JPEG APPn
+    /// segment, every WebP chunk except the pixel data, and every PNG chunk
+    /// except the header and the pixel data.
+    fn container_metadata(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        if bytes.starts_with(&[0xFF, 0xD8]) {
+            let mut at = 2;
+            while at + 4 <= bytes.len() && bytes[at] == 0xFF && bytes[at + 1] != 0xDA {
+                let marker = bytes[at + 1];
+                let len = u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) as usize;
+                if (0xE1..=0xEF).contains(&marker) {
+                    out.push((
+                        format!("app{}", marker - 0xE0),
+                        bytes[at + 4..at + 2 + len].to_vec(),
+                    ));
+                }
+                at += 2 + len;
+            }
+        } else if bytes.starts_with(b"RIFF") {
+            let mut at = 12;
+            while at + 8 <= bytes.len() {
+                let name = String::from_utf8_lossy(&bytes[at..at + 4]).to_string();
+                let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+                if !["VP8 ", "VP8L", "ALPH"].contains(&name.as_str()) {
+                    out.push((name, bytes[at + 8..at + 8 + len].to_vec()));
+                }
+                at += 8 + len + (len & 1);
+            }
+        } else if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+            let mut at = 8;
+            while at + 8 <= bytes.len() {
+                let len = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+                let name = String::from_utf8_lossy(&bytes[at + 4..at + 8]).to_string();
+                if !["IHDR", "IDAT", "IEND"].contains(&name.as_str()) {
+                    out.push((name, bytes[at + 8..at + 8 + len].to_vec()));
+                }
+                at += 12 + len;
+            }
+        }
+        out
+    }
+
+    fn has_chunk(chunks: &[(String, Vec<u8>)], name: &str) -> bool {
+        chunks.iter().any(|(n, _)| n == name)
+    }
+
+    fn webp_with_orientation(orientation: i32) -> Vec<u8> {
+        let image = VipsImage::from_buffer(&nonsquare_fixture()).unwrap();
+        image.set_int("orientation", orientation);
+        image.save_webp(80, false).unwrap()
+    }
+
+    #[test]
+    fn metadata_is_equal_on_both_decode_paths_for_every_output_format() {
+        init();
+        let sources: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("icc jpeg", fixture("icc_srgb_640x480.jpg"), "w=80"),
+            ("icc webp", fixture("icc_srgb_640x480.webp"), "w=80"),
+            ("exif jpeg", fixture("exif_orientation.jpg"), "w=2"),
+            ("oriented jpeg", oriented_jpeg(6, false), "w=100"),
+            ("oriented webp", webp_with_orientation(6), "w=100"),
+        ];
+        let mut mismatches = Vec::new();
+        for (label, data, size) in &sources {
+            for format in ["jpeg", "webp", "png"] {
+                for metadata in ["keep", "copyright", "strip"] {
+                    let params = format!("{size},f={format},metadata={metadata}");
+                    let (reduced, full) = both_paths(data, &params);
+                    let a = container_metadata(&reduced.data);
+                    let b = container_metadata(&full.data);
+                    if a != b {
+                        mismatches.push(format!("{label} [{params}]"));
+                    }
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "metadata differs: {mismatches:#?}");
+    }
+
+    #[test]
+    fn embedded_icc_profile_is_kept_byte_equal_on_both_decode_paths() {
+        init();
+        let jpeg = fixture("icc_srgb_640x480.jpg");
+        let webp = fixture("icc_srgb_640x480.webp");
+        let source_jpeg_icc = container_metadata(&jpeg)
+            .into_iter()
+            .find(|(name, _)| name == "app2")
+            .expect("the JPEG fixture has an ICC profile")
+            .1;
+        let source_webp_icc = container_metadata(&webp)
+            .into_iter()
+            .find(|(name, _)| name == "ICCP")
+            .expect("the WebP fixture has an ICC profile")
+            .1;
+        for (data, format, chunk, source_icc) in [
+            (&jpeg, "jpeg", "app2", &source_jpeg_icc),
+            (&webp, "webp", "ICCP", &source_webp_icc),
+        ] {
+            let params = format!("w=80,f={format},metadata=keep");
+            let (reduced, full) = both_paths(data, &params);
+            for (path, result) in [("reduced", reduced), ("full", full)] {
+                let chunks = container_metadata(&result.data);
+                assert!(has_chunk(&chunks, chunk), "{format} {path}: no ICC profile");
+                let icc = &chunks.iter().find(|(n, _)| n == chunk).unwrap().1;
+                assert_eq!(icc, source_icc, "{format} {path}: the profile changed");
+            }
+        }
+    }
+
+    #[test]
+    fn exif_orientation_is_applied_once_and_reset_on_both_decode_paths() {
+        init();
+        for orientation in 1..=8 {
+            let expected = if orientation >= 5 {
+                (300, 400)
+            } else {
+                (300, 225)
+            };
+            let sources = [
+                ("jpeg", oriented_jpeg(orientation, false)),
+                ("webp", webp_with_orientation(orientation)),
+            ];
+            for (label, data) in sources {
+                let params = "w=300,f=jpeg,metadata=keep";
+                let (reduced, full) = both_paths(&data, params);
+                for (path, result) in [("reduced", &reduced), ("full", &full)] {
+                    assert_eq!(
+                        (result.width, result.height),
+                        expected,
+                        "{label} orientation {orientation} {path}"
+                    );
+                    let out = VipsImage::from_buffer(&result.data).unwrap();
+                    assert!(
+                        matches!(out.get_int("orientation"), None | Some(1)),
+                        "{label} orientation {orientation} {path}: the tag is {:?}",
+                        out.get_int("orientation")
+                    );
+                }
+                let (reduced, full) = both_paths(&data, "w=300,f=png");
+                assert!(
+                    mean_abs_diff(&raster(&reduced.data), &raster(&full.data)) < 4.0,
+                    "{label} orientation {orientation}: the paths turn the pixels differently"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cmyk_jpeg_output_is_three_band_srgb_on_both_decode_paths() {
+        init();
+        let data = fixture("cmyk.jpg");
+        let (reduced, full) = both_paths(&data, "w=4,f=png");
+        let (a, b) = (raster(&reduced.data), raster(&full.data));
+        assert_eq!((a.bands, b.bands), (3, 3));
+        assert!(mean_abs_diff(&a, &b) < 6.0);
+    }
+
+    #[test]
+    fn webp_alpha_is_kept_on_both_decode_paths() {
+        init();
+        let scaled = VipsImage::from_buffer(&fixture("alpha_4x4.png"))
+            .unwrap()
+            .thumbnail(
+                800,
+                ThumbnailOptions {
+                    height: Some(600),
+                    size: Some(consts::VIPS_SIZE_FORCE),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let data = scaled.save_webp(80, true).unwrap();
+        let (reduced, full) = both_paths(&data, "w=100,f=png");
+        let (a, b) = (raster(&reduced.data), raster(&full.data));
+        assert_eq!((a.bands, b.bands), (4, 4));
+        let alpha = |r: &Raster| Raster {
+            width: r.width,
+            height: r.height,
+            bands: 1,
+            pixels: r.pixels.chunks(4).map(|px| px[3]).collect(),
+        };
+        assert!(mean_abs_diff(&alpha(&a), &alpha(&b)) < 4.0);
+    }
+    // ----------------------------------------------------------------
+    // Size parity of the two decode paths (INV-23)
+    // ----------------------------------------------------------------
+
+    /// A JPEG or WebP of `width` x `height` pixels, scaled from the large
+    /// PNG fixture.
+    fn sized_source(webp: bool, width: i32, height: i32) -> Vec<u8> {
+        let scaled = VipsImage::from_buffer(&nonsquare_fixture())
+            .unwrap()
+            .thumbnail(
+                width,
+                ThumbnailOptions {
+                    height: Some(height),
+                    size: Some(consts::VIPS_SIZE_FORCE),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        if webp {
+            scaled.save_webp(80, true).unwrap()
+        } else {
+            scaled.save_jpeg(85, true).unwrap()
+        }
+    }
+
+    /// The size that `vips_thumbnail_image` gives a `fit=contain` box on a
+    /// lazy image of `width` x `height` pixels. The image holds no decoded
+    /// pixels, so this costs nothing per size.
+    fn libvips_contain_size(width: i32, height: i32, target: (i32, i32)) -> (i32, i32) {
+        let lazy = VipsImage::from_buffer(&static_fixture())
+            .unwrap()
+            .embed(0, 0, width, height, [0.0, 0.0, 0.0])
+            .unwrap();
+        let out = lazy
+            .thumbnail(
+                target.0,
+                ThumbnailOptions {
+                    height: Some(target.1),
+                    size: Some(consts::VIPS_SIZE_DOWN),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        (out.width(), out.height())
+    }
+
+    #[test]
+    fn contain_size_gives_the_sizes_of_the_full_decode_for_the_audit_examples() {
+        // (source, box, size of the full decode)
+        let cases = [
+            ((300, 225), (50, 38), (50, 38)),
+            ((2000, 1307), (200, 131), (200, 131)),
+            ((300, 200), (2, 1), (2, 1)),
+            ((1600, 1000), (100, 63), (100, 63)),
+            ((300, 200), (500, 500), (300, 200)),
+            ((2000, 1500), (100, 100), (100, 75)),
+        ];
+        for (source, target, expected) in cases {
+            assert_eq!(
+                contain_size(source, target),
+                expected,
+                "{source:?} {target:?}"
+            );
+            assert_eq!(
+                libvips_contain_size(source.0, source.1, target),
+                expected,
+                "libvips {source:?} {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contain_size_equals_the_libvips_size_for_many_sources_and_boxes() {
+        init();
+        let sources = [
+            (1, 1),
+            (2, 3),
+            (16, 16),
+            // Tall and narrow sources. The reciprocal of the reciprocal of the
+            // shrink factor changes the rounded size for these.
+            (28, 189),
+            (28, 1834),
+            (40, 1270),
+            (40, 1740),
+            (73, 1000),
+            (1000, 73),
+            (100, 2000),
+            (2000, 40),
+            (299, 201),
+            (300, 200),
+            (300, 225),
+            (500, 333),
+            (641, 479),
+            (800, 600),
+            (1000, 750),
+            (1024, 1024),
+            (1600, 1000),
+            (1601, 1067),
+            (2000, 1307),
+            (2000, 1500),
+            (2400, 3200),
+            (3201, 2399),
+            (4000, 3000),
+            (4032, 3024),
+            (5000, 4999),
+            (6000, 4000),
+            (8000, 6000),
+            (8400, 8400),
+        ];
+        let widths = [
+            1, 2, 3, 4, 5, 7, 8, 9, 13, 16, 17, 18, 26, 31, 33, 50, 64, 99, 100, 127, 128, 199,
+            200, 254, 255, 333, 400, 641, 999, 1000, 1200, 1920, 4000,
+        ];
+        let mut checked = 0;
+        for (source_w, source_h) in sources {
+            for width in widths {
+                let derived = ((width as f64 * source_h as f64 / source_w as f64).round() as i32)
+                    .clamp(1, 8192);
+                for height in [derived, 1, 2, 7, 50, 133, 300, 700, 5000] {
+                    let target = (width, height);
+                    assert_eq!(
+                        contain_size((source_w, source_h), target),
+                        libvips_contain_size(source_w, source_h, target),
+                        "source {source_w}x{source_h}, box {width}x{height}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, sources.len() * widths.len() * 9);
+    }
+
+    /// The fit modes and the box sizes of the table tests below. A box has a
+    /// width and an optional height.
+    const PARITY_FITS: [&str; 8] = [
+        "contain",
+        "inside",
+        "pad",
+        "cover",
+        "crop",
+        "fill",
+        "outside",
+        "aspect-crop",
+    ];
+
+    /// Every request whose two paths give another size, as text.
+    fn size_mismatches(webp: bool, source_w: i32, source_h: i32, params: &[String]) -> Vec<String> {
+        let data = sized_source(webp, source_w, source_h);
+        let label = format!(
+            "{} {source_w}x{source_h}",
+            if webp { "webp" } else { "jpeg" }
+        );
+        let mut mismatches = Vec::new();
+        for params in params {
+            let reduced = transform_params(&data, params);
+            let full = transform_params(&data, &format!("{params},frame=0"));
+            assert!(!full.decoded_at_reduced_size, "{label} [{params}] control");
+            // An `aspect-crop` that upscales crops the full image.
+            assert!(
+                reduced.decoded_at_reduced_size || params.contains("aspect-crop"),
+                "{label} [{params}] must decode at reduced size"
+            );
+            if (reduced.width, reduced.height) != (full.width, full.height) {
+                mismatches.push(format!(
+                    "{label} [{params}]: reduced {}x{}, full {}x{}",
+                    reduced.width, reduced.height, full.width, full.height
+                ));
+            }
+        }
+        mismatches
+    }
+
+    fn parity_requests(widths: &[u32], heights: &[Option<u32>]) -> Vec<String> {
+        let mut requests = Vec::new();
+        for fit in PARITY_FITS {
+            for width in widths {
+                for height in heights {
+                    requests.push(match height {
+                        Some(h) => format!("w={width},h={h},fit={fit},f=jpeg"),
+                        None => format!("w={width},fit={fit},f=jpeg"),
+                    });
+                }
+            }
+        }
+        requests
+    }
+
+    #[test]
+    fn reduced_decode_gives_the_full_decode_size_for_every_fit_mode() {
+        init();
+        let requests = parity_requests(
+            &[2, 5, 17, 33, 100, 199, 254],
+            &[None, Some(1), Some(50), Some(133)],
+        );
+        let sources = [
+            (300, 200),
+            (300, 225),
+            (641, 479),
+            (1000, 750),
+            (73, 1000),
+            (1000, 73),
+        ];
+        let mismatches: Vec<String> = std::thread::scope(|scope| {
+            let mut jobs = Vec::new();
+            for webp in [false, true] {
+                for (source_w, source_h) in sources {
+                    let requests = &requests;
+                    jobs.push(
+                        scope.spawn(move || size_mismatches(webp, source_w, source_h, requests)),
+                    );
+                }
+            }
+            jobs.into_iter()
+                .flat_map(|job| job.join().unwrap())
+                .collect()
+        });
+        assert!(
+            mismatches.is_empty(),
+            "{} requests changed size with the reduced decode: {:#?}",
+            mismatches.len(),
+            &mismatches[..mismatches.len().min(40)]
+        );
+    }
+
+    #[test]
+    fn reduced_decode_gives_the_full_decode_size_for_large_sources() {
+        init();
+        let requests = parity_requests(&[200, 254, 400], &[None, Some(133)]);
+        let mismatches: Vec<String> = std::thread::scope(|scope| {
+            let jobs: Vec<_> = [(false, 2000, 1307), (true, 2000, 1307), (false, 3201, 2399)]
+                .into_iter()
+                .map(|(webp, w, h)| {
+                    let requests = &requests;
+                    scope.spawn(move || size_mismatches(webp, w, h, requests))
+                })
+                .collect();
+            jobs.into_iter()
+                .flat_map(|job| job.join().unwrap())
+                .collect()
+        });
+        assert!(
+            mismatches.is_empty(),
+            "{} requests changed size with the reduced decode: {:#?}",
+            mismatches.len(),
+            &mismatches[..mismatches.len().min(40)]
+        );
+    }
+
+    #[test]
+    fn reduced_decode_gives_the_full_decode_size_for_exif_orientations() {
+        init();
+        let requests = [
+            "w=50",
+            "w=200,h=50",
+            "h=40",
+            "w=33,h=200,fit=pad",
+            "w=100,h=100,fit=inside",
+        ];
+        let mut mismatches = Vec::new();
+        for (label, stored_portrait) in [("landscape", false), ("portrait", true)] {
+            for orientation in 1..=8 {
+                let data = oriented_jpeg(orientation, stored_portrait);
+                for params in requests {
+                    let reduced = transform_params(&data, params);
+                    let full = transform_params(&data, &format!("{params},frame=0"));
+                    if (reduced.width, reduced.height) != (full.width, full.height) {
+                        mismatches.push(format!(
+                            "{label} orientation {orientation} [{params}]: reduced {}x{}, full {}x{}",
+                            reduced.width, reduced.height, full.width, full.height
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    #[test]
+    fn audit_examples_keep_their_size_with_the_reduced_decode() {
+        init();
+        let cases = [
+            (false, (300, 225), "w=50", (50, 38)),
+            (false, (2000, 1307), "w=200", (200, 131)),
+            (false, (300, 200), "w=2", (2, 1)),
+            (true, (1600, 1000), "w=100", (100, 63)),
+        ];
+        for (webp, (source_w, source_h), params, expected) in cases {
+            let data = sized_source(webp, source_w, source_h);
+            let result = transform_params(&data, params);
+            assert!(
+                result.decoded_at_reduced_size,
+                "{source_w}x{source_h} [{params}]"
+            );
+            assert_eq!(
+                (result.width, result.height),
+                expected,
+                "{source_w}x{source_h} [{params}]"
+            );
+        }
+    }
+
+    #[test]
+    fn contain_inside_and_pad_never_exceed_the_box_and_cover_fill_crop_give_the_box() {
+        init();
+        let data = sized_source(false, 1000, 750);
+        for (width, height) in [(50, 33), (199, 133), (333, 7), (5, 300)] {
+            for fit in ["contain", "inside", "pad"] {
+                let params = format!("w={width},h={height},fit={fit}");
+                let result = transform_params(&data, &params);
+                assert!(
+                    result.width <= width && result.height <= height,
+                    "[{params}] gave {}x{}",
+                    result.width,
+                    result.height
+                );
+            }
+            for fit in ["cover", "fill", "crop"] {
+                let params = format!("w={width},h={height},fit={fit}");
+                let result = transform_params(&data, &params);
+                assert_eq!((result.width, result.height), (width, height), "[{params}]");
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Content-aware gravity reads the full image (INV-21)
+    // ----------------------------------------------------------------
+
+    /// Requests that crop to the box, so the gravity picks the window.
+    const CROP_FITS: [&str; 3] = ["cover", "crop", "aspect-crop"];
+
+    #[test]
+    fn smart_and_attention_crops_decode_at_full_size_and_keep_the_full_decode_window() {
+        init();
+        // On these sources the reduced decode moved the window: the mean
+        // difference to the full decode was 5 to 9 levels, against less than 1
+        // for `gravity=center`.
+        let sources = [("webp", nonsquare_webp()), ("jpeg", nonsquare_jpeg())];
+        for (label, data) in sources {
+            for gravity in ["smart", "attention"] {
+                for fit in CROP_FITS {
+                    for (width, height) in [(400, 100), (60, 60), (300, 200)] {
+                        let params = format!("w={width},h={height},fit={fit},g={gravity},f=png");
+                        let result = transform_params(&data, &params);
+                        let control = transform_params(&data, &format!("{params},frame=0"));
+                        assert!(
+                            !result.decoded_at_reduced_size,
+                            "{label} [{params}] must decode at full size"
+                        );
+                        assert_eq!(
+                            result.data, control.data,
+                            "{label} [{params}] must give the window of the full decode"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn centre_and_directional_crops_still_decode_at_reduced_size() {
+        init();
+        for (label, data) in [("webp", nonsquare_webp()), ("jpeg", nonsquare_jpeg())] {
+            for gravity in ["center", "north", "southeast"] {
+                for fit in CROP_FITS {
+                    let params = format!("w=400,h=100,fit={fit},g={gravity},f=png");
+                    let (reduced, full) = both_paths(&data, &params);
+                    assert_eq!(
+                        (reduced.width, reduced.height),
+                        (full.width, full.height),
+                        "{label} [{params}]"
+                    );
+                    assert!(
+                        mean_abs_diff(&raster(&reduced.data), &raster(&full.data)) < 1.0,
+                        "{label} [{params}] must keep the window of the full decode"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn smart_and_attention_gravity_do_not_stop_the_reduced_decode_when_the_fit_does_not_crop() {
+        init();
+        for (label, data) in [("webp", nonsquare_webp()), ("jpeg", nonsquare_jpeg())] {
+            for gravity in ["smart", "attention"] {
+                for fit in ["contain", "inside", "pad", "fill", "outside"] {
+                    let params = format!("w=400,h=100,fit={fit},g={gravity},f=png");
+                    assert!(
+                        transform_params(&data, &params).decoded_at_reduced_size,
+                        "{label} [{params}]: the gravity has no effect on this fit"
+                    );
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Parameters that do not change the image keep the reduced decode
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn resize_reads_source_ignores_parameters_that_provably_change_nothing() {
+        let base = TransformParams::default();
+        let no_ops = [
+            (
+                "rotate=0",
+                TransformParams {
+                    rotate: Some(Rotation::Deg0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "trim.top=0",
+                TransformParams {
+                    trim_top: Some(0.0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "all four sides at 0",
+                TransformParams {
+                    trim_top: Some(0.0),
+                    trim_right: Some(0.0),
+                    trim_bottom: Some(0.0),
+                    trim_left: Some(0.0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "rotate=0 and trim.left=0",
+                TransformParams {
+                    rotate: Some(Rotation::Deg0),
+                    trim_left: Some(0.0),
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (name, tp) in no_ops {
+            assert!(resize_reads_source(&tp, false), "{name}");
+            assert!(
+                !resize_reads_source(&tp, true),
+                "{name} with animated output"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_reads_source_still_stops_for_parameters_that_change_the_image() {
+        let base = TransformParams::default();
+        let changes = [
+            (
+                "rotate=90",
+                TransformParams {
+                    rotate: Some(Rotation::Deg90),
+                    ..base.clone()
+                },
+            ),
+            (
+                "rotate=180",
+                TransformParams {
+                    rotate: Some(Rotation::Deg180),
+                    ..base.clone()
+                },
+            ),
+            (
+                "rotate=270",
+                TransformParams {
+                    rotate: Some(Rotation::Deg270),
+                    ..base.clone()
+                },
+            ),
+            (
+                "flip=h",
+                TransformParams {
+                    flip: Some(FlipMode::H),
+                    ..base.clone()
+                },
+            ),
+            (
+                "flip=v",
+                TransformParams {
+                    flip: Some(FlipMode::V),
+                    ..base.clone()
+                },
+            ),
+            (
+                "flip=hv",
+                TransformParams {
+                    flip: Some(FlipMode::Hv),
+                    ..base.clone()
+                },
+            ),
+            (
+                "trim=10",
+                TransformParams {
+                    trim: Some(10.0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "trim of 0",
+                TransformParams {
+                    trim: Some(0.0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "trim.top=0.25",
+                TransformParams {
+                    trim_top: Some(0.25),
+                    ..base.clone()
+                },
+            ),
+            (
+                "trim.bottom=0.001",
+                TransformParams {
+                    trim_bottom: Some(0.001),
+                    ..base.clone()
+                },
+            ),
+            (
+                "trim.top=0 and trim.left=1",
+                TransformParams {
+                    trim_top: Some(0.0),
+                    trim_left: Some(1.0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "rotate=0 and trim.right=5",
+                TransformParams {
+                    rotate: Some(Rotation::Deg0),
+                    trim_right: Some(5.0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "frame=0",
+                TransformParams {
+                    frame: Some(0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "rotate=0 and flip=h",
+                TransformParams {
+                    rotate: Some(Rotation::Deg0),
+                    flip: Some(FlipMode::H),
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (name, tp) in changes {
+            assert!(!resize_reads_source(&tp, false), "{name}");
+        }
+    }
+
+    #[test]
+    fn resize_reads_source_stops_only_for_the_fits_that_crop_by_content() {
+        let base = TransformParams::default();
+        for gravity in [Gravity::Smart, Gravity::Attention] {
+            for (fit, stops) in [
+                (FitMode::Cover, true),
+                (FitMode::Crop, true),
+                (FitMode::AspectCrop, true),
+                (FitMode::Contain, false),
+                (FitMode::Inside, false),
+                (FitMode::Pad, false),
+                (FitMode::Fill, false),
+                (FitMode::Outside, false),
+            ] {
+                let tp = TransformParams {
+                    fit,
+                    gravity,
+                    ..base.clone()
+                };
+                assert_eq!(
+                    resize_reads_source(&tp, false),
+                    !stops,
+                    "fit={fit:?} gravity={gravity:?}"
+                );
+            }
+        }
+        for gravity in [Gravity::Center, Gravity::North, Gravity::Southwest] {
+            let tp = TransformParams {
+                fit: FitMode::Cover,
+                gravity,
+                ..base.clone()
+            };
+            assert!(resize_reads_source(&tp, false), "gravity={gravity:?}");
+        }
+    }
+
+    #[test]
+    fn requests_with_parameters_that_change_nothing_decode_at_reduced_size_with_the_same_bytes() {
+        init();
+        let plain_requests = ["w=100,f=png", "w=100,h=80,fit=cover,f=png", "w=100,f=jpeg"];
+        let no_ops = [
+            "rotate=0",
+            "trim.top=0",
+            "trim.right=0.0,trim.bottom=0",
+            "rotate=0,trim.left=0",
+        ];
+        for (label, data) in [("jpeg", nonsquare_jpeg()), ("webp", nonsquare_webp())] {
+            for plain in plain_requests {
+                let expected = transform_params(&data, plain);
+                assert!(expected.decoded_at_reduced_size, "{label} [{plain}]");
+                for no_op in no_ops {
+                    let params = format!("{plain},{no_op}");
+                    let result = transform_params(&data, &params);
+                    assert!(
+                        result.decoded_at_reduced_size,
+                        "{label} [{params}] must decode at reduced size"
+                    );
+                    assert_eq!(
+                        result.data, expected.data,
+                        "{label} [{params}] must give the bytes of [{plain}]"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_side_trim_next_to_a_zero_side_trim_still_takes_effect() {
+        init();
+        // Trimming half of 2000 px from the left leaves 1000x1500.
+        for (label, data) in [("jpeg", nonsquare_jpeg()), ("webp", nonsquare_webp())] {
+            let result = transform_params(&data, "w=100,trim.top=0,trim.left=0.5,rotate=0");
+            assert!(!result.decoded_at_reduced_size, "{label}");
+            assert_eq!((result.width, result.height), (100, 150), "{label}");
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // format=thumbhash keeps the strict full decode (INV-19)
+    // ----------------------------------------------------------------
+
+    /// JPEG sources cut inside the pixel data, or with an overwritten tail.
+    /// Their header is intact, so the probe accepts them.
+    fn damaged_jpeg_sources() -> Vec<(String, Vec<u8>)> {
+        truncated_sources()
+            .into_iter()
+            .chain(corrupted_tail_sources())
+            .filter(|(label, _)| label.starts_with("jpeg"))
+            .collect()
+    }
+
+    #[test]
+    fn transform_thumbhash_of_damaged_jpeg_fails_where_the_lenient_reduced_decode_succeeds() {
+        init();
+        let sources = damaged_jpeg_sources();
+        assert_eq!(sources.len(), 3, "two cuts and one overwritten tail");
+        for (label, data) in sources {
+            for resize in ["w=50", "w=300,h=200,fit=cover", "w=100,h=100,fit=pad"] {
+                // Control: the same resize on the default load reads the source
+                // at reduced size and returns the blank pixels as an image.
+                let lenient = transform_params(&data, &format!("{resize},f=png"));
+                assert!(
+                    lenient.decoded_at_reduced_size,
+                    "{label} [{resize}] control must decode at reduced size"
+                );
+                // `format=thumbhash` decodes at full size with the strict load.
+                // A strict reduced decode fails only some of the time on
+                // libvips 8.15.1, so this request must never take that path.
+                let params = format!("format=thumbhash,{resize}");
+                let p = parse(&params).unwrap();
+                assert!(
+                    matches!(
+                        transform(&data, &p, None, None),
+                        Err(TransformError::Vips(_))
+                    ),
+                    "{label} [{params}] must fail, not give a hash"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_decode_size_needs_a_box_height() {
+        let opts = ThumbnailOptions {
+            size: Some(consts::VIPS_SIZE_DOWN),
+            ..Default::default()
+        };
+        assert_eq!(full_decode_size((300, 225), 50, opts), None);
+    }
+
+    #[test]
+    fn full_decode_size_gives_the_contain_size_for_a_box_with_a_height() {
+        let opts = ThumbnailOptions {
+            height: Some(38),
+            size: Some(consts::VIPS_SIZE_DOWN),
+            ..Default::default()
+        };
+        assert_eq!(full_decode_size((300, 225), 50, opts), Some((50, 38)));
+    }
+
+    #[test]
+    fn full_decode_size_is_none_for_the_fits_that_need_no_correction() {
+        let cases = [
+            ("cover", FitMode::Cover),
+            ("crop", FitMode::Crop),
+            ("fill", FitMode::Fill),
+            ("outside", FitMode::Outside),
+        ];
+        for (label, fit) in cases {
+            let opts = build_thumbnail_options(fit, Gravity::Center, Some(38));
+            assert_eq!(full_decode_size((300, 225), 50, opts), None, "{label}");
+        }
+        for (label, fit) in [
+            ("contain", FitMode::Contain),
+            ("inside", FitMode::Inside),
+            ("pad", FitMode::Pad),
+        ] {
+            let opts = build_thumbnail_options(fit, Gravity::Center, Some(38));
+            assert_eq!(
+                full_decode_size((300, 225), 50, opts),
+                Some((50, 38)),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_without_an_oriented_size_keeps_the_plain_reduced_decode() {
+        init();
+        let data = sized_source(false, 1000, 750);
+        let current = VipsImage::from_buffer(&data).unwrap();
+        let opts = build_thumbnail_options(FitMode::Contain, Gravity::Center, Some(38));
+        let plain = VipsImage::thumbnail_buffer(&data, 50, opts).unwrap();
+        assert_ne!(
+            (plain.width(), plain.height()),
+            (50, 38),
+            "the plain decode needs a wrong size for this check"
+        );
+        let (image, reduced) = resize(&current, Some(&data), None, 50, opts).unwrap();
+        assert!(reduced);
+        assert_eq!(
+            (image.width(), image.height()),
+            (plain.width(), plain.height())
+        );
+        assert_eq!(
+            image.write_to_memory().unwrap(),
+            plain.write_to_memory().unwrap()
+        );
+    }
+
+    #[test]
+    fn resize_keeps_a_plain_reduced_decode_when_its_size_is_right_and_fixes_it_when_not() {
+        init();
+        // (webp, source size, box, the plain reduced decode has the box size)
+        let cases = [
+            (false, (1000, 750), (533, 400), true),
+            (false, (1000, 750), (50, 38), false),
+            (true, (1000, 750), (50, 38), true),
+            (true, (1600, 1000), (100, 63), false),
+        ];
+        for (webp, source_size, (width, height), plain_is_right) in cases {
+            let label = format!("webp={webp} {source_size:?} box {width}x{height}");
+            let data = sized_source(webp, source_size.0, source_size.1);
+            let current = VipsImage::from_buffer(&data).unwrap();
+            let opts = build_thumbnail_options(FitMode::Contain, Gravity::Center, Some(height));
+            let plain = VipsImage::thumbnail_buffer(&data, width, opts).unwrap();
+            assert_eq!(
+                (plain.width(), plain.height()) == (width, height),
+                plain_is_right,
+                "{label}: plain decode"
+            );
+            let (image, reduced) =
+                resize(&current, Some(&data), Some(source_size), width, opts).unwrap();
+            assert!(reduced, "{label}");
+            assert_eq!((image.width(), image.height()), (width, height), "{label}");
+            if plain_is_right {
+                assert_eq!(
+                    image.write_to_memory().unwrap(),
+                    plain.write_to_memory().unwrap(),
+                    "{label}: the pixels of the plain decode"
+                );
+            }
         }
     }
 }
