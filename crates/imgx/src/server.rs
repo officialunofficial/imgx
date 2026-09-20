@@ -465,7 +465,9 @@ async fn handle_image_request(
         );
     };
 
-    let transform_input = fetch_result.data.clone();
+    // The task borrows the bytes. The raw-bytes fallback takes them back.
+    let source = Arc::new(fetch_result.data);
+    let transform_input = Arc::clone(&source);
     let accept_owned = accept_header.map(|s| s.to_string());
     let tp_for_task = tp.clone();
 
@@ -506,7 +508,7 @@ async fn handle_image_request(
             state,
             &req,
             &tp,
-            fetch_result.data,
+            reclaim_source(source),
             if_none_match,
             TransformFailure::Failed(&e),
         ),
@@ -514,7 +516,7 @@ async fn handle_image_request(
             state,
             &req,
             &tp,
-            fetch_result.data,
+            reclaim_source(source),
             if_none_match,
             TransformFailure::Panicked(&e),
         ),
@@ -607,6 +609,14 @@ fn handle_transform_failure(
         .map(|f| f.content_type().to_string())
         .unwrap_or_else(|| "application/octet-stream".to_string());
     build_image_response(state, raw_data, ct, if_none_match)
+}
+
+/// Take the source bytes back from the handle that the transform task shared.
+///
+/// The task drops its handle before its join result is ready, so the unwrap
+/// moves the bytes out. The copy stays as a fallback for a handle that lives on.
+fn reclaim_source(source: Arc<Vec<u8>>) -> Vec<u8> {
+    Arc::try_unwrap(source).unwrap_or_else(|shared| shared.to_vec())
 }
 
 /// Builds the INV-9 error response for a failed `format=thumbhash` request
@@ -1576,6 +1586,25 @@ mod tests {
             "application/json"
         );
         assert_eq!(String::from_utf8(body).unwrap(), THUMBHASH_422_BODY);
+    }
+
+    #[test]
+    fn reclaim_source_returns_the_same_allocation_when_no_other_handle_lives() {
+        let bytes = vec![7u8; 4096];
+        let address = bytes.as_ptr();
+        let reclaimed = reclaim_source(Arc::new(bytes));
+        assert_eq!(reclaimed.as_ptr(), address, "the reclaim copied the bytes");
+        assert_eq!(reclaimed, vec![7u8; 4096]);
+    }
+
+    #[test]
+    fn reclaim_source_copies_the_bytes_while_another_handle_lives() {
+        let shared = Arc::new(vec![9u8; 64]);
+        let other = Arc::clone(&shared);
+        let reclaimed = reclaim_source(shared);
+        assert_eq!(reclaimed, vec![9u8; 64]);
+        assert_ne!(reclaimed.as_ptr(), other.as_ptr());
+        assert_eq!(*other, vec![9u8; 64], "the other handle keeps its bytes");
     }
 
     #[tokio::test]
