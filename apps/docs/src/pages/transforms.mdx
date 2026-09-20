@@ -229,6 +229,8 @@ points are **not** implemented — see `docs/CLOUDFLARE_PARITY.md` gap 12.
 
 :::info
 For content-aware cropping, use `smart`/`auto` or `attention`. Directional values (`north`, `south`, and others) fall back to center cropping.
+
+A `smart` or `attention` crop with `fit=cover`, `fit=crop`, or `fit=aspect-crop` decodes the source at full size. The content search then reads the same pixels as it always did. A resize with another gravity decodes a JPEG or WebP source at reduced size, which uses less memory.
 :::
 
 ## Effects
