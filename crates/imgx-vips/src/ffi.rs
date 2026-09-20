@@ -1,23 +1,27 @@
 // Hand-declared libvips/glib C FFI surface. Signatures verified against the
-// headers in /opt/homebrew/Cellar/vips/8.18.0_2/include/vips/{image,header,
-// foreign,resample,error,vips}.h. Kept minimal — extend only as the pipeline
-// needs a new C call, mirroring the surface enumerated in the Zig
-// implementation's src/vips/bindings.zig.
+// libvips 8.18.4 headers. Every libvips symbol also exists in the 8.15.1
+// headers of Ubuntu 24.04, the oldest version that CI links. Kept minimal —
+// extend only as the pipeline needs a new C call, mirroring the surface
+// enumerated in the Zig implementation's src/vips/bindings.zig.
 
 #![allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 
 use libc::{c_char, c_double, c_int, c_void, size_t};
 
+/// An opaque libvips image. Release it with `g_object_unref`.
 #[repr(C)]
 pub struct VipsImage {
     _private: [u8; 0],
 }
 
+/// An opaque libvips array of doubles. Release it with `vips_area_unref`.
 #[repr(C)]
 pub struct VipsArrayDouble {
     _private: [u8; 0],
 }
 
+/// An opaque reference-counted libvips memory area. Release it with
+/// `vips_area_unref`.
 #[repr(C)]
 pub struct VipsArea {
     _private: [u8; 0],
@@ -44,6 +48,11 @@ unsafe extern "C" {
     pub fn g_object_unref(object: *mut c_void);
     pub fn g_free(mem: *mut c_void);
 
+    // -- operation cache --
+    // Signatures checked against libvips 8.15.1 and 8.18.4 `vips/operation.h`.
+    pub fn vips_cache_get_max() -> c_int;
+    pub fn vips_cache_set_max(max: c_int);
+
     // -- errors --
     pub fn vips_error_buffer() -> *const c_char;
     pub fn vips_error_clear();
@@ -58,6 +67,13 @@ unsafe extern "C" {
     // `vips_source_new_from_blob` takes its own reference to that blob.
     // The caller's bytes therefore need not outlive the call.
     pub fn vips_blob_copy(data: *const c_void, length: size_t) -> *mut VipsBlob;
+    // Only the tests call `vips_blob_new`. It builds a blob whose free
+    // callback reports its release. The callback type is `VipsCallbackFn`.
+    pub fn vips_blob_new(
+        free_fn: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
+        data: *const c_void,
+        length: size_t,
+    ) -> *mut VipsBlob;
     pub fn vips_source_new_from_blob(blob: *mut VipsBlob) -> *mut VipsSource;
     // The option list ends with NULL (G_GNUC_NULL_TERMINATED), for example
     // `vips_image_new_from_source(src, "n=-1", NULL)`.
