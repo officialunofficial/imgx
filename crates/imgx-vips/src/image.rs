@@ -15,13 +15,22 @@ static VIPS_INIT_OK: AtomicBool = AtomicBool::new(false);
 /// `VIPS_FAIL_ON_ERROR` (nickname `error`, from `vips/foreign.h`).
 const STRICT_OPTION: &str = "fail_on=error";
 
-/// Initialize libvips. Safe to call more than once (subsequent calls are
-/// no-ops); mirrors `bindings.zig`'s `init()`. Must be paired with at most
-/// one `shutdown()` call, from `main`, never from tests.
+/// Number of operations that libvips keeps for reuse. Every request builds
+/// its operations from new images, so a cached operation never hits again.
+/// The cache only keeps the input images, and their source bytes, alive.
+const OPERATION_CACHE_MAX: c_int = 0;
+
+/// Initialize libvips and turn off its operation cache. Safe to call more
+/// than once (subsequent calls are no-ops); mirrors `bindings.zig`'s
+/// `init()`. Must be paired with at most one `shutdown()` call, from `main`,
+/// never from tests.
 pub fn init() -> Result<(), VipsError> {
     VIPS_INIT.call_once(|| {
         let argv0 = CString::new("imgx").unwrap();
         let rc = unsafe { ffi::vips_init(argv0.as_ptr()) };
+        if rc == 0 {
+            unsafe { ffi::vips_cache_set_max(OPERATION_CACHE_MAX) };
+        }
         VIPS_INIT_OK.store(rc == 0, Ordering::SeqCst);
     });
     if VIPS_INIT_OK.load(Ordering::SeqCst) {
@@ -218,25 +227,31 @@ impl VipsImage {
         ptr::NonNull::new(raw).map(|ptr| VipsImage { ptr })
     }
 
+    /// Width in pixels. A negative libvips value reads as 0.
     pub fn width(&self) -> i32 {
         unsafe { ffi::vips_image_get_width(self.ptr.as_ptr()) }.max(0)
     }
 
+    /// Height in pixels. A negative libvips value reads as 0. A stacked
+    /// animation reports the height of the whole stack.
     pub fn height(&self) -> i32 {
         unsafe { ffi::vips_image_get_height(self.ptr.as_ptr()) }.max(0)
     }
 
+    /// Number of bands per pixel, alpha included.
     pub fn bands(&self) -> i32 {
         unsafe { ffi::vips_image_get_bands(self.ptr.as_ptr()) }.max(0)
     }
 
+    /// True when the image has an alpha band.
     pub fn has_alpha(&self) -> bool {
         unsafe { ffi::vips_image_hasalpha(self.ptr.as_ptr()) != 0 }
     }
 
     /// Return true when the decoder of this image can decode at reduced
     /// size. This holds for JPEG and WebP. For those formats
-    /// `thumbnail_buffer` is faster than `thumbnail`. PNG and GIF decode at
+    /// `thumbnail_buffer` uses less memory than `thumbnail`. It is faster
+    /// when the shrink ratio is 4 or more. PNG, GIF, AVIF, and TIFF decode at
     /// full size either way, so `thumbnail_buffer` would only decode twice.
     pub fn shrinks_on_load(&self) -> bool {
         let mut out: *const c_char = ptr::null();
@@ -425,10 +440,20 @@ impl VipsImage {
     /// Decode `data` and resize to fit within `width` in one step. This
     /// calls `vips_thumbnail_source`. libvips tells the decoder the target
     /// size, so JPEG and WebP decode at reduced size. JPEG uses scaling in
-    /// the DCT domain. The method decodes the first frame only. It copies
-    /// `data`, so `data` need not outlive the returned image. Do not use it
-    /// when a pixel operation must run on the full-size image before the
-    /// resize.
+    /// the DCT domain when the shrink ratio is 4 or more. WebP uses the
+    /// libwebp scaler in place of the Lanczos kernel. The method decodes the
+    /// first frame only. It copies `data`, so `data` need not outlive the
+    /// returned image. Do not use it when a pixel operation must run on the
+    /// full-size image before the resize.
+    ///
+    /// The size of a `contain`, `inside`, or `pad` result can differ by 1 px
+    /// or more from the size that `thumbnail` gives on the full image. The
+    /// caller compares the size and corrects it when it matters.
+    ///
+    /// The decode uses the default `fail_on=none`. Do not use this method
+    /// when a damaged source must fail. `fail_on=error` in the `option_string`
+    /// argument is not reliable here: on libvips 8.15.1 the sequential decode
+    /// of a truncated JPEG can return without an error.
     pub fn thumbnail_buffer(
         data: &[u8],
         width: i32,
@@ -743,11 +768,26 @@ struct OwnedSource {
 
 impl OwnedSource {
     fn copy_of(data: &[u8]) -> Result<Self, String> {
+        // `vips_blob_copy` fails for zero bytes and sets no error message.
+        if data.is_empty() {
+            return Err("empty source".to_string());
+        }
+        // The copy is needed: a lazy image reads the bytes after the caller drops `data`.
         let blob =
             unsafe { ffi::vips_blob_copy(data.as_ptr() as *const c_void, data.len() as size_t) };
         if blob.is_null() {
             return Err(last_vips_error());
         }
+        unsafe { Self::from_blob(blob) }
+    }
+
+    /// Build a source over `blob` and release the caller's reference to it.
+    ///
+    /// # Safety
+    ///
+    /// `blob` must be a valid, non-null `VipsBlob` whose reference the
+    /// caller owns. The caller must not use that reference afterwards.
+    unsafe fn from_blob(blob: *mut ffi::VipsBlob) -> Result<Self, String> {
         let raw = unsafe { ffi::vips_source_new_from_blob(blob) };
         // The source holds its own reference to the blob.
         unsafe { ffi::vips_area_unref(blob as *mut ffi::VipsArea) };
@@ -794,6 +834,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
 
     fn fixture(name: &str) -> Vec<u8> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1212,6 +1253,243 @@ mod tests {
             let img = VipsImage::from_buffer(&data).expect("load");
             assert_eq!(img.shrinks_on_load(), expected, "{name}");
         }
+    }
+
+    /// A little-endian TIFF with one uncompressed 8-bit grey strip.
+    fn grey_tiff(width: u32, height: u32) -> Vec<u8> {
+        const ENTRY_COUNT: u32 = 8;
+        const HEADER_LEN: u32 = 8;
+        let pixel_offset = HEADER_LEN + 2 + ENTRY_COUNT * 12 + 4;
+        let pixel_count = width * height;
+        // Each entry is (tag, type, value). Type 3 is SHORT and type 4 is
+        // LONG. Every count is 1, and every value fits in the entry.
+        let entries: [(u16, u16, u32); ENTRY_COUNT as usize] = [
+            (256, 4, width),
+            (257, 4, height),
+            (258, 3, 8),
+            (259, 3, 1),
+            (262, 3, 1),
+            (273, 4, pixel_offset),
+            (278, 4, height),
+            (279, 4, pixel_count),
+        ];
+        let mut tiff = vec![b'I', b'I', 42, 0];
+        tiff.extend_from_slice(&HEADER_LEN.to_le_bytes());
+        tiff.extend_from_slice(&(ENTRY_COUNT as u16).to_le_bytes());
+        for (tag, kind, value) in entries {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&kind.to_le_bytes());
+            tiff.extend_from_slice(&1u32.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend((0..pixel_count).map(|i| (i % 251) as u8));
+        tiff
+    }
+
+    #[test]
+    fn init_turns_off_the_operation_cache() {
+        init().expect("vips init");
+        let limit = unsafe { ffi::vips_cache_get_max() };
+        assert_eq!(
+            limit, 0,
+            "libvips keeps {limit} operations and their inputs"
+        );
+    }
+
+    #[test]
+    fn empty_source_error_says_the_source_is_empty() {
+        init().expect("vips init");
+        let load = VipsImage::from_buffer(&[]).err().expect("empty load fails");
+        assert!(matches!(load, VipsError::LoadFailed(_)), "{load:?}");
+        assert_eq!(load.to_string(), "vips load failed: empty source");
+        let resize = VipsImage::thumbnail_buffer(&[], 100, ThumbnailOptions::default())
+            .err()
+            .expect("empty resize fails");
+        assert!(matches!(resize, VipsError::ResizeFailed(_)), "{resize:?}");
+        assert_eq!(resize.to_string(), "vips resize failed: empty source");
+    }
+
+    #[test]
+    fn shrinks_on_load_is_false_for_heif_and_tiff() {
+        init().expect("vips init");
+        let png = VipsImage::from_buffer(&fixture("test_4x4.png")).expect("load png");
+        let mut sources = vec![("tiff", grey_tiff(16, 8))];
+        // The libheif of some builds, such as Alpine, has no AVIF encoder.
+        if let Ok(avif) = png.save_avif(50, 0, true) {
+            sources.push(("avif", avif));
+        }
+        for (name, data) in sources {
+            let img = VipsImage::from_buffer(&data).unwrap_or_else(|e| panic!("load {name}: {e}"));
+            assert!(!img.shrinks_on_load(), "{name}");
+        }
+    }
+
+    #[test]
+    fn grey_tiff_helper_builds_a_loadable_image() {
+        init().expect("vips init");
+        let img = VipsImage::from_buffer(&grey_tiff(16, 8)).expect("load tiff");
+        assert_eq!((img.width(), img.height(), img.bands()), (16, 8, 1));
+    }
+
+    /// A 2048x1536 JPEG with EXIF orientation 6, so it displays as
+    /// 1536x2048. Both sides divide by 8, so no shrink factor truncates.
+    fn oriented_jpeg_2048x1536() -> Vec<u8> {
+        let png = VipsImage::from_buffer(&fixture("bench_2000x1500.png")).expect("load png");
+        let scaled = png
+            .thumbnail(
+                2048,
+                ThumbnailOptions {
+                    height: Some(1536),
+                    size: Some(crate::ffi::VIPS_SIZE_FORCE),
+                    ..Default::default()
+                },
+            )
+            .expect("scale");
+        scaled.set_int("orientation", 6);
+        let jpeg = scaled.save_jpeg(85, false).expect("encode jpeg");
+        let reloaded = VipsImage::from_buffer(&jpeg).expect("reload jpeg");
+        assert_eq!(reloaded.get_int("orientation"), Some(6));
+        jpeg
+    }
+
+    /// The size libvips gives for a 300 px wide box on the 2048x1536 source
+    /// with orientation 6. `crop` and `force` give the box. Otherwise the
+    /// image fits inside the box.
+    fn expected_thumbnail_size(
+        height: Option<i32>,
+        crop: bool,
+        force: bool,
+        no_rotate: bool,
+    ) -> (i32, i32) {
+        let (box_w, box_h) = (300, height.unwrap_or(300));
+        if crop || force {
+            return (box_w, box_h);
+        }
+        let (source_w, source_h) = if no_rotate {
+            (2048.0, 1536.0)
+        } else {
+            (1536.0, 2048.0)
+        };
+        let scale = (box_w as f64 / source_w).min(box_h as f64 / source_h);
+        (
+            (source_w * scale).round() as i32,
+            (source_h * scale).round() as i32,
+        )
+    }
+
+    #[test]
+    fn thumbnail_options_reach_libvips_in_every_combination() {
+        init().expect("vips init");
+        let data = oriented_jpeg_2048x1536();
+        let img = VipsImage::from_buffer(&data).expect("load jpeg");
+        for height in [None, Some(160)] {
+            for crop in [None, Some(crate::ffi::VIPS_INTERESTING_CENTRE)] {
+                for size in [None, Some(crate::ffi::VIPS_SIZE_FORCE)] {
+                    for no_rotate in [false, true] {
+                        let opts = ThumbnailOptions {
+                            height,
+                            crop,
+                            size,
+                            no_rotate,
+                        };
+                        let expected = expected_thumbnail_size(
+                            height,
+                            crop.is_some(),
+                            size.is_some(),
+                            no_rotate,
+                        );
+                        let label = format!("{opts:?}");
+                        let full = img.thumbnail(300, opts).expect("thumbnail");
+                        assert_eq!((full.width(), full.height()), expected, "thumbnail {label}");
+                        let direct = VipsImage::thumbnail_buffer(&data, 300, opts)
+                            .expect("thumbnail_buffer");
+                        assert_eq!(
+                            (direct.width(), direct.height()),
+                            expected,
+                            "thumbnail_buffer {label}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn thumbnail_buffer_of_jpeg_and_webp_outlives_its_source_bytes() {
+        init().expect("vips init");
+        let png = VipsImage::from_buffer(&fixture("bench_2000x1500.png")).expect("load png");
+        let sources = [
+            ("jpeg", png.save_jpeg(85, true).expect("encode jpeg")),
+            ("webp", png.save_webp(80, true).expect("encode webp")),
+        ];
+        for (label, mut data) in sources {
+            let small = VipsImage::thumbnail_buffer(&data, 100, ThumbnailOptions::default())
+                .unwrap_or_else(|e| panic!("thumbnail_buffer {label}: {e}"));
+            // The loader has not read the pixels yet. Overwrite the bytes,
+            // so a decode from borrowed memory fails or differs.
+            data.fill(0xEE);
+            drop(data);
+            let out = small
+                .save_jpeg(85, true)
+                .unwrap_or_else(|e| panic!("encode {label} after source overwritten: {e}"));
+            assert!(!out.is_empty(), "{label}");
+            assert_eq!(small.width(), 100, "{label}");
+        }
+    }
+
+    #[test]
+    fn raw_extern_blocks_live_only_in_ffi_rs() {
+        let needle = ["unsafe", "extern", "\"C\"", "{"].join(" ");
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in fs::read_dir(&src).expect("read src") {
+            let path = entry.expect("dir entry").path();
+            if path.file_name().is_some_and(|name| name == "ffi.rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("read source file");
+            if text.contains(&needle) {
+                offenders.push(path.display().to_string());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "extern blocks outside ffi.rs: {offenders:?}"
+        );
+    }
+
+    static BLOB_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn count_blob_free(_data: *mut c_void, _area: *mut c_void) -> c_int {
+        BLOB_FREE_CALLS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    #[test]
+    fn owned_source_releases_its_blob_once_when_it_drops() {
+        init().expect("vips init");
+        static BYTES: [u8; 4] = *b"abcd";
+        let blob = unsafe {
+            ffi::vips_blob_new(
+                Some(count_blob_free),
+                BYTES.as_ptr() as *const c_void,
+                BYTES.len(),
+            )
+        };
+        assert!(!blob.is_null());
+        let source = unsafe { OwnedSource::from_blob(blob) }.expect("source from blob");
+        assert_eq!(
+            BLOB_FREE_CALLS.load(Ordering::SeqCst),
+            0,
+            "the source keeps the blob alive"
+        );
+        drop(source);
+        assert_eq!(
+            BLOB_FREE_CALLS.load(Ordering::SeqCst),
+            1,
+            "dropping the source releases the blob once"
+        );
     }
 
     #[test]

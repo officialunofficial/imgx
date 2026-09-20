@@ -218,3 +218,42 @@ imgx is designed to sit behind a CDN. Image responses include:
 - `Vary: Accept` — tells the CDN to cache separate variants per format negotiation
 
 Configure your CDN to forward the `Accept` header and respect `Vary: Accept` for correct content negotiation.
+
+---
+
+## Upgrades and cached variants
+
+Some releases change the output bytes of a variant. Release v0.1.5 does this for JPEG and WebP sources. Its resize decodes the source at reduced size, so the pixel bytes differ slightly. A WebP source scales with the libwebp scaler in place of the Lanczos filter. Some sizes also change by 1 px for `fit=contain`, `fit=inside`, and `fit=pad`.
+
+The next release changes these variants again:
+
+- It restores the size that a full decode gives. The 1 px change of v0.1.5 goes away.
+- `gravity=smart` and `gravity=attention` decode at full size again on the fits that crop (`cover`, `crop`, and `aspect-crop`). The crop window returns to the window of a full decode.
+- `rotate=0` and a per-side trim of 0 give the bytes of the same request without them.
+
+The cache key does not change. The same URL then maps to a different body and a different `ETag`.
+
+### What happens with a shared L2 cache
+
+The L2 cache (R2 or S3) is shared by all replicas. imgx does not expire an L2 entry. `IMGX_CACHE_DEFAULT_TTL_SECONDS` only sets the `Cache-Control` header. An old variant stays in the variants bucket until a lifecycle rule or a purge removes it.
+
+During a rolling upgrade, old and new replicas share one bucket. Each replica reads the entry that the last writer stored. The same key can therefore return either variant. This has these effects:
+
+- The `ETag` of one URL can change between responses.
+- A request with `If-None-Match` can return `200` in place of `304`. This costs one extra transfer.
+- A client can see a size that differs by 1 px from an earlier response.
+
+No response is corrupt. Every variant is a valid image of the requested source.
+
+### Roll-out options
+
+Choose one of these options.
+
+1. **Accept the mix.** The mix ends when the old L2 entries expire or you purge them. Choose this option when a 1 px change and an extra revalidation are acceptable.
+2. **Drain and replace.** Stop all old replicas, then start the new version. Purge the variants bucket. Every variant is then new. This option needs a short window with no service, or a blue-green switch.
+3. **Use a new variants bucket.** Set `IMGX_R2_BUCKET_VARIANTS` to a new bucket name for the new version. Old replicas keep the old bucket, so the two versions never share an entry. Delete the old bucket after the roll-out.
+4. **Expire the old entries.** Add a lifecycle rule to the variants bucket that deletes objects after a fixed number of days. The mix ends when the old entries are gone. Choose a period that matches how long you accept a mix.
+
+Also purge the CDN. It keeps a variant for `max-age` seconds, which is 3600 by default. The L1 memory cache is empty after each restart, so it needs no action.
+
+A rollback has the same effect in the other direction. The new variants stay in the bucket and the old version serves them. Use the same options.

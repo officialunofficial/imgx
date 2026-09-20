@@ -40,6 +40,25 @@ For higher throughput, run multiple imgx instances behind a load balancer. Each 
 
 ---
 
+## Memory use
+
+imgx decodes a JPEG or WebP source at reduced size when a request resizes it. libvips then reads only the pixels that the output needs. The peak memory use of a request was 1.4 to 12 times lower than a full decode in the audit. A JPEG that shrinks by a ratio of 4 or more also ran 1.15 to 1.4 times faster.
+
+A request decodes the source at full size in these cases:
+
+- The request changes the image before the resize. This holds for `rotate` other than 0, `flip`, `trim`, `trim.top`, `trim.right`, `trim.bottom`, `trim.left` other than 0, and `frame`. It also holds for animated output.
+- The request uses `gravity=smart` or `gravity=attention` with `fit=cover`, `fit=crop`, or `fit=aspect-crop`. The content search then reads the same pixels as a full decode.
+- The request uses `format=thumbhash`. That format loads the source strictly, so a damaged source fails and never gives a hash of blank pixels. A strict reduced decode is not reliable on libvips 8.15.1.
+- The source is PNG, GIF, or AVIF. These formats cannot decode at reduced size.
+
+The reduced decode gives the same output size as a full decode. The pixels differ slightly. A JPEG scales in the DCT domain only when the shrink ratio is 4 or more. Below that, the bytes equal the full decode in almost every request. In rare cases they differ by 1 level at most. A WebP source scales with the libwebp scaler in place of the Lanczos filter. The audit measured 30 to 40 dB PSNR against a full decode on detailed sources.
+
+imgx also turns off the libvips operation cache. Every request builds its operations from new images, so a cached operation never hits. The cache only kept the source bytes of old requests in memory. With a 20 MB JPEG, the peak memory use of one process fell from 339 MB to 134 MB on Ubuntu 24.04. The number of requests per second did not change. The server also shares the origin bytes with the transform task and does not copy them.
+
+The numbers come from the audit of the reduced decode and from the measurements in `docs/INVARIANTS.md`. They depend on the host, the libvips version, and the source.
+
+---
+
 ## Memory allocator
 
 imgx uses [jemalloc](https://jemalloc.net/) (via [`tikv-jemallocator`](https://github.com/tikv/jemallocator)) as the global allocator on all non-MSVC targets, instead of the system allocator. The workload is alloc-heavy and multi-threaded by nature — every transform allocates a fresh image buffer, and requests are served concurrently across tokio worker threads — which is exactly the pattern jemalloc's per-thread arenas are designed for. No configuration is needed; it's compiled in as the process-wide allocator.
@@ -54,6 +73,8 @@ imgx uses a two-tier cache to balance speed and persistence:
 |------|---------|-------|-------------|------------------------|
 | **L1** | In-memory LRU | Fastest | Lost on restart | No |
 | **L2** | R2 / S3 | Fast | Survives restarts | Yes |
+
+**The L2 cache has no expiry.** imgx never removes an L2 entry. A release that changes output bytes leaves old variants in the bucket. See [Upgrades and cached variants](/deployment#upgrades-and-cached-variants).
 
 **Writes are best-effort and non-blocking.** On cache misses, imgx still returns the response even when a cache backend skips a write (for example, cache disabled or entry too large). When L2 is enabled, its write happens asynchronously via `tokio::spawn`, keeping the R2 upload off the response path.
 
