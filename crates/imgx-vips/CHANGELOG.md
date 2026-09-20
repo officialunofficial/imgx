@@ -3,6 +3,13 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.1.6] - 2026-09-20
+
+### Bug Fixes
+
+- *(vips)* Keep source bytes owned and turn off the operation cache(e97a2c4)
+
+
 ## [0.1.5] - 2026-09-19
 
 ### Bug Fixes

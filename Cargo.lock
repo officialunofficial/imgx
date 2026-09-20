@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "imgx"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "axum",
  "imgx-vips",
@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "imgx-edge"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "worker",
  "worker-macros",
@@ -905,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "imgx-vips"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libc",
  "pkg-config",
