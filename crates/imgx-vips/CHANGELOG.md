@@ -3,6 +3,13 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.1.7] - 2026-09-21
+
+### Testing
+
+- *(vips)* Scan FFI-isolation guard test recursively ([#46](https://github.com/officialunofficial/imgx/pull/46))(16c061c)
+
+
 ## [0.1.6] - 2026-09-20
 
 ### Bug Fixes
