@@ -1443,8 +1443,7 @@ mod tests {
         let needle = ["unsafe", "extern", "\"C\"", "{"].join(" ");
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();
-        for entry in fs::read_dir(&src).expect("read src") {
-            let path = entry.expect("dir entry").path();
+        for path in rs_files_recursive(&src) {
             if path.file_name().is_some_and(|name| name == "ffi.rs") {
                 continue;
             }
@@ -1457,6 +1456,23 @@ mod tests {
             offenders.is_empty(),
             "extern blocks outside ffi.rs: {offenders:?}"
         );
+    }
+
+    /// Collects every `.rs` file under `dir`, recursing into subdirectories,
+    /// so `raw_extern_blocks_live_only_in_ffi_rs` keeps enforcing the
+    /// FFI-isolation boundary even if source ever moves into a submodule
+    /// directory (a plain `fs::read_dir` would silently stop covering it).
+    fn rs_files_recursive(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                files.extend(rs_files_recursive(&path));
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+        files
     }
 
     static BLOB_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
