@@ -443,11 +443,15 @@ The response includes a `Vary: Accept` header so CDNs cache different format var
 
 ## Caching behavior
 
-imgx caches transform results using a deterministic key built from the image path, transform parameters, and resolved output format.
+imgx caches transform results under a deterministic key. The key holds the image path, the transform parameters, and a format segment.
 
 **Key format:** `<image-path>|<transform-string>|<format>`
 
 **Example:** `photos/hero.jpg|w=400,h=300|webp`
+
+With an explicit format, the format segment is that format's name. With `auto`, the segment is `auto:` followed by the formats that the `Accept` header supports, joined by `+`, in the order `avif`, `webp`, `jpeg`, `png`, `gif`. For example, `Accept: image/jpeg` gives `auto:jpeg`, and `Accept: */*` gives `auto:avif+webp+jpeg+png+gif`. Two `Accept` headers that support the same formats share one cache entry. Two headers that support different formats never share one. A client therefore always gets a format that it accepts.
+
+**Example:** `photos/hero.jpg|w=400,h=300|auto:avif+webp`
 
 Parameter order does not matter. `w=400,h=300` and `h=300,w=400` produce the same cache key.
 
