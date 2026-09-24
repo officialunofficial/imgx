@@ -3,6 +3,13 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.1.9] - 2026-09-24
+
+### Miscellaneous
+
+- Release v0.1.8 ([#51](https://github.com/officialunofficial/imgx/pull/51))(9f32733)
+
+
 ## [0.1.8] - 2026-09-24
 
 ### Bug Fixes
