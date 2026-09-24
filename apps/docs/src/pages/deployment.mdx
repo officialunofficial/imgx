@@ -233,6 +233,8 @@ The next release changes these variants again:
 
 The cache key does not change. The same URL then maps to a different body and a different `ETag`.
 
+A later release changes the cache key of every `auto` request. The format segment changes from `auto` to `auto:` plus the formats that the `Accept` header supports (INV-27). An `auto` request therefore misses the cache once after the upgrade, and imgx transforms it again. Keys for an explicit format do not change. Old `auto` entries are never read again. A lifecycle rule on the variants bucket removes them.
+
 ### What happens with a shared L2 cache
 
 The L2 cache (R2 or S3) is shared by all replicas. imgx does not expire an L2 entry. `IMGX_CACHE_DEFAULT_TTL_SECONDS` only sets the `Cache-Control` header. An old variant stays in the variants bucket until a lifecycle rule or a purge removes it.

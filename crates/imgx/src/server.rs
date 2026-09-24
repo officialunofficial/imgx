@@ -30,7 +30,7 @@ use crate::origin::{
 use crate::router::{self, ImageRequest, Route};
 use crate::s3::S3Client;
 use crate::transform::params::OnErrorMode;
-use crate::transform::{params, pipeline};
+use crate::transform::{negotiate, params, pipeline};
 
 /// The cache backend selected at startup based on config. A closed set
 /// (Noop/Memory/Tiered), so this is an enum rather than `dyn Cache` --
@@ -372,13 +372,13 @@ async fn handle_image_request(
         )));
     }
 
-    let format_str = tp.format.map(|f| f.as_str()).unwrap_or("auto");
+    let format_str = negotiate::cache_format_segment(accept_header, tp.format);
     // Use the canonical `to_cache_key()` serialization (INV-1) rather than
     // the raw URL options segment: it's already parameter-order-
     // independent and, as of gap 8, is also what makes the scq quality
     // override above actually vary the cache key (the override mutates
     // `tp.quality`, which `to_cache_key()` includes).
-    let cache_key = cache::compute_cache_key(&req.image_path, &tp.to_cache_key(), format_str);
+    let cache_key = cache::compute_cache_key(&req.image_path, &tp.to_cache_key(), &format_str);
 
     if let Some(entry) = state.cache.get(&cache_key).await {
         metrics::with_local_recorder(&state.metrics_recorder, || {
@@ -1191,6 +1191,40 @@ mod tests {
         let (_, _, second) = get_full(router, path, &[(header::ACCEPT, "image/webp")]).await;
         assert_eq!(second, first);
         assert_eq!(metric_value(&state, "imgx_cache_misses_total"), 1.0);
+        assert_eq!(metric_value(&state, "imgx_cache_hits_total"), 1.0);
+        assert_eq!(state.cache.size().await, 1);
+    }
+
+    #[tokio::test]
+    async fn auto_format_cache_entry_is_not_shared_across_accept_headers() {
+        let state = state_with_fixture_origin("icc_srgb_640x480.jpg").await;
+        let router = build_router(Arc::clone(&state));
+        let path = "/image/w=64,format=auto/photo.jpg";
+        let content_type =
+            |headers: &HeaderMap| headers[header::CONTENT_TYPE].to_str().unwrap().to_string();
+        let (_, jpeg, _) = get_full(router.clone(), path, &[(header::ACCEPT, "image/jpeg")]).await;
+        let (_, avif, _) =
+            get_full(router.clone(), path, &[(header::ACCEPT, "image/avif,*/*")]).await;
+        let (_, jpeg_again, _) = get_full(router, path, &[(header::ACCEPT, "image/jpeg")]).await;
+        assert_eq!(content_type(&jpeg), "image/jpeg");
+        assert_eq!(content_type(&avif), "image/avif");
+        assert_eq!(content_type(&jpeg_again), "image/jpeg");
+        assert_eq!(state.cache.size().await, 2);
+    }
+
+    #[tokio::test]
+    async fn auto_format_cache_entry_is_shared_by_equivalent_accept_headers() {
+        let state = state_with_fixture_origin("icc_srgb_640x480.jpg").await;
+        let router = build_router(Arc::clone(&state));
+        let path = "/image/w=64/photo.jpg";
+        let (_, _, first) = get_full(router.clone(), path, &[(header::ACCEPT, "*/*")]).await;
+        let (_, _, second) = get_full(
+            router,
+            path,
+            &[(header::ACCEPT, "image/avif,image/webp,image/apng,*/*;q=0.8")],
+        )
+        .await;
+        assert_eq!(second, first);
         assert_eq!(metric_value(&state, "imgx_cache_hits_total"), 1.0);
         assert_eq!(state.cache.size().await, 1);
     }

@@ -157,6 +157,43 @@ pub fn negotiate_animated_format(
     None
 }
 
+/// The formats a negotiated request can resolve to, in a fixed order.
+/// `cache_format_segment` lists them in this order.
+const NEGOTIABLE_FORMATS: [OutputFormat; 5] = [
+    OutputFormat::Avif,
+    OutputFormat::Webp,
+    OutputFormat::Jpeg,
+    OutputFormat::Png,
+    OutputFormat::Gif,
+];
+
+/// The format segment of a cache key (INV-27).
+///
+/// An explicit non-auto format gives its own name, the same as before. An
+/// auto request gives `auto:` and then the formats the Accept header
+/// supports, joined by `+`, in `NEGOTIABLE_FORMATS` order. For one source,
+/// `negotiate_format` and `negotiate_animated_format` read only this set,
+/// so two requests with the same segment resolve to the same output
+/// format. The segment never equals the bare `auto` of older keys.
+pub fn cache_format_segment(
+    accept_header: Option<&str>,
+    requested_format: Option<OutputFormat>,
+) -> String {
+    if let Some(fmt) = requested_format
+        && fmt != OutputFormat::Auto
+    {
+        return fmt.as_str().to_string();
+    }
+
+    let accept = accept_header.map(parse_accept_header).unwrap_or_default();
+    let supported: Vec<&str> = NEGOTIABLE_FORMATS
+        .iter()
+        .filter(|fmt| accept.supports(**fmt))
+        .map(|fmt| fmt.as_str())
+        .collect();
+    format!("auto:{}", supported.join("+"))
+}
+
 /// Cloudflare's `compression=fast` (gap 6, docs/CLOUDFLARE_PARITY.md):
 /// "will usually override the format parameter to choose JPEG over more
 /// efficient formats like AVIF or WebP" (verified against
@@ -553,5 +590,70 @@ mod tests {
             apply_compression_fast(OutputFormat::Webp, false),
             OutputFormat::Webp
         );
+    }
+
+    #[test]
+    fn cache_format_segment_keeps_an_explicit_format_unchanged() {
+        assert_eq!(
+            cache_format_segment(Some("image/avif"), Some(OutputFormat::Webp)),
+            "webp"
+        );
+        assert_eq!(
+            cache_format_segment(Some("image/webp"), Some(OutputFormat::Thumbhash)),
+            "thumbhash"
+        );
+    }
+
+    #[test]
+    fn cache_format_segment_varies_auto_by_accepted_formats() {
+        assert_eq!(cache_format_segment(Some("image/jpeg"), None), "auto:jpeg");
+        assert_eq!(
+            cache_format_segment(Some("image/avif,image/webp"), Some(OutputFormat::Auto)),
+            "auto:avif+webp"
+        );
+        assert_ne!(
+            cache_format_segment(Some("image/jpeg"), None),
+            cache_format_segment(Some("image/avif,*/*"), None)
+        );
+    }
+
+    #[test]
+    fn cache_format_segment_treats_unset_and_auto_alike() {
+        assert_eq!(
+            cache_format_segment(Some("image/webp"), None),
+            cache_format_segment(Some("image/webp"), Some(OutputFormat::Auto))
+        );
+    }
+
+    #[test]
+    fn cache_format_segment_is_equal_for_equivalent_accept_headers() {
+        let all = "auto:avif+webp+jpeg+png+gif";
+        assert_eq!(cache_format_segment(Some("*/*"), None), all);
+        assert_eq!(cache_format_segment(Some("image/*"), None), all);
+        assert_eq!(
+            cache_format_segment(Some("image/avif,image/webp,image/apng,*/*;q=0.8"), None),
+            all
+        );
+        assert_eq!(
+            cache_format_segment(Some("image/webp, image/avif"), None),
+            cache_format_segment(Some("image/avif,image/webp"), None)
+        );
+    }
+
+    #[test]
+    fn cache_format_segment_drops_a_format_disabled_with_q_zero() {
+        assert_eq!(
+            cache_format_segment(Some("image/avif;q=0,image/webp"), None),
+            "auto:webp"
+        );
+    }
+
+    #[test]
+    fn cache_format_segment_for_no_accept_header_is_not_the_legacy_auto_key() {
+        assert_eq!(cache_format_segment(None, None), "auto:");
+        assert_eq!(cache_format_segment(Some(""), None), "auto:");
+        for accept in [None, Some(""), Some("image/jpeg"), Some("*/*")] {
+            assert_ne!(cache_format_segment(accept, None), "auto");
+        }
     }
 }

@@ -168,6 +168,13 @@
 - **Because:** `OwnedSource` and `init` in `crates/imgx-vips/src/image.rs`, and `reclaim_source` in `crates/imgx/src/server.rs`. INV-20 lists the C symbols. The outlives tests catch the borrowed-memory mistake. The mutants "blob never released" and "source never released" leak memory on each request. They survived until the blob-release test existed. libvips keeps 100 operations by default. Every request builds its operations from new images, so a cached operation never hits again. It only keeps the blob alive. See the non-invariants below for the measured effect.
 - **If violated:** A use after free when the caller drops the source bytes. Or a memory leak that grows with each request. Or a peak memory use that grows with the size of the source bytes. Up to 100 operations keep their blobs. Or a log line with no reason for an empty origin body.
 
+### INV-27: An auto-format cache entry is shared only by Accept headers that support the same formats
+
+- **Always:** For a request with no format or `format=auto`, the third `compute_cache_key` segment is `auto:` followed by the formats that `parse_accept_header` reports as supported. The list uses the fixed order `avif`, `webp`, `jpeg`, `png`, `gif`, joined by `+`. No supported format gives `auto:`. The segment never equals the bare `auto` of older keys. An explicit non-auto format keeps its own name as the segment, byte-identical to before.
+- **Because:** The cache lookup runs before the origin fetch. The resolved format also depends on the source (alpha and animation), so the key cannot hold it. For one source, `negotiate_format` and `negotiate_animated_format` read only the supported set. So one segment always resolves to one output format. The old key used the literal `auto` for every Accept header. The first request for a variant then fixed its format for every later client (issue #49).
+- **If violated:** A client can get a format that it does not accept. For example, a client with no AVIF decoder gets AVIF, because another client asked first. Or two equivalent Accept headers store two copies of one variant.
+- **Relation to INV-1:** `to_cache_key()` does not change. Only the format segment of `auto` requests changes. Every `auto` request misses once after the upgrade. Old `auto` entries are never read again.
+
 ## Enforceable invariants
 
 Each maps to a concrete check that must exist in the Rust port with equivalent coverage.
@@ -258,6 +265,13 @@ Each maps to a concrete check that must exist in the Rust port with equivalent c
   - `reclaim_source_returns_the_same_allocation_when_no_other_handle_lives`: the fallback gets the origin bytes back without a copy.
   - `reclaim_source_copies_the_bytes_while_another_handle_lives`: a handle that lives on keeps its bytes.
   - `plain_task_panic_still_serves_raw_origin_bytes`, `plain_transform_error_still_serves_raw_origin_bytes`, and `transform_failure_fallback_is_never_cached` pin the raw-bytes fallback.
+- [x] **INV-27 (an auto-format cache entry is shared only by Accept headers that support the same formats):** `cache_format_segment` in `crates/imgx/src/transform/negotiate.rs`, called by `handle_image_request` in `crates/imgx/src/server.rs`, tested by these tests.
+  - `cache_format_segment_keeps_an_explicit_format_unchanged`: explicit keys, `thumbhash` included, are byte-identical to before.
+  - `cache_format_segment_varies_auto_by_accepted_formats` and `cache_format_segment_drops_a_format_disabled_with_q_zero`: the segment follows the parsed Accept set.
+  - `cache_format_segment_is_equal_for_equivalent_accept_headers` and `cache_format_segment_treats_unset_and_auto_alike`: equivalent requests share one key.
+  - `cache_format_segment_for_no_accept_header_is_not_the_legacy_auto_key`: no request reads an old `auto` entry.
+  - `auto_format_cache_entry_is_not_shared_across_accept_headers`: JPEG, then AVIF, then JPEG again, through the router. Before the fix, the AVIF request got JPEG.
+  - `auto_format_cache_entry_is_shared_by_equivalent_accept_headers`: `*/*` and a browser Accept header hit one entry.
 
 ## Assumptions & non-invariants
 
