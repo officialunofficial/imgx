@@ -3,6 +3,13 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.1.8] - 2026-09-24
+
+### Bug Fixes
+
+- *(cache)* Key auto-format variants by the formats Accept supports ([#50](https://github.com/officialunofficial/imgx/pull/50))(fa7af2e)
+
+
 ## [0.1.6] - 2026-09-20
 
 ### Bug Fixes
