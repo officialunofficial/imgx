@@ -18,10 +18,7 @@ compatibility_date = "2026-07-12"
 directory = "./dist/public"
 not_found_handling = "404-page"
 
-# No `routes`/zone binding yet -- which hostname serves the docs site
-# (a custom domain, or the default *.workers.dev subdomain) is an
-# operator decision to make at deploy time, e.g.:
-#
-# routes = [
-#   { pattern = "docs.example.com/*", zone_name = "example.com" }
-# ]
+# Keep the existing documentation hostname under deployment configuration.
+[[routes]]
+pattern = "imgx.officialunofficial.com"
+custom_domain = true
