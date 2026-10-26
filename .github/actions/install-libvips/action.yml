@@ -1,0 +1,17 @@
+name: Install libvips
+description: Install libvips-dev with apt, bounded by timeouts and one retry.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+        for attempt in 1 2; do
+          if sudo timeout 180 apt-get "${apt_opts[@]}" update \
+            && sudo timeout 300 apt-get "${apt_opts[@]}" install -y libvips-dev; then
+            exit 0
+          fi
+          echo "apt attempt $attempt failed"
+        done
+        exit 1
