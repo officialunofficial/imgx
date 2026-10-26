@@ -483,6 +483,10 @@ only for HTTP origins (not R2, which has no public URL to redirect to).
 - **Values:** `redirect`
 - **Default:** unset (raw-bytes fallback)
 
+With `IMGX_TRANSFORM_FAILURE=error` imgx returns the JSON error envelope for
+every failed transform and ignores `onerror`. See
+[Configuration](/configuration).
+
 ```text
 /image/w=400,onerror=redirect/photo.jpg
 ```

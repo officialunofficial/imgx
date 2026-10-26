@@ -83,6 +83,7 @@
 - **If violated:** A transient, already-recovered failure keeps silently serving wrong output for up to an hour (default TTL) after the fact — the cache actively works against recovery instead of being neutral to it.
 - **Extended (Cloudflare parity gap 7, `docs/CLOUDFLARE_PARITY.md`):** an opt-in per-request `onerror=redirect` parameter (`TransformParams::onerror`, matching Cloudflare's own `onerror=redirect`) additively changes the failure-path *response* — a `302` to the origin image URL instead of the raw-bytes fallback, for `Http` origins only. This does NOT weaken the guarantee above: the default (`onerror` unset) behavior is unchanged, and neither the redirect nor the raw-bytes fallback is ever written to `cache_key`. See `crates/imgx/src/server.rs`'s `handle_transform_failure`.
 - **Extended (ThumbHash):** for `format=thumbhash`, the server never serves the raw origin bytes. It returns the INV-9 JSON envelope with 422 or 500 instead. It writes nothing under `cache_key`. `handle_transform_failure` stays unchanged for every other format. INV-19 pins this.
+- **Extended (fail closed):** with `IMGX_TRANSFORM_FAILURE=error`, a failed transform of any format returns the INV-9 JSON envelope and never the raw origin bytes. INV-28 pins this. The default `passthrough` keeps the fallback above unchanged.
 
 ### INV-14: An arbitrary attacker-influenced URL is never fetched without every SSRF guard applying, and is never fetched at all unless explicitly opted into
 
@@ -174,6 +175,12 @@
 - **Because:** The cache lookup runs before the origin fetch. The resolved format also depends on the source (alpha and animation), so the key cannot hold it. For one source, `negotiate_format` and `negotiate_animated_format` read only the supported set. So one segment always resolves to one output format. The old key used the literal `auto` for every Accept header. The first request for a variant then fixed its format for every later client (issue #49).
 - **If violated:** A client can get a format that it does not accept. For example, a client with no AVIF decoder gets AVIF, because another client asked first. Or two equivalent Accept headers store two copies of one variant.
 - **Relation to INV-1:** `to_cache_key()` does not change. Only the format segment of `auto` requests changes. Every `auto` request misses once after the upgrade. Old `auto` entries are never read again.
+
+### INV-28: With `IMGX_TRANSFORM_FAILURE=error`, a failed transform of any format fails closed and is not cacheable
+
+- **Always:** When `pipeline::transform()` fails, or its task panics, for any format, and `IMGX_TRANSFORM_FAILURE` is `error`, the server returns the INV-9 JSON envelope with `Cache-Control: no-store`. Source and libvips failures (`ExceedsMaxPixels`, `Vips`) give 422. `TransformError::Thumbhash` and a task panic give 500. The response has no `ETag`, no `Vary` and no `Location`. The server never serves the raw origin bytes. It ignores `onerror=redirect`. It writes nothing under `cache_key`. The value `passthrough` is the default and keeps INV-13 unchanged. Any other value fails config loading.
+- **Because:** `crates/imgx/src/server.rs` (`failed_transform_response` and `fail_closed_response`). In `passthrough` mode the fallback is a 200 with the requested `Content-Type`, the normal `Cache-Control` and an `ETag`. A shared cache in front of imgx cannot tell it from a success. It stores the original bytes under the rendition URL, with their metadata, for the whole TTL. The error response reuses the path of INV-19, so both share one mapping from failure to status.
+- **If violated:** A downstream cache keeps a full original under a rendition URL after a transient failure. The cache serves it long after imgx recovers.
 
 ## Enforceable invariants
 
@@ -272,6 +279,14 @@ Each maps to a concrete check that must exist in the Rust port with equivalent c
   - `cache_format_segment_for_no_accept_header_is_not_the_legacy_auto_key`: no request reads an old `auto` entry.
   - `auto_format_cache_entry_is_not_shared_across_accept_headers`: JPEG, then AVIF, then JPEG again, through the router. Before the fix, the AVIF request got JPEG.
   - `auto_format_cache_entry_is_shared_by_equivalent_accept_headers`: `*/*` and a browser Accept header hit one entry.
+
+- [x] **INV-28 (with `IMGX_TRANSFORM_FAILURE=error`, a failed transform of any format fails closed and is not cacheable):** `crates/imgx/src/server.rs` and `crates/imgx/src/config.rs`, tested by these tests.
+  - `error_mode_corrupt_source_returns_envelope_for_every_format_and_caches_nothing`: webp, jpeg, png, avif, no format and `auto` give the 422 envelope with `no-store` and no origin bytes. Nothing is cached.
+  - `error_mode_ignores_onerror_redirect`: no `Location` header.
+  - `error_mode_task_panic_returns_500_envelope_with_no_store` and `error_mode_internal_error_maps_to_500_and_source_errors_to_422`: the status mapping.
+  - `error_mode_failure_does_not_poison_a_later_success`: a successful transform keeps its normal `Cache-Control` and is cached.
+  - `passthrough_mode_keeps_the_raw_bytes_fallback_for_every_format`: the default is unchanged.
+  - `transform_failure_mode_parses_known_values_only` and `transform_failure_env_var_rejects_an_unknown_value`: config loading.
 
 ## Assumptions & non-invariants
 

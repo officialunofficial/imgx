@@ -47,6 +47,7 @@ Required when `IMGX_ORIGIN_TYPE=r2`. All fields must be non-empty.
 | `IMGX_TRANSFORM_MAX_FRAMES` | `u32` | `100` | Maximum frames to load from animated images. Excess frames are truncated. |
 | `IMGX_TRANSFORM_MAX_ANIMATED_PIXELS` | `u64` | `50000000` | Maximum total pixels across all frames. Animated images exceeding this budget are served as a static first frame. |
 | `IMGX_TRANSFORM_AVIF_EFFORT` | `u8` | `4` | AVIF encoder effort, `0` to `9`. A lower value encodes faster and writes larger files. The default is the libvips default. The cache key does not include this setting. A cached variant keeps the effort it had when imgx encoded it. |
+| `IMGX_TRANSFORM_FAILURE` | `string` | `passthrough` | What imgx answers when a transform fails. `passthrough` serves the raw origin bytes with a `200`, as before. `error` returns the JSON error envelope with `Cache-Control: no-store` for every format: `422` for a source that libvips cannot process or that exceeds `IMGX_TRANSFORM_MAX_PIXELS`, `500` for an internal failure or a panic. It never serves origin bytes, ignores `onerror=redirect`, and never caches the failure. Use `error` when a shared cache sits in front of imgx. Any other value stops the server at start. |
 
 ## Cache
 

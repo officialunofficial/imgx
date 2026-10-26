@@ -119,6 +119,26 @@ impl R2Config {
     }
 }
 
+/// What the server answers when a transform fails. See docs/INVARIANTS.md INV-28.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransformFailureMode {
+    /// Serve the raw origin bytes (INV-13). The default.
+    #[default]
+    Passthrough,
+    /// Answer the INV-9 error envelope with `Cache-Control: no-store`.
+    Error,
+}
+
+impl TransformFailureMode {
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s {
+            "passthrough" => Some(Self::Passthrough),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransformConfig {
     pub max_width: u32,
@@ -132,6 +152,7 @@ pub struct TransformConfig {
     /// output). The default is the libvips default. A lower value gives
     /// faster encodes and larger AVIF files.
     pub avif_effort: u8,
+    pub on_failure: TransformFailureMode,
 }
 
 impl Default for TransformConfig {
@@ -145,6 +166,7 @@ impl Default for TransformConfig {
             max_frames: 100,
             max_animated_pixels: 50_000_000,
             avif_effort: imgx_vips::DEFAULT_AVIF_EFFORT,
+            on_failure: TransformFailureMode::default(),
         }
     }
 }
@@ -247,6 +269,10 @@ impl Config {
         }
         if let Some(v) = env_var("TRANSFORM_AVIF_EFFORT") {
             cfg.transform.avif_effort = parse_num(&v)?;
+        }
+        if let Some(v) = env_var("TRANSFORM_FAILURE") {
+            cfg.transform.on_failure =
+                TransformFailureMode::parse_str(&v).ok_or(ConfigError::InvalidValue)?;
         }
 
         if let Some(v) = env_var("CACHE_ENABLED") {
@@ -581,6 +607,28 @@ mod tests {
         assert_eq!(parse_num::<u16>(""), Err(ConfigError::InvalidValue));
         // Overflow: 70000 does not fit in u16
         assert_eq!(parse_num::<u16>("70000"), Err(ConfigError::InvalidValue));
+    }
+
+    #[test]
+    fn transform_failure_mode_defaults_to_passthrough() {
+        assert_eq!(
+            Config::defaults().transform.on_failure,
+            TransformFailureMode::Passthrough
+        );
+    }
+
+    #[test]
+    fn transform_failure_mode_parses_known_values_only() {
+        assert_eq!(
+            TransformFailureMode::parse_str("passthrough"),
+            Some(TransformFailureMode::Passthrough)
+        );
+        assert_eq!(
+            TransformFailureMode::parse_str("error"),
+            Some(TransformFailureMode::Error)
+        );
+        assert_eq!(TransformFailureMode::parse_str("Error"), None);
+        assert_eq!(TransformFailureMode::parse_str(""), None);
     }
 
     // NOTE: load_from_env's "no env vars set" case and the IMGX_/ZIMGX_

@@ -14,14 +14,14 @@ use axum::Router;
 use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusRecorder};
 use tokio::sync::Semaphore;
 use tower::ServiceBuilder;
 
 use crate::cache::{self, Cache, CacheEntry, MemoryCache, NoopCache, R2Cache, TieredCache};
-use crate::config::{Config, OriginType};
+use crate::config::{Config, OriginType, TransformFailureMode};
 use crate::http::errors::HttpError;
 use crate::http::response;
 use crate::origin::{
@@ -532,6 +532,9 @@ enum TransformFailure<'a> {
 /// Builds the response for a failed transform. Both failure kinds share this
 /// one path, so no arm can skip the `format=thumbhash` check (INV-19).
 ///
+/// With `IMGX_TRANSFORM_FAILURE=error`, a failure of any format returns the
+/// INV-9 JSON envelope with `Cache-Control: no-store` (INV-28).
+///
 /// A `format=thumbhash` failure returns the INV-9 JSON envelope and never
 /// the origin bytes. Every other format falls back to the raw fetched bytes
 /// rather than a 500, as the Zig original does. The fallback is always
@@ -550,7 +553,16 @@ fn failed_transform_response(
     let transform = req.transform_string.as_deref().unwrap_or("");
     let path = &req.image_path;
     let thumbhash = tp.format == Some(params::OutputFormat::Thumbhash);
+    let fail_closed = state.config.transform.on_failure == TransformFailureMode::Error;
     match (failure, thumbhash) {
+        (TransformFailure::Failed(e), _) if fail_closed => {
+            tracing::warn!(error = %e, path = %path, transform = %transform, "image transform failed, returning error");
+            fail_closed_response(Some(e))
+        }
+        (TransformFailure::Panicked(e), _) if fail_closed => {
+            tracing::warn!(error = %e, path = %path, transform = %transform, "image transform task panicked, returning error");
+            fail_closed_response(None)
+        }
         (TransformFailure::Failed(e), true) => {
             tracing::warn!(error = %e, path = %path, transform = %transform, "thumbhash transform failed");
             thumbhash_failure_response(Some(e))
@@ -632,6 +644,16 @@ fn thumbhash_failure_response(error: Option<&pipeline::TransformError>) -> Respo
         Some(pipeline::TransformError::Thumbhash(_)) | None => HttpError::internal_error(None),
     };
     error_response(err)
+}
+
+/// The INV-9 envelope of `thumbhash_failure_response` with
+/// `Cache-Control: no-store`, for `IMGX_TRANSFORM_FAILURE=error` (INV-28).
+fn fail_closed_response(error: Option<&pipeline::TransformError>) -> Response {
+    let mut response = thumbhash_failure_response(error);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Build a response from image bytes: ETag generation, 304 handling, and
@@ -1066,6 +1088,169 @@ mod tests {
         let (status, body) = get(router, "/image/w=100/photo.jpg").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "not an image");
+    }
+
+    async fn error_mode_state(origin: &'static str) -> Arc<AppState> {
+        init_vips();
+        let mut cfg = Config::defaults();
+        cfg.origin.base_url = serve_repeatedly(origin).await;
+        cfg.transform.on_failure = TransformFailureMode::Error;
+        Arc::new(AppState::new(cfg))
+    }
+
+    #[tokio::test]
+    async fn error_mode_corrupt_source_returns_envelope_for_every_format_and_caches_nothing() {
+        let state = error_mode_state(CORRUPT_JPEG_ORIGIN).await;
+        let router = build_router(Arc::clone(&state));
+        let requests = [
+            ("/image/format=webp/photo.jpg", None),
+            ("/image/format=jpeg/photo.jpg", None),
+            ("/image/format=png/photo.jpg", None),
+            ("/image/format=avif/photo.jpg", None),
+            ("/image/w=100/photo.jpg", None),
+            ("/image/format=auto/photo.jpg", Some("image/webp,image/*")),
+            ("/image/format=thumbhash/photo.jpg", None),
+        ];
+        for (index, (path, accept)) in requests.iter().enumerate() {
+            let mut headers = Vec::new();
+            if let Some(accept) = accept {
+                headers.push((header::ACCEPT, *accept));
+            }
+            let (status, headers, body) = get_full(router.clone(), path, &headers).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+            assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+            assert_eq!(
+                headers.get(header::CONTENT_TYPE).unwrap(),
+                "application/json"
+            );
+            assert!(headers.get(header::ETAG).is_none(), "{path}");
+            assert!(headers.get(header::VARY).is_none(), "{path}");
+            assert!(headers.get(header::LOCATION).is_none(), "{path}");
+            assert_eq!(
+                String::from_utf8(body).unwrap(),
+                THUMBHASH_422_BODY,
+                "{path}"
+            );
+            assert_eq!(
+                metric_value(&state, "imgx_cache_misses_total"),
+                (index + 1) as f64
+            );
+        }
+        assert_eq!(metric_value(&state, "imgx_cache_hits_total"), 0.0);
+        assert_eq!(state.cache.size().await, 0);
+    }
+
+    #[tokio::test]
+    async fn error_mode_ignores_onerror_redirect() {
+        let state = error_mode_state(CORRUPT_JPEG_ORIGIN).await;
+        let (status, headers, body) = get_full(
+            build_router(state),
+            "/image/onerror=redirect/photo.jpg",
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(headers.get(header::LOCATION).is_none());
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_ne!(body, b"not an image");
+    }
+
+    #[tokio::test]
+    async fn error_mode_failure_does_not_poison_a_later_success() {
+        init_vips();
+        let mut cfg = Config::defaults();
+        cfg.transform.on_failure = TransformFailureMode::Error;
+        cfg.origin.base_url = serve_fixture_repeatedly(fixture("test_4x4.png")).await;
+        let state = Arc::new(AppState::new(cfg));
+        let (status, headers, _) = get_full(
+            build_router(Arc::clone(&state)),
+            "/image/format=webp/photo.png",
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(state.cache.size().await, 1);
+    }
+
+    #[tokio::test]
+    async fn error_mode_task_panic_returns_500_envelope_with_no_store() {
+        let panic = panicked_task_error().await;
+        let response = fail_closed_response(None);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+
+        let mut cfg = Config::defaults();
+        cfg.transform.on_failure = TransformFailureMode::Error;
+        let state = AppState::new(cfg);
+        let req = ImageRequest {
+            image_path: "photo.jpg".to_string(),
+            transform_string: Some("format=jpeg".to_string()),
+        };
+        let tp = params::parse("format=jpeg").unwrap();
+        let response = failed_transform_response(
+            &state,
+            &req,
+            &tp,
+            RAW_ORIGIN_BYTES.to_vec(),
+            None,
+            TransformFailure::Panicked(&panic),
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            b"{\"error\":{\"status\":500,\"message\":\"Internal Server Error\"}}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_mode_internal_error_maps_to_500_and_source_errors_to_422() {
+        let internal = pipeline::TransformError::Thumbhash(
+            crate::transform::thumbhash::ThumbhashError::UnsupportedBands(9),
+        );
+        assert_eq!(
+            fail_closed_response(Some(&internal)).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let vips = pipeline::TransformError::Vips(imgx_vips::VipsError::LoadFailed("x".into()));
+        assert_eq!(
+            fail_closed_response(Some(&vips)).status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let over_budget = pipeline::TransformError::ExceedsMaxPixels(2, 1);
+        assert_eq!(
+            fail_closed_response(Some(&over_budget)).status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_mode_keeps_the_raw_bytes_fallback_for_every_format() {
+        init_vips();
+        let mut cfg = Config::defaults();
+        cfg.origin.base_url = serve_repeatedly(CORRUPT_JPEG_ORIGIN).await;
+        assert_eq!(cfg.transform.on_failure, TransformFailureMode::Passthrough);
+        let router = build_router(Arc::new(AppState::new(cfg)));
+        for path in [
+            "/image/format=webp/photo.jpg",
+            "/image/format=png/photo.jpg",
+            "/image/format=avif/photo.jpg",
+        ] {
+            let (status, headers, body) = get_full(router.clone(), path, &[]).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(body, b"not an image", "{path}");
+            assert_ne!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        }
     }
 
     async fn get_full(
