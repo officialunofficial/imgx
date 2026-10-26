@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # sccache and incremental compilation are incompatible ("incremental
@@ -15,8 +18,61 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  lint:
+  # The jobs below run in a prebuilt image that holds libvips, so no job
+  # runs apt against the Ubuntu mirror. The tag is a hash of
+  # .github/ci/Dockerfile: a changed Dockerfile gets a new tag, and this job
+  # builds and pushes it in the same run that uses it.
+  ci-image:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compute image reference
+        id: ref
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          hash=$(sha256sum .github/ci/Dockerfile | cut -c1-12)
+          echo "image=ghcr.io/${owner}/imgx-ci:${hash}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v4.5.2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push if the tag is new
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: |
+          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "$IMAGE already exists"
+          else
+            docker build -t "$IMAGE" .github/ci
+            docker push "$IMAGE"
+          fi
+
+  # The Rust version is pinned to the same value in rust-version
+  # (Cargo.toml), msrv (clippy.toml), channel (rust-toolchain.toml) and every
+  # job below, so clippy on this toolchain also checks the MSRV. There is no
+  # separate msrv job.
+  lint:
+    needs: ci-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ needs.ci-image.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
 
@@ -24,11 +80,6 @@ jobs:
         uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: rustfmt, clippy
-
-      - name: Install libvips
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libvips-dev
 
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: Swatinem/rust-cache@v2
@@ -40,21 +91,22 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
+    needs: ci-image
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ needs.ci-image.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.98.1
-
-      # libheif-plugin-aomenc is the AV1 encoder that AVIF output needs. It
-      # is only a Recommends dependency of libheif-dev, so name it here. A
-      # plain apt-get install replaces cache-apt-pkgs-action, which restored
-      # an empty cache entry (5 KB) as a hit and installed no packages.
-      - name: Install libvips
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libvips-dev libheif-plugin-aomenc
 
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: Swatinem/rust-cache@v2
@@ -62,30 +114,18 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
-  msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      # Keep in sync with rust-version in Cargo.toml, msrv in clippy.toml,
-      # and channel in rust-toolchain.toml. Every job pins the same Rust
-      # version, so the MSRV is the toolchain.
-      - name: Install Rust (MSRV)
-        uses: dtolnay/rust-toolchain@1.98.1
-
-      - name: Install libvips
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libvips-dev
-
-      - uses: mozilla-actions/sccache-action@v0.0.11
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Check on MSRV
-        run: cargo check --workspace --all-targets
-
   coverage:
+    needs: ci-image
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ needs.ci-image.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
 
@@ -93,11 +133,6 @@ jobs:
         uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: llvm-tools-preview
-
-      - name: Install libvips
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libvips-dev libheif-plugin-aomenc
 
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: mozilla-actions/sccache-action@v0.0.11
@@ -110,6 +145,7 @@ jobs:
 
   deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # cargo-deny-action runs cargo inside its own Docker container, which
     # doesn't have sccache installed -- the workflow-level RUSTC_WRAPPER
     # env leaking in here makes every rustc invocation fail immediately
@@ -126,18 +162,22 @@ jobs:
           command: check
 
   build:
-    needs: [lint, test]
+    needs: [ci-image, lint, test]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ needs.ci-image.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.98.1
-
-      - name: Install libvips
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libvips-dev
 
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: Swatinem/rust-cache@v2
