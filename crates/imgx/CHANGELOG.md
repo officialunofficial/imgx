@@ -3,6 +3,13 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.1.9] - 2026-10-26
+
+### Features
+
+- *(server)* Add IMGX_TRANSFORM_FAILURE=error to fail closed on a failed transform ([#64](https://github.com/officialunofficial/imgx/pull/64))(b220029)
+
+
 ## [0.1.8] - 2026-09-24
 
 ### Bug Fixes
