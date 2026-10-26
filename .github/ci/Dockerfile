@@ -12,6 +12,7 @@ RUN apt-get update \
         cmake \
         curl \
         git \
+        jq \
         libheif-plugin-aomenc \
         libvips-dev \
         pkg-config \
