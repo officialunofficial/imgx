@@ -9,31 +9,19 @@ permissions:
   contents: read
 
 jobs:
-  ci-image:
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/ci-image.yml
-
   # Runs when a release-plz PR is merged into main: tags the release,
   # creates a GitHub release with the generated changelog, and runs
   # `cargo publish` for imgx-vips then imgx (release-plz orders publishes
   # by the dependency graph).
   release-plz-release:
     name: Release-plz release
-    needs: ci-image
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # A slow Ubuntu mirror can take 20 minutes or more to install libvips.
+    # A failed release publishes nothing, so a long timeout costs only time.
+    timeout-minutes: 60
     permissions:
       contents: read
-      packages: read
       pull-requests: read
-    # `cargo publish` builds each packaged crate, which needs libvips.
-    container:
-      image: ${{ needs.ci-image.outputs.image }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       # The default GITHUB_TOKEN can't create/approve PRs on this org
       # (locked at the Enterprise level), so we mint a short-lived
@@ -55,6 +43,12 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Install libvips
+        timeout-minutes: 45
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvips-dev
 
       - name: Run release-plz
         uses: release-plz/action@v0.5
