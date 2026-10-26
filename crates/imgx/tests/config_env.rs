@@ -5,7 +5,7 @@
 
 use std::sync::Mutex;
 
-use imgx::config::{Config, ConfigError, OriginType};
+use imgx::config::{Config, ConfigError, OriginType, TransformFailureMode};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -31,6 +31,7 @@ fn clear_all() {
         "TRANSFORM_MAX_FRAMES",
         "TRANSFORM_MAX_ANIMATED_PIXELS",
         "TRANSFORM_AVIF_EFFORT",
+        "TRANSFORM_FAILURE",
         "CACHE_ENABLED",
         "CACHE_MAX_SIZE_BYTES",
         "CACHE_DEFAULT_TTL_SECONDS",
@@ -63,6 +64,7 @@ fn load_from_env_with_no_env_vars_returns_defaults() {
     assert_eq!(cfg.transform.max_width, 8192);
     assert_eq!(cfg.transform.default_quality, 80);
     assert_eq!(cfg.transform.avif_effort, imgx_vips::DEFAULT_AVIF_EFFORT);
+    assert_eq!(cfg.transform.on_failure, TransformFailureMode::Passthrough);
     assert!(cfg.transform.strip_metadata);
     assert!(cfg.cache.enabled);
     assert_eq!(cfg.cache.default_ttl_seconds, 3600);
@@ -168,6 +170,39 @@ fn avif_effort_env_var_above_the_maximum_fails_validation() {
 
     let cfg = Config::load_from_env().expect("parsing succeeds");
     assert_eq!(cfg.validate(), Err(ConfigError::InvalidAvifEffort));
+
+    clear_all();
+}
+
+#[test]
+fn transform_failure_env_var_selects_the_failure_mode() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_all();
+
+    unsafe {
+        std::env::set_var("IMGX_TRANSFORM_FAILURE", "error");
+    }
+    let cfg = Config::load_from_env().expect("load succeeds");
+    assert_eq!(cfg.transform.on_failure, TransformFailureMode::Error);
+
+    unsafe {
+        std::env::set_var("IMGX_TRANSFORM_FAILURE", "passthrough");
+    }
+    let cfg = Config::load_from_env().expect("load succeeds");
+    assert_eq!(cfg.transform.on_failure, TransformFailureMode::Passthrough);
+
+    clear_all();
+}
+
+#[test]
+fn transform_failure_env_var_rejects_an_unknown_value() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_all();
+
+    unsafe {
+        std::env::set_var("IMGX_TRANSFORM_FAILURE", "retry");
+    }
+    assert_eq!(Config::load_from_env(), Err(ConfigError::InvalidValue));
 
     clear_all();
 }
