@@ -1402,7 +1402,8 @@ mod tests {
         let state = state_with_fixture_origin("icc_srgb_640x480.jpg").await;
         let router = build_router(Arc::clone(&state));
         let path = "/image/w=64/photo.jpg";
-        let (_, _, first) = get_full(router.clone(), path, &[(header::ACCEPT, "*/*")]).await;
+        let (_, _, first) =
+            get_full(router.clone(), path, &[(header::ACCEPT, "image/avif,*/*")]).await;
         let (_, _, second) = get_full(
             router,
             path,

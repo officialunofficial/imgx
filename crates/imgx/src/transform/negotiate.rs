@@ -16,9 +16,10 @@ pub struct AcceptResult {
 }
 
 impl AcceptResult {
+    /// A wildcard counts for every format but AVIF (INV-7).
     pub fn supports(&self, fmt: OutputFormat) -> bool {
         match fmt {
-            OutputFormat::Avif => self.supports_avif || self.wildcard,
+            OutputFormat::Avif => self.supports_avif,
             OutputFormat::Webp => self.supports_webp || self.wildcard,
             OutputFormat::Jpeg => self.supports_jpeg || self.wildcard,
             OutputFormat::Png => self.supports_png || self.wildcard,
@@ -239,7 +240,7 @@ mod tests {
     fn parse_accept_header_star_star_wildcard() {
         let r = parse_accept_header("*/*");
         assert!(r.wildcard);
-        assert!(r.supports(OutputFormat::Avif));
+        assert!(!r.supports(OutputFormat::Avif));
         assert!(r.supports(OutputFormat::Webp));
         assert!(r.supports(OutputFormat::Jpeg));
         assert!(r.supports(OutputFormat::Png));
@@ -249,7 +250,7 @@ mod tests {
     fn parse_accept_header_image_wildcard() {
         let r = parse_accept_header("image/*");
         assert!(r.wildcard);
-        assert!(r.supports(OutputFormat::Avif));
+        assert!(!r.supports(OutputFormat::Avif));
         assert!(r.supports(OutputFormat::Webp));
         assert!(r.supports(OutputFormat::Jpeg));
         assert!(r.supports(OutputFormat::Png));
@@ -420,18 +421,53 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_format_wildcard_accept_avif_highest_priority() {
+    fn negotiate_format_wildcard_alone_never_gives_avif() {
         assert_eq!(
             negotiate_format(Some("*/*"), false, None),
-            OutputFormat::Avif
+            OutputFormat::Webp
+        );
+        assert_eq!(
+            negotiate_format(Some("image/*"), true, None),
+            OutputFormat::Webp
         );
     }
 
     #[test]
-    fn negotiate_format_wildcard_accept_alpha_avif() {
+    fn negotiate_format_gives_webp_to_safari_15() {
+        let safari_15 = "image/webp,image/png,image/svg+xml,image/*;q=0.8,video/*;q=0.8,*/*;q=0.5";
+        for alpha in [false, true] {
+            assert_eq!(
+                negotiate_format(Some(safari_15), alpha, None),
+                OutputFormat::Webp
+            );
+        }
+    }
+
+    #[test]
+    fn negotiate_format_gives_webp_to_webp_next_to_a_wildcard() {
+        for alpha in [false, true] {
+            assert_eq!(
+                negotiate_format(Some("image/webp,*/*"), alpha, None),
+                OutputFormat::Webp
+            );
+        }
+    }
+
+    #[test]
+    fn negotiate_format_gives_avif_only_to_an_explicit_avif_entry() {
+        for accept in [
+            "image/avif,*/*",
+            "image/avif,image/webp,image/apng,*/*;q=0.8",
+        ] {
+            assert_eq!(
+                negotiate_format(Some(accept), false, None),
+                OutputFormat::Avif,
+                "{accept}"
+            );
+        }
         assert_eq!(
-            negotiate_format(Some("image/*"), true, None),
-            OutputFormat::Avif
+            negotiate_format(Some("image/avif;q=0,*/*"), false, None),
+            OutputFormat::Webp
         );
     }
 
@@ -627,9 +663,11 @@ mod tests {
 
     #[test]
     fn cache_format_segment_is_equal_for_equivalent_accept_headers() {
+        let wildcard = "auto:webp+jpeg+png+gif";
+        assert_eq!(cache_format_segment(Some("*/*"), None), wildcard);
+        assert_eq!(cache_format_segment(Some("image/*"), None), wildcard);
         let all = "auto:avif+webp+jpeg+png+gif";
-        assert_eq!(cache_format_segment(Some("*/*"), None), all);
-        assert_eq!(cache_format_segment(Some("image/*"), None), all);
+        assert_eq!(cache_format_segment(Some("image/avif,*/*"), None), all);
         assert_eq!(
             cache_format_segment(Some("image/avif,image/webp,image/apng,*/*;q=0.8"), None),
             all
