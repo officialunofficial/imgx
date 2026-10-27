@@ -3,6 +3,13 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.1.10] - 2026-10-26
+
+### Bug Fixes
+
+- *(transform)* A wildcard Accept no longer implies AVIF support ([#70](https://github.com/officialunofficial/imgx/pull/70))(810cd86)
+
+
 ## [0.1.9] - 2026-10-26
 
 ### Features
