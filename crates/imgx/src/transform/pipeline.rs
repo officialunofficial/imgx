@@ -6,7 +6,9 @@
 
 use thiserror::Error;
 
-use imgx_vips::{DEFAULT_AVIF_EFFORT, ThumbnailOptions, VipsError, VipsImage, consts};
+use imgx_vips::{
+    DEFAULT_AVIF_EFFORT, DEFAULT_WEBP_EFFORT, ThumbnailOptions, VipsError, VipsImage, consts,
+};
 
 use super::negotiate;
 use super::params::{
@@ -1020,6 +1022,21 @@ pub fn composite_draw_overlay(
     base.composite_over(&overlay, x, y).map_err(Into::into)
 }
 
+/// The narrowest encoded width that gets `LARGE_WEBP_EFFORT`.
+const LARGE_WEBP_MIN_WIDTH: i32 = 1280;
+
+/// The WebP effort for outputs of `LARGE_WEBP_MIN_WIDTH` and wider.
+const LARGE_WEBP_EFFORT: u8 = 2;
+
+/// The WebP effort for an output `encoded_width` pixels wide.
+fn webp_effort(encoded_width: i32) -> u8 {
+    if encoded_width >= LARGE_WEBP_MIN_WIDTH {
+        LARGE_WEBP_EFFORT
+    } else {
+        DEFAULT_WEBP_EFFORT
+    }
+}
+
 /// Encode a VipsImage into a buffer using the specified output format.
 /// `pub(crate)` (rather than private) so `server.rs` can re-encode a base
 /// image after compositing draw overlays fetched post-transform -- see
@@ -1045,7 +1062,7 @@ pub(crate) fn encode_image(
             image.save_jpeg(q, do_strip)
         }
         OutputFormat::Png => image.save_png(6, do_strip),
-        OutputFormat::Webp => image.save_webp(q, do_strip),
+        OutputFormat::Webp => image.save_webp_with_effort(q, webp_effort(image.width()), do_strip),
         OutputFormat::Avif => image.save_avif(q, options.avif_effort, do_strip),
         OutputFormat::Gif => encode_gif(image),
         // Never reached: `transform()` intercepts `format == Json` and
@@ -1156,6 +1173,69 @@ mod tests {
     fn animated_fixture() -> Option<Vec<u8>> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/loading.gif");
         fs::read(&path).ok()
+    }
+
+    #[test]
+    fn webp_effort_is_lower_from_the_large_width_threshold() {
+        for width in [1, 160, 320, 640, 960, 1279] {
+            assert_eq!(webp_effort(width), DEFAULT_WEBP_EFFORT, "width={width}");
+        }
+        for width in [1280, 1281, 1920, 2560, 8192] {
+            assert_eq!(webp_effort(width), LARGE_WEBP_EFFORT, "width={width}");
+        }
+    }
+
+    #[test]
+    fn encode_image_webp_uses_the_large_effort_only_for_wide_outputs() {
+        init();
+        let src = VipsImage::from_buffer(&fixture("bench_2000x1500.png")).unwrap();
+        let wide = src.thumbnail(1300, ThumbnailOptions::default()).unwrap();
+        let narrow = src.thumbnail(1000, ThumbnailOptions::default()).unwrap();
+        let options = test_encode_options();
+
+        let wide_out = encode_image(&wide, OutputFormat::Webp, &options).unwrap();
+        let wide_at_large = wide
+            .save_webp_with_effort(80, LARGE_WEBP_EFFORT, true)
+            .unwrap();
+        let wide_at_default = wide
+            .save_webp_with_effort(80, DEFAULT_WEBP_EFFORT, true)
+            .unwrap();
+        assert_eq!(wide_out, wide_at_large);
+        assert_ne!(wide_at_large, wide_at_default);
+        let decoded = VipsImage::from_buffer(&wide_out).unwrap();
+        assert_eq!(
+            (&wide_out[..4], &wide_out[8..12]),
+            (&b"RIFF"[..], &b"WEBP"[..])
+        );
+        assert_eq!(decoded.width(), 1300);
+
+        let narrow_out = encode_image(&narrow, OutputFormat::Webp, &options).unwrap();
+        let narrow_at_default = narrow
+            .save_webp_with_effort(80, DEFAULT_WEBP_EFFORT, true)
+            .unwrap();
+        assert_eq!(narrow_out, narrow_at_default);
+    }
+
+    #[test]
+    fn transform_scale_down_of_a_small_source_encodes_webp_at_the_default_effort() {
+        init();
+        let big = VipsImage::from_buffer(&fixture("bench_2000x1500.png")).unwrap();
+        let small = big.thumbnail(1000, ThumbnailOptions::default()).unwrap();
+        let source = small.save_png(6, true).unwrap();
+        let p = parse("w=1920,fit=scale-down,format=webp,q=80").unwrap();
+
+        let result = transform(&source, &p, None, None).unwrap();
+
+        assert_eq!(result.width, 1000);
+        let pixels = VipsImage::from_buffer(&source).unwrap();
+        let at_default = pixels
+            .save_webp_with_effort(80, DEFAULT_WEBP_EFFORT, true)
+            .unwrap();
+        let at_large = pixels
+            .save_webp_with_effort(80, LARGE_WEBP_EFFORT, true)
+            .unwrap();
+        assert_ne!(at_default, at_large);
+        assert_eq!(result.data, at_default);
     }
 
     #[test]

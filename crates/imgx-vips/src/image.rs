@@ -46,6 +46,12 @@ pub const DEFAULT_AVIF_EFFORT: u8 = 4;
 /// The highest AVIF encoder effort that libvips accepts.
 pub const MAX_AVIF_EFFORT: u8 = 9;
 
+/// The WebP encoder effort that libvips uses by default.
+pub const DEFAULT_WEBP_EFFORT: u8 = 4;
+
+/// The highest WebP encoder effort that libvips accepts.
+pub const MAX_WEBP_EFFORT: u8 = 6;
+
 /// Shut down libvips. Call at most once, from `main` on process exit.
 /// Never call from tests (`bindings.zig` carries the same restriction).
 pub fn shutdown() {
@@ -343,8 +349,20 @@ impl VipsImage {
         save_result(rc, buf, len)
     }
 
-    /// Encode to WebP. `quality` is 1-100.
+    /// Encode to WebP with `DEFAULT_WEBP_EFFORT`. `quality` is 1-100.
     pub fn save_webp(&self, quality: i32, strip: bool) -> Result<Vec<u8>, VipsError> {
+        self.save_webp_with_effort(quality, DEFAULT_WEBP_EFFORT, strip)
+    }
+
+    /// Encode to WebP. `quality` is 1-100. `effort` is the encoder CPU
+    /// effort. It runs from 0 (fastest, largest output) to
+    /// `MAX_WEBP_EFFORT` (slowest, smallest output).
+    pub fn save_webp_with_effort(
+        &self,
+        quality: i32,
+        effort: u8,
+        strip: bool,
+    ) -> Result<Vec<u8>, VipsError> {
         let mut buf: *mut c_void = ptr::null_mut();
         let mut len: size_t = 0;
         let rc = unsafe {
@@ -354,6 +372,8 @@ impl VipsImage {
                 &mut len,
                 c"Q".as_ptr(),
                 quality,
+                c"effort".as_ptr(),
+                effort as c_int,
                 c"strip".as_ptr(),
                 bool_to_int(strip),
                 ptr::null::<c_char>(),
@@ -1506,6 +1526,21 @@ mod tests {
             1,
             "dropping the source releases the blob once"
         );
+    }
+
+    #[test]
+    fn save_webp_accepts_the_full_effort_range() {
+        init().expect("vips init");
+        let img = VipsImage::from_buffer(&fixture("bench_2000x1500.png")).expect("load png");
+        for effort in [0, DEFAULT_WEBP_EFFORT, MAX_WEBP_EFFORT] {
+            let webp = img
+                .save_webp_with_effort(80, effort, true)
+                .expect("encode webp");
+            assert_eq!(&webp[..4], b"RIFF", "effort={effort}");
+            assert_eq!(&webp[8..12], b"WEBP", "effort={effort}");
+            let back = VipsImage::from_buffer(&webp).expect("decode webp");
+            assert_eq!(back.width(), img.width(), "effort={effort}");
+        }
     }
 
     #[test]
