@@ -3,6 +3,13 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.1.11] - 2026-10-29
+
+### Performance
+
+- *(transform)* Use WebP effort 2 for outputs 1280 px and wider ([#73](https://github.com/officialunofficial/imgx/pull/73))(e33dc2a)
+
+
 ## [0.1.10] - 2026-10-26
 
 ### Bug Fixes
