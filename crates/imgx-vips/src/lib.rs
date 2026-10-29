@@ -8,8 +8,8 @@ mod image;
 
 pub use error::VipsError;
 pub use image::{
-    DEFAULT_AVIF_EFFORT, MAX_AVIF_EFFORT, ThumbnailOptions, VipsImage, arrayjoin_vertical, init,
-    shutdown,
+    DEFAULT_AVIF_EFFORT, DEFAULT_WEBP_EFFORT, MAX_AVIF_EFFORT, MAX_WEBP_EFFORT, ThumbnailOptions,
+    VipsImage, arrayjoin_vertical, init, shutdown,
 };
 
 /// libvips C enum constants needed to call the FFI-wrapped operations

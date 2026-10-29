@@ -19,7 +19,7 @@ The specific latency numbers previously published on this page were measured aga
 - **Origin fetch** — Network round-trip to your image storage. R2 from the same region is typically fastest. HTTP origins depend on the server.
 - **Transform complexity** — Resize alone is fast. Adding blur, sharpen, or format conversion adds processing time. Animated GIFs with many frames are the most expensive.
 - **Image size** — A 10 MP JPEG takes longer to decode and resize than a 1 MP thumbnail.
-- **Output format** — AVIF encoding is slower than JPEG or WebP. PNG compression is moderate.
+- **Output format** — AVIF encoding is slower than JPEG or WebP. PNG compression is moderate. For WebP output 1280 pixels wide or wider, imgx uses encoder effort 2 in place of the libvips default of 4. This encodes faster and writes slightly larger files. imgx measures the width after the resize. The cache key does not include the WebP effort. A cached variant keeps its old effort until its TTL ends.
 
 ### What keeps warm requests fast
 
