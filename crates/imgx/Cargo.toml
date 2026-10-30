@@ -23,9 +23,9 @@ imgx-vips = { path = "../imgx-vips", version = "0.1.11" }
 tracing = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
-lru = "0.18"
-parking_lot = "0.12"
-rusty-s3 = "0.10"
+lru = "0.19"
+parking_lot = "0.13"
+rusty-s3 = "0.11"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 url = "2"
 axum = "0.8"
