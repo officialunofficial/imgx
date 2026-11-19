@@ -45,7 +45,9 @@ while True:
     -e IMGX_TRANSFORM_FAILURE=error "$image" >/dev/null
 
 address=127.0.0.1:$port
-curl --fail --silent --show-error --retry 10 --retry-delay 1 --retry-connrefused \
+# Docker may publish the port before imgx has bound the listener.
+curl --noproxy 127.0.0.1 --fail --silent --show-error --max-time 3 \
+    --retry 10 --retry-delay 1 --retry-all-errors \
     "http://$address/health" >/dev/null
 for format in jpeg png webp gif avif json thumbhash; do
     case "$format" in
@@ -53,7 +55,7 @@ for format in jpeg png webp gif avif json thumbhash; do
         thumbhash) media='text/plain; charset=utf-8' ;;
         *) media="image/$format" ;;
     esac
-    actual=$(curl --fail --silent --show-error --output "$work/$format" --write-out '%{content_type}' \
+    actual=$(curl --noproxy 127.0.0.1 --fail --silent --show-error --output "$work/$format" --write-out '%{content_type}' \
         "http://$address/image/width=12,format=$format/small.png")
     test "$actual" = "$media"
     test -s "$work/$format"
