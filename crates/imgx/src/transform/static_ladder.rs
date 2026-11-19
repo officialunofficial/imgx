@@ -2,8 +2,8 @@
 
 use imgx_vips::VipsError;
 use imgx_vips::ladder::{
-    Codec, DecodePolicy, Geometry, Gravity, LadderRequest, LosslessPolicy, MetadataPolicy,
-    OutputSpec, RenderError, RenderLimits, WebpEffort, render_ladder,
+    Codec, DecodePolicy, Geometry, Gravity, LadderRequest, OutputSpec, RenderError, RenderLimits,
+    render_ladder,
 };
 
 use super::params::{AnimMode, FitMode, MetadataMode, OutputFormat, TransformParams};
@@ -29,20 +29,9 @@ pub(crate) fn render(
     } else {
         DecodePolicy::LenientReduced
     };
-    let request = LadderRequest {
-        baseline: None,
-        outputs: &[output],
-        thumbhash: false,
-        decode,
-    };
-    let limits = RenderLimits {
-        max_input_bytes: MAX_BYTES,
-        max_pixels,
-        max_edge: MAX_EDGE,
-        max_outputs: 1,
-        max_output_bytes: MAX_BYTES,
-        max_total_output_bytes: MAX_BYTES,
-    };
+    let outputs = [output];
+    let request = LadderRequest::new(&outputs, decode);
+    let limits = RenderLimits::new(MAX_BYTES, max_pixels, MAX_EDGE, 1, MAX_BYTES, MAX_BYTES);
     let rendered = match render_ladder(input, &request, &limits) {
         Ok(rendered) => rendered,
         // A request outside the ladder's bounds keeps the existing renderer's
@@ -111,17 +100,7 @@ fn recipe(params: &TransformParams) -> Option<(OutputFormat, OutputSpec)> {
         OutputFormat::Jpeg | OutputFormat::BaselineJpeg => Codec::Jpeg,
         _ => return None,
     };
-    Some((
-        format,
-        OutputSpec {
-            geometry,
-            codec,
-            quality: params.quality,
-            effort: WebpEffort::ByWidth,
-            lossless: LosslessPolicy::Lossy,
-            metadata: MetadataPolicy::Strip,
-        },
-    ))
+    Some((format, OutputSpec::new(geometry, codec, params.quality)))
 }
 
 #[cfg(test)]

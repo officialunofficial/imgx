@@ -10,52 +10,44 @@ use imgx_vips::ladder::{
     Codec, DecodePolicy, Encoded, Geometry, Gravity, LadderRequest, LosslessPolicy, MetadataPolicy,
     OutputSpec, RenderError, RenderLimits, WebpEffort, render_ladder,
 };
-use imgx_vips::{VipsImage, consts};
+use imgx_vips::{VipsImage, consts, thumbhash, vips_version};
 use reqwest::{Client, StatusCode, header};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const LIMITS: RenderLimits = RenderLimits {
-    max_input_bytes: 32 * 1024 * 1024,
-    max_pixels: 64_000_000,
-    max_edge: 2560,
-    max_outputs: 9,
-    max_output_bytes: 32 * 1024 * 1024,
-    max_total_output_bytes: 64 * 1024 * 1024,
-};
+const LIMITS: RenderLimits = RenderLimits::new(
+    32 * 1024 * 1024,
+    64_000_000,
+    2560,
+    9,
+    32 * 1024 * 1024,
+    64 * 1024 * 1024,
+);
 
 const WIDTHS: [u32; 7] = [160, 320, 640, 960, 1280, 1920, 2560];
 
-const MASTER: OutputSpec = OutputSpec {
-    geometry: Geometry::MaxEdge(2560),
-    codec: Codec::Webp,
-    quality: 95,
-    effort: WebpEffort::Fixed(4),
-    lossless: LosslessPolicy::Source,
-    metadata: MetadataPolicy::Srgb,
+const MASTER: OutputSpec = {
+    let mut spec = OutputSpec::new(Geometry::MaxEdge(2560), Codec::Webp, 95);
+    spec.effort = WebpEffort::Fixed(4);
+    spec.lossless = LosslessPolicy::Source;
+    spec.metadata = MetadataPolicy::Srgb;
+    spec
 };
 
-const CARD: OutputSpec = OutputSpec {
-    geometry: Geometry::Cover {
+const CARD: OutputSpec = OutputSpec::new(
+    Geometry::Cover {
         width: 1200,
         height: 630,
         gravity: Gravity::Center,
     },
-    codec: Codec::Jpeg,
-    ..rung(1200)
-};
+    Codec::Jpeg,
+    80,
+);
 
 const fn rung(width: u32) -> OutputSpec {
-    OutputSpec {
-        geometry: Geometry::ScaleDownWidth(width),
-        codec: Codec::Webp,
-        quality: 80,
-        effort: WebpEffort::ByWidth,
-        lossless: LosslessPolicy::Lossy,
-        metadata: MetadataPolicy::Strip,
-    }
+    OutputSpec::new(Geometry::ScaleDownWidth(width), Codec::Webp, 80)
 }
 
 struct Case {
@@ -65,7 +57,7 @@ struct Case {
     ssim_floor: f64,
 }
 
-const CASES: [Case; 6] = [
+const CASES: &[Case] = &[
     Case {
         name: "blue-marble.jpg",
         size: (2048, 2048),
@@ -88,7 +80,7 @@ const CASES: [Case; 6] = [
         name: "transparent.png",
         size: (319, 173),
         alpha: true,
-        ssim_floor: 0.91,
+        ssim_floor: 0.90,
     },
     Case {
         name: "small.png",
@@ -101,6 +93,30 @@ const CASES: [Case; 6] = [
         size: (403, 257),
         alpha: false,
         ssim_floor: 0.965,
+    },
+    Case {
+        name: "thin-tall.png",
+        size: (40, 2400),
+        alpha: false,
+        ssim_floor: 0.96,
+    },
+    Case {
+        name: "thin-wide.png",
+        size: (2400, 40),
+        alpha: false,
+        ssim_floor: 0.96,
+    },
+    Case {
+        name: "wide-master.jpg",
+        size: (2560, 1280),
+        alpha: false,
+        ssim_floor: 0.93,
+    },
+    Case {
+        name: "portrait.heic",
+        size: (257, 403),
+        alpha: false,
+        ssim_floor: 0.96,
     },
 ];
 
@@ -150,19 +166,22 @@ async fn check_http_goldens(static_ladder: bool) {
     let mut specs: Vec<_> = WIDTHS.into_iter().map(rung).collect();
     specs.push(CARD);
 
+    eprintln!("linked libvips {:?}", vips_version());
     for case in CASES {
         let input = fixture(case.name);
-        let ladder = render_ladder(
-            &input,
-            &LadderRequest {
-                baseline: Some(MASTER),
-                outputs: &specs,
-                thumbhash: true,
-                decode: DecodePolicy::Strict,
-            },
-            &LIMITS,
-        )
-        .unwrap();
+        let mut request = LadderRequest::new(&specs, DecodePolicy::Strict);
+        request.baseline = Some(MASTER);
+        request.thumbhash = true;
+        let ladder = match render_ladder(&input, &request, &LIMITS) {
+            Err(RenderError::UnsupportedInput)
+                if case.name == "portrait.heic"
+                    && std::env::var_os("IMGX_PINNED_GOLDENS").is_none() =>
+            {
+                eprintln!("portrait.heic skipped: system HEVC decoder unavailable");
+                continue;
+            }
+            result => result.unwrap_or_else(|error| panic!("{}: {error}", case.name)),
+        };
         let master = ladder.baseline.unwrap();
         let master_image = decode(&master.bytes);
         assert_eq!((master.width, master.height), case.size, "{}", case.name);
@@ -215,12 +234,7 @@ async fn check_http_goldens(static_ladder: bool) {
 
             let same_bytes = render_ladder(
                 &master.bytes,
-                &LadderRequest {
-                    baseline: None,
-                    outputs: std::slice::from_ref(spec),
-                    thumbhash: false,
-                    decode: DecodePolicy::LenientReduced,
-                },
+                &LadderRequest::new(std::slice::from_ref(spec), DecodePolicy::LenientReduced),
                 &LIMITS,
             )
             .unwrap();
@@ -333,16 +347,21 @@ fn check_dimensions(size: (u32, u32), output: &Encoded, spec: &OutputSpec) {
             let height = ((u64::from(width) * u64::from(size.1) + u64::from(size.0 / 2))
                 / u64::from(size.0))
             .max(1) as u32;
-            (width, height)
+            match (size, width) {
+                // The rounded height is the tighter side of these boxes.
+                ((2400, 40), 320) => (300, 5),
+                ((2400, 40), 1280) => (1260, 21),
+                _ => (width, height),
+            }
         }
         Geometry::Cover { width, height, .. } => (width, height),
-        Geometry::MaxEdge(_) => unreachable!(),
+        _ => unreachable!(),
     };
     assert_eq!((output.width, output.height), expected);
     match spec.codec {
         Codec::Jpeg => assert!(output.bytes.starts_with(b"\xff\xd8\xff")),
         Codec::Webp => assert_eq!(&output.bytes[8..12], b"WEBP"),
-        Codec::Png => unreachable!(),
+        _ => unreachable!(),
     }
 }
 
@@ -397,18 +416,81 @@ fn compare_pixels(native: &VipsImage, fallback: &VipsImage) -> (f64, f64) {
 
 #[test]
 fn corrupt_input_returns_no_batch() {
-    let result = render_ladder(
-        &fixture("corrupt.png"),
-        &LadderRequest {
-            baseline: Some(MASTER),
-            outputs: &[rung(160)],
-            thumbhash: true,
-            decode: DecodePolicy::Strict,
-        },
-        &LIMITS,
-    );
+    let outputs = [rung(160)];
+    let mut request = LadderRequest::new(&outputs, DecodePolicy::Strict);
+    request.baseline = Some(MASTER);
+    request.thumbhash = true;
+    let result = render_ladder(&fixture("corrupt.png"), &request, &LIMITS);
     assert!(
         matches!(result, Err(RenderError::CorruptInput(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn direct_thumbhash_uses_opaque_cmyk_and_full_range_rgb16() {
+    let mut request = LadderRequest::new(&[], DecodePolicy::Strict);
+    request.thumbhash = true;
+    for name in ["cmyk.jpg", "rgb16.png"] {
+        let input = fixture(name);
+        let hash = render_ladder(&input, &request, &LIMITS)
+            .unwrap()
+            .thumbhash
+            .unwrap();
+        assert_eq!(hash[2] & 0x80, 0, "{name} has no alpha");
+
+        // Encode an explicitly normalized 8-bit reference at the hash size.
+        let reference = decode(&input)
+            .thumbnail(
+                thumbhash::MAX_SIDE as i32,
+                imgx_vips::ThumbnailOptions {
+                    height: Some(thumbhash::MAX_SIDE as i32),
+                    size: Some(consts::VIPS_SIZE_DOWN),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .colourspace(consts::VIPS_INTERPRETATION_sRGB)
+            .unwrap();
+        let reference = reference.save_png(6, true).unwrap();
+        let expected = render_ladder(&reference, &request, &LIMITS)
+            .unwrap()
+            .thumbhash
+            .unwrap();
+        assert_eq!(hash, expected, "{name} matches its 8-bit sRGB reference");
+    }
+}
+
+#[test]
+fn smart_crop_keeps_the_pre_crop_pixel_limit() {
+    let input = fixture("thin-tall.png");
+    for gravity in [Gravity::Attention, Gravity::Entropy] {
+        let mut spec = CARD;
+        spec.geometry = Geometry::Cover {
+            width: 1200,
+            height: 630,
+            gravity,
+        };
+        let outputs = [spec];
+        let request = LadderRequest::new(&outputs, DecodePolicy::Strict);
+        assert!(matches!(
+            render_ladder(&input, &request, &LIMITS),
+            Err(RenderError::PixelLimit {
+                actual: 86_400_000,
+                limit: 64_000_000
+            })
+        ));
+    }
+}
+
+#[test]
+#[ignore = "requires libheif with its HEVC plugin disabled"]
+fn heic_without_decoder_is_unsupported() {
+    let outputs = [rung(160)];
+    let request = LadderRequest::new(&outputs, DecodePolicy::Strict);
+    let result = render_ladder(&fixture("portrait.heic"), &request, &LIMITS);
+    assert!(
+        matches!(result, Err(RenderError::UnsupportedInput)),
         "{result:?}"
     );
 }

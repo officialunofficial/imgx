@@ -13,6 +13,7 @@ use crate::{
 
 /// Why rendering returned no batch.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum RenderError {
     #[error("invalid render request: {0}")]
     InvalidRequest(&'static str),
@@ -38,6 +39,7 @@ pub enum RenderError {
 
 /// Requested renditions. When present, the baseline raster feeds the renditions and ThumbHash.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct LadderRequest<'a> {
     pub baseline: Option<OutputSpec>,
     pub outputs: &'a [OutputSpec],
@@ -45,8 +47,21 @@ pub struct LadderRequest<'a> {
     pub decode: DecodePolicy,
 }
 
+impl<'a> LadderRequest<'a> {
+    /// Render the requested outputs directly from the source, without ThumbHash.
+    pub const fn new(outputs: &'a [OutputSpec], decode: DecodePolicy) -> Self {
+        Self {
+            baseline: None,
+            outputs,
+            thumbhash: false,
+            decode,
+        }
+    }
+}
+
 /// How to open the source. Every policy reads a single frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecodePolicy {
     /// Fail on decoder errors, including during pixel evaluation.
     Strict,
@@ -61,6 +76,7 @@ pub enum DecodePolicy {
 
 /// Recipe for one output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct OutputSpec {
     pub geometry: Geometry,
     pub codec: Codec,
@@ -70,8 +86,23 @@ pub struct OutputSpec {
     pub metadata: MetadataPolicy,
 }
 
+impl OutputSpec {
+    /// A lossy output with metadata stripped and WebP effort chosen by width.
+    pub const fn new(geometry: Geometry, codec: Codec, quality: u8) -> Self {
+        Self {
+            geometry,
+            codec,
+            quality,
+            effort: WebpEffort::ByWidth,
+            lossless: LosslessPolicy::Lossy,
+            metadata: MetadataPolicy::Strip,
+        }
+    }
+}
+
 /// Output geometry in the displayed orientation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Geometry {
     /// Downscale to a square bounding box, preserving aspect ratio.
     MaxEdge(u32),
@@ -87,6 +118,7 @@ pub enum Geometry {
 
 /// Position or content heuristic used when cropping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Gravity {
     Center,
     Attention,
@@ -95,6 +127,7 @@ pub enum Gravity {
 
 /// Encoders available in the shared native bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Codec {
     Webp,
     Jpeg,
@@ -103,6 +136,7 @@ pub enum Codec {
 
 /// WebP encoder effort. JPEG and PNG use their native defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum WebpEffort {
     Fixed(u8),
     /// Use imgx's width threshold on the encoded width.
@@ -111,6 +145,7 @@ pub enum WebpEffort {
 
 /// WebP encoding mode. JPEG is always lossy and PNG is always lossless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum LosslessPolicy {
     Lossy,
     Lossless,
@@ -120,6 +155,7 @@ pub enum LosslessPolicy {
 
 /// How to handle input metadata and colour profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum MetadataPolicy {
     Keep,
     Strip,
@@ -127,10 +163,12 @@ pub enum MetadataPolicy {
     Srgb,
 }
 
-/// Hard request and response bounds. The pixel limit also bounds cover's pre-crop raster.
+/// Hard request and response bounds.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct RenderLimits {
     pub max_input_bytes: usize,
+    /// Bounds decoded sources, outputs and the full raster scanned by smart crops.
     pub max_pixels: u64,
     pub max_edge: u32,
     /// Number of requested encoded outputs, including a baseline and repeated requests.
@@ -140,8 +178,30 @@ pub struct RenderLimits {
     pub max_total_output_bytes: usize,
 }
 
+impl RenderLimits {
+    /// Set all byte, raster and output-count limits for a batch.
+    pub const fn new(
+        max_input_bytes: usize,
+        max_pixels: u64,
+        max_edge: u32,
+        max_outputs: usize,
+        max_output_bytes: usize,
+        max_total_output_bytes: usize,
+    ) -> Self {
+        Self {
+            max_input_bytes,
+            max_pixels,
+            max_edge,
+            max_outputs,
+            max_output_bytes,
+            max_total_output_bytes,
+        }
+    }
+}
+
 /// One complete batch of encoded renditions.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Ladder {
     pub baseline: Option<Encoded>,
     pub outputs: Vec<Encoded>,
@@ -153,6 +213,7 @@ pub struct Ladder {
 
 /// Encoded bytes and their actual dimensions and format.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Encoded {
     pub bytes: Vec<u8>,
     pub width: u32,
@@ -162,6 +223,7 @@ pub struct Encoded {
 
 /// Timings for fully evaluated phases.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct Timings {
     /// Header probe and full decode. For a fused render, this is just the probe.
     pub decode: Duration,
@@ -173,6 +235,7 @@ pub struct Timings {
 
 /// Times for one distinct encoded output.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct OutputTimings {
     pub resize: Duration,
     /// Decode and resize together for shrink on load. In that case, `resize` is zero.
@@ -190,6 +253,10 @@ pub fn released_webp_effort(encoded_width: u32) -> u8 {
 }
 
 /// Decode the first frame and render a batch. On failure no encoded bytes are returned.
+///
+/// Resource failures are reported when the allocator or codec exposes a
+/// recoverable status. libvips and GLib also use aborting allocators, so an
+/// allocation failure in native code can terminate the process.
 pub fn render_ladder(
     input: &[u8],
     request: &LadderRequest<'_>,
@@ -383,10 +450,15 @@ fn resize(
 ) -> Result<(VipsImage, Duration), RenderError> {
     let started = Instant::now();
     let size = oriented_size(source);
-    let (width, opts) = thumbnail_options(size, canonical_spec(spec, size).geometry, limits)?;
+    let geometry = canonical_spec(spec, size).geometry;
+    let ThumbnailPlan {
+        width,
+        options: opts,
+        center_crop,
+    } = thumbnail_plan(source, geometry, limits)?;
     let image = if let Some(input) = reduced_input {
         let resized = VipsImage::thumbnail_buffer(input, width, opts).map_err(decode_error)?;
-        if opts.crop.is_none() {
+        if opts.crop.is_none() && center_crop.is_none() {
             let expected = contain_size(size, (width, opts.height.expect("thumbnail box")));
             if (resized.width(), resized.height()) != expected {
                 VipsImage::thumbnail_buffer(
@@ -411,6 +483,29 @@ fn resize(
         source
             .thumbnail_with_profile(width, opts, profile)
             .map_err(backend_error)?
+    };
+    let image = if let Some((width, height)) = center_crop {
+        let image = image
+            .crop(
+                (image.width() - width) / 2,
+                (image.height() - height) / 2,
+                width,
+                height,
+            )
+            .map_err(backend_error)?;
+        if !matches!(source.get_int("orientation"), None | Some(1)) {
+            // Rotate only the cropped raster. thumbnail's autorotation would
+            // otherwise force the full scaled raster into memory.
+            image
+                .materialize()
+                .map_err(backend_error)?
+                .autorot()
+                .map_err(backend_error)?
+        } else {
+            image
+        }
+    } else {
+        image
     };
     if image.width() <= 0
         || image.height() <= 0
@@ -441,11 +536,18 @@ fn resize(
     Ok((image, started.elapsed()))
 }
 
-fn thumbnail_options(
-    (source_width, source_height): (u32, u32),
+struct ThumbnailPlan {
+    width: i32,
+    options: ThumbnailOptions,
+    center_crop: Option<(i32, i32)>,
+}
+
+fn thumbnail_plan(
+    source: &VipsImage,
     geometry: Geometry,
     limits: &RenderLimits,
-) -> Result<(i32, ThumbnailOptions), RenderError> {
+) -> Result<ThumbnailPlan, RenderError> {
+    let (source_width, source_height) = oriented_size(source);
     let (width, height, crop, size) = match geometry {
         Geometry::MaxEdge(edge) => (edge, edge, None, Some(consts::VIPS_SIZE_DOWN)),
         Geometry::ScaleDownWidth(width) => {
@@ -470,7 +572,40 @@ fn thumbnail_options(
                 (f64::from(source_width) * scale).round() as u64,
                 (f64::from(source_height) * scale).round() as u64,
             );
-            check_pixels(pre_crop, limits.max_pixels)?;
+            let pre_crop_check = check_pixels(pre_crop, limits.max_pixels);
+            if gravity == Gravity::Center
+                && matches!(pre_crop_check, Err(RenderError::PixelLimit { .. }))
+            {
+                check_pixels((u64::from(width), u64::from(height)), limits.max_pixels)?;
+                // Without libvips' built-in crop, the scaled raster remains
+                // lazy. Ceil the long edge so the short edge determines scale.
+                let scaled_width = (f64::from(source_width) * scale)
+                    .ceil()
+                    .max(f64::from(width)) as u64;
+                let scaled_height = (f64::from(source_height) * scale)
+                    .ceil()
+                    .max(f64::from(height)) as u64;
+                let scaled_width =
+                    i32::try_from(scaled_width).map_err(|_| RenderError::OutputLimit)?;
+                let scaled_height =
+                    i32::try_from(scaled_height).map_err(|_| RenderError::OutputLimit)?;
+                let swapped = matches!(source.get_int("orientation"), Some(5..=8));
+                let (scaled_width, scaled_height, width, height) = if swapped {
+                    (scaled_height, scaled_width, height, width)
+                } else {
+                    (scaled_width, scaled_height, width, height)
+                };
+                return Ok(ThumbnailPlan {
+                    width: scaled_width,
+                    options: ThumbnailOptions {
+                        height: Some(scaled_height),
+                        no_rotate: true,
+                        ..Default::default()
+                    },
+                    center_crop: Some((width as i32, height as i32)),
+                });
+            }
+            pre_crop_check?;
             if pre_crop.0.max(pre_crop.1) > i32::MAX as u64 {
                 return Err(RenderError::OutputLimit);
             }
@@ -483,15 +618,16 @@ fn thumbnail_options(
         }
     };
     let height = i32::try_from(height).map_err(|_| RenderError::OutputLimit)?;
-    Ok((
-        width as i32,
-        ThumbnailOptions {
+    Ok(ThumbnailPlan {
+        width: width as i32,
+        options: ThumbnailOptions {
             height: Some(height),
             crop,
             size,
             no_rotate: false,
         },
-    ))
+        center_crop: None,
+    })
 }
 
 fn contain_size(source: (u32, u32), target: (i32, i32)) -> (i32, i32) {
@@ -616,12 +752,29 @@ fn backend_error(error: VipsError) -> RenderError {
 }
 
 fn classify_native_failure(error: VipsError, failure: fn(VipsError) -> RenderError) -> RenderError {
-    let message = error.to_string();
-    if message.to_ascii_lowercase().contains("out of memory") {
-        RenderError::Resource(message)
-    } else {
-        failure(error)
+    let message = match &error {
+        VipsError::Resource(_) => return RenderError::Resource(error.to_string()),
+        VipsError::LoadFailed(message) | VipsError::OperationFailed(message) => message,
+        _ => return failure(error),
+    };
+    // libvips exposes a text buffer, but includes the original libheif
+    // error code and subcode at the end of each "heif:" diagnostic.
+    for line in message.lines().filter(|line| line.starts_with("heif: ")) {
+        if line.ends_with(" (4.3000)") || line.ends_with(" (11.6003)") {
+            // Unsupported codec (older libheif) or no matching decoder installed.
+            return RenderError::UnsupportedInput;
+        }
+        if let Some((_, code)) = line.rsplit_once(" (6.")
+            && let Some(subcode) = code
+                .strip_suffix(')')
+                .and_then(|code| code.parse::<u32>().ok())
+            && subcode != 1000
+        // heif_suberror_Security_limit_exceeded
+        {
+            return RenderError::Resource(error.to_string());
+        }
     }
+    failure(error)
 }
 
 fn resource_error(error: std::collections::TryReserveError) -> RenderError {
@@ -769,6 +922,18 @@ mod tests {
             },
         );
         assert!(matches!(result, Err(RenderError::OutputLimit)));
+    }
+
+    #[test]
+    fn native_status_codes_distinguish_missing_codecs_and_allocation_failures() {
+        for status in ["4.3000", "11.6003"] {
+            let error = VipsError::OperationFailed(format!("heif: native diagnostic ({status})"));
+            assert!(matches!(decode_error(error), RenderError::UnsupportedInput));
+        }
+        let error = VipsError::OperationFailed("heif: native diagnostic (6.0)".into());
+        assert!(matches!(decode_error(error), RenderError::Resource(_)));
+        let error = VipsError::OperationFailed("heif: native diagnostic (6.1000)".into());
+        assert!(matches!(decode_error(error), RenderError::CorruptInput(_)));
     }
 
     #[test]

@@ -45,7 +45,9 @@ unsafe extern "C" {
     // -- lifecycle --
     pub fn vips_init(argv0: *const c_char) -> c_int;
     pub fn vips_shutdown();
+    pub fn vips_version(flag: c_int) -> c_int;
     pub fn g_object_unref(object: *mut c_void);
+    pub fn g_try_malloc(size: size_t) -> *mut c_void;
     pub fn g_free(mem: *mut c_void);
 
     // -- operation cache --
@@ -63,12 +65,7 @@ unsafe extern "C" {
     // bytes and the safe wrapper cannot express the borrow.
     // Signatures checked against libvips 8.18.4 `vips/type.h`,
     // `vips/connection.h` and `vips/image.h`.
-    // `vips_blob_copy` copies the bytes into a reference-counted blob.
-    // `vips_source_new_from_blob` takes its own reference to that blob.
-    // The caller's bytes therefore need not outlive the call.
-    pub fn vips_blob_copy(data: *const c_void, length: size_t) -> *mut VipsBlob;
-    // Only the tests call `vips_blob_new`. It builds a blob whose free
-    // callback reports its release. The callback type is `VipsCallbackFn`.
+    // The callback is called when libvips releases the last blob reference.
     pub fn vips_blob_new(
         free_fn: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
         data: *const c_void,

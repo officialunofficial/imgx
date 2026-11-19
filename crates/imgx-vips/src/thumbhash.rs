@@ -14,6 +14,7 @@ pub const MAX_SIDE: u32 = 100;
 
 /// Why the ThumbHash path rejected its input.
 #[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ThumbhashError {
     #[error("thumbhash input {width}x{height} is outside 1..={MAX_SIDE} on a side")]
     InvalidDimensions { width: u32, height: u32 },
