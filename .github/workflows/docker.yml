@@ -6,7 +6,7 @@ on:
     # release-plz tags releases as `imgx-vX.Y.Z` (package-prefixed, since
     # imgx-vips is tagged separately in the same repo) -- not the bare
     # `vX.Y.Z` this previously matched, which never fired.
-    tags: ["imgx-v*"]
+    tags: ["imgx-v[0-9]*"]
   pull_request:
     branches: [main]
 
@@ -31,10 +31,10 @@ jobs:
       push: ${{ github.event_name != 'pull_request' }}
       platforms: linux/amd64,linux/arm64
       meta-images: ghcr.io/${{ github.repository }}
+      meta-flavor: latest=false
       meta-tags: |
         type=ref,event=branch
-        type=match,pattern=imgx-v(.*),group=1
-        type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/imgx-v') }}
+        type=match,pattern=^imgx-v([0-9].*)$,group=1
         type=sha
       cache: true
       cache-mode: max
@@ -43,6 +43,73 @@ jobs:
         - registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+  release-toolchain:
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/ci-image.yml
+
+  verify-release:
+    needs: [build, release-toolchain]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}@${{ needs.build.outputs.digest }}
+      TOOLCHAIN: ${{ needs.release-toolchain.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run goldens against the pushed release
+        run: test/goldens-runtime.sh "$TOOLCHAIN" "$IMAGE"
+
+      - name: Smoke test the pushed release
+        run: |
+          test/smoke-runtime.sh "$IMAGE"
+          IMGX_TRANSFORM_STATIC_LADDER=true test/smoke-runtime.sh "$IMAGE"
+
+  publish-release-image:
+    needs: [build, verify-release]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IMAGE: ghcr.io/${{ github.repository }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - name: Add the verified image digest to the release notes
+        run: |
+          # The tag can arrive before release-plz creates the GitHub release.
+          for attempt in {1..12}; do
+            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq .body > release-notes.md; then
+              break
+            fi
+            if [ "$attempt" = 12 ]; then
+              exit 1
+            fi
+            sleep 5
+          done
+          awk '/^<!-- imgx-container-image -->$/{exit} {print}' release-notes.md > release-body.md
+          printf '\n<!-- imgx-container-image -->\n### Container image\n\n%s@%s\n' "$IMAGE" "$DIGEST" >> release-body.md
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file release-body.md
+
+      - uses: docker/login-action@v4.5.2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point latest at the verified multi-platform image
+        run: docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
 
   scan:
     needs: build

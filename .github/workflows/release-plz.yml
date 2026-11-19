@@ -107,7 +107,7 @@ jobs:
       # the registry diff (also catches unpublished/yanked states).
       - name: Checkout last release tag as the comparison baseline
         run: |
-          last_tag=$(git tag -l 'imgx-v*' | sort -V | tail -1)
+          last_tag=$(git tag -l 'imgx-v[0-9]*' | sort -V | tail -1)
           echo "Comparing against $last_tag"
           git worktree add /tmp/last-release "$last_tag"
 

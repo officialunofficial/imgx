@@ -2,7 +2,9 @@
 
 use std::fmt::Write;
 use std::path::Path;
+use std::process::{Child, Command};
 use std::sync::Arc;
+use std::time::Duration;
 
 use imgx::config::{Config, TransformFailureMode};
 use imgx::server::{AppState, build_router};
@@ -143,26 +145,8 @@ async fn native_ladder_matches_opt_in_http_render_perceptually() {
 
 async fn check_http_goldens(static_ladder: bool) {
     let origin = MockServer::start().await;
-    let config = Config {
-        origin: imgx::config::OriginConfig {
-            base_url: origin.uri(),
-            ..Default::default()
-        },
-        transform: imgx::config::TransformConfig {
-            on_failure: TransformFailureMode::Error,
-            static_ladder,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server = format!("http://{}", listener.local_addr().unwrap());
-    let task = tokio::spawn(async move {
-        axum::serve(listener, build_router(Arc::new(AppState::new(config))))
-            .await
-            .unwrap();
-    });
     let client = Client::builder().no_proxy().build().unwrap();
+    let (server, _server) = start_server(&origin, &client, static_ladder).await;
     let mut specs: Vec<_> = WIDTHS.into_iter().map(rung).collect();
     specs.push(CARD);
 
@@ -304,7 +288,82 @@ async fn check_http_goldens(static_ladder: bool) {
         .unwrap();
     assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(refused.headers()[header::CONTENT_TYPE], "application/json");
-    task.abort();
+}
+
+enum GoldenServer {
+    Embedded(tokio::task::JoinHandle<()>),
+    Runtime(Child),
+}
+
+impl Drop for GoldenServer {
+    fn drop(&mut self) {
+        match self {
+            Self::Embedded(task) => task.abort(),
+            Self::Runtime(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+async fn start_server(
+    origin: &MockServer,
+    client: &Client,
+    static_ladder: bool,
+) -> (String, GoldenServer) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = format!("http://127.0.0.1:{port}");
+    let server_process = if let Some(binary) = std::env::var_os("IMGX_GOLDEN_SERVER") {
+        // The installed binary binds its own port.
+        drop(listener);
+        let child = Command::new(binary)
+            .env("IMGX_SERVER_HOST", "127.0.0.1")
+            .env("IMGX_SERVER_PORT", port.to_string())
+            .env("IMGX_ORIGIN_BASE_URL", origin.uri())
+            .env("IMGX_TRANSFORM_FAILURE", "error")
+            .env("IMGX_TRANSFORM_STATIC_LADDER", static_ladder.to_string())
+            .env("RUST_LOG", "warn")
+            .spawn()
+            .expect("start imgx from the runtime image");
+        GoldenServer::Runtime(child)
+    } else {
+        let config = Config {
+            origin: imgx::config::OriginConfig {
+                base_url: origin.uri(),
+                ..Default::default()
+            },
+            transform: imgx::config::TransformConfig {
+                on_failure: TransformFailureMode::Error,
+                static_ladder,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        GoldenServer::Embedded(tokio::spawn(async move {
+            axum::serve(listener, build_router(Arc::new(AppState::new(config))))
+                .await
+                .unwrap();
+        }))
+    };
+    let health = format!("{server}/health");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if client
+                .get(&health)
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("imgx health endpoint");
+    (server, server_process)
 }
 
 // Byte goldens are tied to the native codec build used by CI.
