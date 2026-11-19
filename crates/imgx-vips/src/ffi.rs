@@ -109,6 +109,7 @@ unsafe extern "C" {
         name: *const c_char,
         out: *mut *const c_char,
     ) -> c_int;
+    pub fn vips_image_remove(image: *mut VipsImage, name: *const c_char) -> c_int;
     pub fn vips_image_get_typeof(image: *const VipsImage, name: *const c_char) -> size_t;
     pub fn vips_image_set_int(image: *mut VipsImage, name: *const c_char, i: c_int);
 

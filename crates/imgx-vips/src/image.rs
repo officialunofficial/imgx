@@ -270,6 +270,10 @@ impl VipsImage {
         op_result(0, output, VipsError::OperationFailed)
     }
 
+    pub(crate) fn remove_icc_profile(&mut self) {
+        unsafe { ffi::vips_image_remove(self.ptr.as_ptr(), c"icc-profile-data".as_ptr()) };
+    }
+
     pub(crate) fn has_icc_profile(&self) -> bool {
         unsafe { ffi::vips_image_get_typeof(self.ptr.as_ptr(), c"icc-profile-data".as_ptr()) != 0 }
     }

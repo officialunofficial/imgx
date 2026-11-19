@@ -411,6 +411,17 @@ fn resize(
         (image.width() as u64, image.height() as u64),
         limits.max_pixels,
     )?;
+    let image = if spec.metadata == MetadataPolicy::Srgb {
+        let mut srgb = image
+            .colourspace(consts::VIPS_INTERPRETATION_sRGB)
+            .map_err(backend_error)?;
+        // The saver writes the standard profile explicitly. Give it the
+        // normalized pixels without an inherited profile to validate.
+        srgb.remove_icc_profile();
+        srgb
+    } else {
+        image
+    };
     let image = image.materialize().map_err(if reduced_input.is_some() {
         decode_error
     } else {
