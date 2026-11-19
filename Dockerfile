@@ -1,12 +1,12 @@
-# CI and release share the signed Alpine packages and the native ABI.
+# CI and release use the same signed packages from the pinned Alpine branch.
+# See test/fixtures/golden/README.md for the codec versions and release checks.
 FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS codecs
 
 # vips-heif loads libheif's codec plugins at runtime. Keep the AOM
-# encoder for imgx's existing AVIF output.
+# encoder for AVIF output and libde265 for HEIC input.
 RUN apk add --no-cache \
-    vips=8.18.2-r0 vips-heif=8.18.2-r0 libheif-aom \
-    libjpeg-turbo=3.1.3-r0 libpng=1.6.59-r0 lcms2=2.19-r0 \
-    libwebp=1.6.0-r0 libwebpdemux=1.6.0-r0 libwebpmux=1.6.0-r0
+    vips vips-heif libheif-aom libheif-libde265 \
+    libjpeg-turbo libpng lcms2 libwebp libwebpdemux libwebpmux
 
 FROM rust:1.98.1-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS rust
 
@@ -17,7 +17,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:$PATH
 COPY --from=rust /usr/local/rustup /usr/local/rustup
 COPY --from=rust /usr/local/cargo /usr/local/cargo
-RUN apk add --no-cache vips-dev=8.18.2-r0 musl-dev pkgconfig cmake make g++
+RUN apk add --no-cache vips-dev musl-dev pkgconfig cmake make g++
 
 FROM build-deps AS ci
 

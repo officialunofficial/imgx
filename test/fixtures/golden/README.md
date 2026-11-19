@@ -27,5 +27,16 @@ The transparent SSIM floor is 0.90, about 0.022 below the measured score.
 The threshold for alpha is 0.5. The test also compares the HTTP bytes to
 a standalone render with the same encoded input and reduced decode policy.
 
-Set `IMGX_PINNED_GOLDENS=1` in the pinned CI image to also assert SHA-256
-goldens for the Q95 photo master and the lossless transparent master.
+Set `IMGX_PINNED_GOLDENS=1` to also assert SHA-256 goldens for the Q95 photo
+master and the lossless transparent master, and require the HEIC decoder.
+The recorded Alpine 3.24 bundle used libvips 8.18.2, libheif 1.23.7,
+libjpeg-turbo 3.1.3, libpng 1.6.59, Little CMS 2.19 and libwebp 1.6.0.
+Alpine updates packages within the branch. The released image digest pins
+the actual bundle, including transitive libraries.
+
+The release workflow runs these goldens against the pushed image by digest.
+The harness loads libvips from that image and runs both HTTP suites against
+its installed `imgx` binary. Run `test/goldens-runtime.sh TOOLCHAIN_IMAGE
+RUNTIME_IMAGE` with the matching Dockerfile `ci` image to repeat the check.
+The workflow adds the digest to the release notes after the goldens and
+`test/smoke-runtime.sh` pass.
