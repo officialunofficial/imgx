@@ -14,5 +14,5 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-worker = "0.8"
-worker-macros = "0.8"
+worker = "0.9"
+worker-macros = "0.9"
