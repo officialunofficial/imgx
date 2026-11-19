@@ -45,10 +45,14 @@ pub(crate) fn render(
     };
     let rendered = match render_ladder(input, &request, &limits) {
         Ok(rendered) => rendered,
-        Err(RenderError::UnsupportedInput | RenderError::AnimatedInput) => return None,
-        Err(RenderError::PixelLimit { actual, limit }) => {
-            return Some(Err(TransformError::ExceedsMaxPixels(actual, limit)));
-        }
+        // A request outside the ladder's bounds keeps the existing renderer's
+        // policy. It checks its own source pixel budget before reading pixels.
+        Err(
+            RenderError::UnsupportedInput
+            | RenderError::AnimatedInput
+            | RenderError::PixelLimit { .. }
+            | RenderError::OutputLimit,
+        ) => return None,
         Err(error) => return Some(Err(VipsError::OperationFailed(error.to_string()).into())),
     };
     let output = rendered
@@ -143,6 +147,38 @@ mod tests {
         );
         let params = parse("width=128,format=webp,sharpen=1").unwrap();
         assert!(render(input, &params, 1_000_000).is_none());
+    }
+
+    #[test]
+    fn width_only_tall_webp_keeps_the_legacy_height_cap() {
+        imgx_vips::init().unwrap();
+        let small = include_bytes!("../../../../test/fixtures/golden/small.png");
+        let webp = VipsImage::from_buffer(small)
+            .unwrap()
+            .embed(0, 0, 200, 9000, [100.0, 110.0, 130.0])
+            .unwrap()
+            .save_webp(80, true)
+            .unwrap();
+        let params = parse("width=200,format=webp").unwrap();
+        let legacy = super::super::pipeline::transform(&webp, &params, None, None).unwrap();
+        let shared = render(&webp, &params, 2_000_000)
+            .expect("shared recipe")
+            .unwrap();
+        assert!(shared.width < 200 && shared.height <= MAX_EDGE);
+        assert_eq!((shared.width, shared.height), (legacy.width, legacy.height));
+        assert!(shared.data == legacy.data);
+    }
+
+    #[test]
+    fn a_cover_beyond_the_ladder_budget_defers_to_the_existing_renderer() {
+        imgx_vips::init().unwrap();
+        let small = include_bytes!("../../../../test/fixtures/golden/small.png");
+        let webp = VipsImage::from_buffer(small)
+            .unwrap()
+            .save_webp(80, true)
+            .unwrap();
+        let params = parse("width=24,height=12,fit=cover,format=jpeg").unwrap();
+        assert!(render(&webp, &params, 200).is_none());
     }
 
     #[test]
