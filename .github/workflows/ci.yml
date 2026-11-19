@@ -25,10 +25,7 @@ jobs:
       packages: write
     uses: ./.github/workflows/ci-image.yml
 
-  # The Rust version is pinned to the same value in rust-version
-  # (Cargo.toml), msrv (clippy.toml), channel (rust-toolchain.toml) and every
-  # job below, so clippy on this toolchain also checks the MSRV. There is no
-  # separate msrv job.
+  # The CI image installs the pinned MSRV toolchain used for release builds.
   lint:
     needs: ci-image
     runs-on: ubuntu-latest
@@ -43,11 +40,6 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.98.1
-        with:
-          components: rustfmt, clippy
 
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: Swatinem/rust-cache@v2
@@ -73,9 +65,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.98.1
-
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: Swatinem/rust-cache@v2
 
@@ -96,11 +85,6 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.98.1
-        with:
-          components: llvm-tools-preview
 
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: mozilla-actions/sccache-action@v0.0.11
@@ -143,9 +127,6 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.98.1
 
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: Swatinem/rust-cache@v2
