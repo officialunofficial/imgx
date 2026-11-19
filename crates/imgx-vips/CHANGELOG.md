@@ -3,6 +3,14 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.1.12] - 2026-11-19
+
+### Features
+
+- *(vips)* Add a bounded single-frame rendition ladder ([#82](https://github.com/officialunofficial/imgx/pull/82))(626d141)
+- *(transform)* Opt in to shared static rendition rendering ([#84](https://github.com/officialunofficial/imgx/pull/84))(d154c9c)
+
+
 ## [0.1.11] - 2026-10-29
 
 ### Performance
