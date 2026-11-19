@@ -40,6 +40,18 @@ pub fn init() -> Result<(), VipsError> {
     }
 }
 
+/// Version of the linked libvips as (major, minor, patch). Can be called before `init`.
+pub fn vips_version() -> (u32, u32, u32) {
+    // Flags 0, 1 and 2 query the major, minor and micro version.
+    unsafe {
+        (
+            ffi::vips_version(0) as u32,
+            ffi::vips_version(1) as u32,
+            ffi::vips_version(2) as u32,
+        )
+    }
+}
+
 /// The AVIF encoder effort that libvips uses by default.
 pub const DEFAULT_AVIF_EFFORT: u8 = 4;
 
@@ -216,7 +228,7 @@ impl VipsImage {
         let c_opts = CString::new(option_string).map_err(|_| {
             VipsError::LoadFailed("option string contained an interior NUL".to_string())
         })?;
-        let source = OwnedSource::copy_of(data).map_err(VipsError::LoadFailed)?;
+        let source = OwnedSource::copy_of(data, VipsError::LoadFailed)?;
         Self::from_source(&source, &c_opts)
     }
 
@@ -225,7 +237,7 @@ impl VipsImage {
         strict: bool,
         accepts: impl FnOnce(&[u8]) -> bool,
     ) -> Result<Option<Self>, VipsError> {
-        let source = OwnedSource::copy_of(data).map_err(VipsError::LoadFailed)?;
+        let source = OwnedSource::copy_of(data, VipsError::LoadFailed)?;
         // The loader name is a static class string owned by libvips.
         let loader = unsafe { ffi::vips_foreign_find_load_source(source.ptr.as_ptr()) };
         if loader.is_null() || !accepts(unsafe { CStr::from_ptr(loader) }.to_bytes()) {
@@ -581,7 +593,7 @@ impl VipsImage {
         width: i32,
         opts: ThumbnailOptions,
     ) -> Result<Self, VipsError> {
-        let source = OwnedSource::copy_of(data).map_err(VipsError::ResizeFailed)?;
+        let source = OwnedSource::copy_of(data, VipsError::ResizeFailed)?;
         let mut output: *mut ffi::VipsImage = ptr::null_mut();
         macro_rules! call {
             ($($arg:expr),*) => {
@@ -889,18 +901,22 @@ struct OwnedSource {
 }
 
 impl OwnedSource {
-    fn copy_of(data: &[u8]) -> Result<Self, String> {
-        // `vips_blob_copy` fails for zero bytes and sets no error message.
+    fn copy_of(data: &[u8], on_fail: fn(String) -> VipsError) -> Result<Self, VipsError> {
         if data.is_empty() {
-            return Err("empty source".to_string());
+            return Err(on_fail("empty source".into()));
         }
-        // The copy is needed: a lazy image reads the bytes after the caller drops `data`.
-        let blob =
-            unsafe { ffi::vips_blob_copy(data.as_ptr() as *const c_void, data.len() as size_t) };
-        if blob.is_null() {
-            return Err(last_vips_error());
+        // A lazy image can read the encoded bytes after the caller drops them.
+        let owned = unsafe { ffi::g_try_malloc(data.len()) };
+        if owned.is_null() {
+            return Err(VipsError::Resource(
+                "could not allocate the input buffer".into(),
+            ));
         }
-        unsafe { Self::from_blob(blob) }
+        let blob = unsafe {
+            ptr::copy_nonoverlapping(data.as_ptr(), owned.cast::<u8>(), data.len());
+            ffi::vips_blob_new(Some(free_blob_data), owned, data.len())
+        };
+        unsafe { Self::from_blob(blob) }.map_err(on_fail)
     }
 
     /// Build a source over `blob` and release the caller's reference to it.
@@ -917,6 +933,11 @@ impl OwnedSource {
             .map(|ptr| OwnedSource { ptr })
             .ok_or_else(last_vips_error)
     }
+}
+
+unsafe extern "C" fn free_blob_data(data: *mut c_void, _area: *mut c_void) -> c_int {
+    unsafe { ffi::g_free(data) };
+    0
 }
 
 impl Drop for OwnedSource {
@@ -948,9 +969,14 @@ fn save_result(rc: i32, buf: *mut c_void, len: size_t) -> Result<Vec<u8>, VipsEr
     if buf.is_null() {
         return Err(VipsError::SaveFailed(last_vips_error()));
     }
-    let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, len) };
-    let owned = slice.to_vec();
+    let mut owned = Vec::new();
+    let allocation = owned.try_reserve_exact(len);
+    if allocation.is_ok() {
+        let slice = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len) };
+        owned.extend_from_slice(slice);
+    }
     unsafe { ffi::g_free(buf) };
+    allocation.map_err(|error| VipsError::Resource(error.to_string()))?;
     Ok(owned)
 }
 

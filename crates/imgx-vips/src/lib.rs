@@ -12,7 +12,7 @@ pub mod thumbhash;
 pub use error::VipsError;
 pub use image::{
     DEFAULT_AVIF_EFFORT, DEFAULT_WEBP_EFFORT, MAX_AVIF_EFFORT, MAX_WEBP_EFFORT, ThumbnailOptions,
-    VipsImage, arrayjoin_vertical, init, shutdown,
+    VipsImage, arrayjoin_vertical, init, shutdown, vips_version,
 };
 pub use ladder::{Ladder, LadderRequest, RenderError, RenderLimits, render_ladder};
 

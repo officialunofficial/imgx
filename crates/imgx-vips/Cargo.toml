@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Hand-rolled libvips FFI bindings and RAII wrapper used internally by imgx"
+description = "Bounded image rendition rendering and safe wrappers for libvips"
 keywords = ["libvips", "vips", "ffi", "image"]
 categories = ["multimedia::images", "external-ffi-bindings"]
 

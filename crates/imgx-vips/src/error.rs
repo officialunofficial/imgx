@@ -6,10 +6,13 @@ use crate::ffi;
 
 /// Errors surfaced from libvips FFI calls.
 ///
-/// Mirrors `src/vips/bindings.zig`'s `VipsError` set. Every variant carries
+/// Mirrors `src/vips/bindings.zig`'s `VipsError` set. Native operation failures carry
 /// the last message from `vips_error_buffer()` at the point of failure.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum VipsError {
+    #[error("resource unavailable: {0}")]
+    Resource(String),
     #[error("vips init failed: {0}")]
     InitFailed(String),
     #[error("vips load failed: {0}")]
