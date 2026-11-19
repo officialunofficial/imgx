@@ -30,7 +30,7 @@ use crate::origin::{
 use crate::router::{self, ImageRequest, Route};
 use crate::s3::S3Client;
 use crate::transform::params::OnErrorMode;
-use crate::transform::{negotiate, params, pipeline};
+use crate::transform::{negotiate, params, pipeline, static_ladder};
 
 /// The cache backend selected at startup based on config. A closed set
 /// (Noop/Memory/Tiered), so this is an enum rather than `dyn Cache` --
@@ -470,9 +470,19 @@ async fn handle_image_request(
     let transform_input = Arc::clone(&source);
     let accept_owned = accept_header.map(|s| s.to_string());
     let tp_for_task = tp.clone();
+    let use_static_ladder = state.config.transform.static_ladder;
 
     let transform_task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        if use_static_ladder
+            && let Some(result) = static_ladder::render(
+                &transform_input,
+                &tp_for_task,
+                transform_settings.limits.max_pixels,
+            )
+        {
+            return result;
+        }
         let result = pipeline::transform(
             &transform_input,
             &tp_for_task,

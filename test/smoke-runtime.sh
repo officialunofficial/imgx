@@ -20,9 +20,11 @@ cleanup() {
     rm -rf "$work"
 }
 trap cleanup EXIT
+mkdir "$work/origin"
+cp "$fixtures/small.png" "$work/origin/"
 "$runtime" network create "$prefix" >/dev/null
 "$runtime" run -d --name "$prefix-origin" --network "$prefix" \
-    -v "$fixtures:/fixtures:ro" -w /fixtures \
+    -v "$work/origin:/fixtures:ro" -w /fixtures \
     "${IMGX_SMOKE_ORIGIN_IMAGE:-python:3-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd}" \
     python3 -m http.server 9000 >/dev/null
 "$runtime" exec "$prefix-origin" python3 -c '
@@ -42,6 +44,7 @@ while True:
 '
 "$runtime" run -d --name "$prefix-renderer" --network "$prefix" -p "127.0.0.1:$port:8080" \
     -e IMGX_ORIGIN_BASE_URL="http://$prefix-origin:9000" \
+    -e IMGX_TRANSFORM_STATIC_LADDER="${IMGX_TRANSFORM_STATIC_LADDER:-false}" \
     -e IMGX_TRANSFORM_FAILURE=error "$image" >/dev/null
 
 address=127.0.0.1:$port
@@ -59,4 +62,11 @@ for format in jpeg png webp gif avif json thumbhash; do
         "http://$address/image/width=12,format=$format/small.png")
     test "$actual" = "$media"
     test -s "$work/$format"
+done
+
+# Render a WebP source through the width-only and card recipes.
+cp "$work/webp" "$work/origin/master.webp"
+for options in 'width=8,format=webp' 'width=24,height=12,fit=cover,format=jpeg'; do
+    curl --noproxy 127.0.0.1 --fail --silent --show-error "http://$address/image/$options/master.webp" > "$work/card"
+    test -s "$work/card"
 done

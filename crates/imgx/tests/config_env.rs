@@ -32,6 +32,7 @@ fn clear_all() {
         "TRANSFORM_MAX_ANIMATED_PIXELS",
         "TRANSFORM_AVIF_EFFORT",
         "TRANSFORM_FAILURE",
+        "TRANSFORM_STATIC_LADDER",
         "CACHE_ENABLED",
         "CACHE_MAX_SIZE_BYTES",
         "CACHE_DEFAULT_TTL_SECONDS",
@@ -66,6 +67,7 @@ fn load_from_env_with_no_env_vars_returns_defaults() {
     assert_eq!(cfg.transform.avif_effort, imgx_vips::DEFAULT_AVIF_EFFORT);
     assert_eq!(cfg.transform.on_failure, TransformFailureMode::Passthrough);
     assert!(cfg.transform.strip_metadata);
+    assert!(!cfg.transform.static_ladder);
     assert!(cfg.cache.enabled);
     assert_eq!(cfg.cache.default_ttl_seconds, 3600);
     assert!(!cfg.origin.allow_remote_sources);
@@ -203,6 +205,20 @@ fn transform_failure_env_var_rejects_an_unknown_value() {
         std::env::set_var("IMGX_TRANSFORM_FAILURE", "retry");
     }
     assert_eq!(Config::load_from_env(), Err(ConfigError::InvalidValue));
+
+    clear_all();
+}
+
+#[test]
+fn static_ladder_env_var_opts_in_to_shared_rendering() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_all();
+
+    unsafe {
+        std::env::set_var("IMGX_TRANSFORM_STATIC_LADDER", "true");
+    }
+    let cfg = Config::load_from_env().expect("load succeeds");
+    assert!(cfg.transform.static_ladder);
 
     clear_all();
 }

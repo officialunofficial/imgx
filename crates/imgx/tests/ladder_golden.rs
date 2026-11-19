@@ -117,6 +117,15 @@ fn decode(bytes: &[u8]) -> VipsImage {
 
 #[tokio::test]
 async fn native_ladder_matches_legacy_http_render_perceptually() {
+    check_http_goldens(false).await;
+}
+
+#[tokio::test]
+async fn native_ladder_matches_opt_in_http_render_perceptually() {
+    check_http_goldens(true).await;
+}
+
+async fn check_http_goldens(static_ladder: bool) {
     let origin = MockServer::start().await;
     let config = Config {
         origin: imgx::config::OriginConfig {
@@ -125,6 +134,7 @@ async fn native_ladder_matches_legacy_http_render_perceptually() {
         },
         transform: imgx::config::TransformConfig {
             on_failure: TransformFailureMode::Error,
+            static_ladder,
             ..Default::default()
         },
         ..Default::default()
@@ -181,11 +191,8 @@ async fn native_ladder_matches_legacy_http_render_perceptually() {
             } else {
                 format!("width={},fit=scale-down,format=webp,quality=80", WIDTHS[i])
             };
-            let response = client
-                .get(format!("{server}/image/{options}/{}.webp", case.name))
-                .send()
-                .await
-                .unwrap();
+            let url = format!("{server}/image/{options}/{}.webp", case.name);
+            let response = client.get(&url).send().await.unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{} {options}", case.name);
             let media = if spec.codec == Codec::Jpeg {
                 "image/jpeg"
@@ -193,7 +200,18 @@ async fn native_ladder_matches_legacy_http_render_perceptually() {
                 "image/webp"
             };
             assert_eq!(response.headers()[header::CONTENT_TYPE], media);
+            let etag = response.headers()[header::ETAG].clone();
             let fallback = response.bytes().await.unwrap();
+            if i == 0 {
+                let cached = client
+                    .get(&url)
+                    .header(header::IF_NONE_MATCH, etag)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+                assert!(cached.bytes().await.unwrap().is_empty());
+            }
 
             let same_bytes = render_ladder(
                 &master.bytes,

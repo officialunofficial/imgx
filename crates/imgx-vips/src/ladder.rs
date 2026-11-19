@@ -18,6 +18,8 @@ pub enum RenderError {
     InvalidRequest(&'static str),
     #[error("unsupported image format or unavailable decoder")]
     UnsupportedInput,
+    #[error("requested a still image, but the source is animated")]
+    AnimatedInput,
     #[error("corrupt image: {0}")]
     CorruptInput(VipsError),
     #[error("input is {actual} bytes, limit is {limit}")]
@@ -53,6 +55,8 @@ pub enum DecodePolicy {
     /// Allow libvips' partial-image recovery and shrink on load when rendering
     /// just one JPEG or WebP derivative without a baseline or ThumbHash.
     LenientReduced,
+    /// Like `LenientReduced`, with a header check that refuses animated sources.
+    LenientReducedStill,
 }
 
 /// Recipe for one output.
@@ -71,7 +75,7 @@ pub struct OutputSpec {
 pub enum Geometry {
     /// Downscale to a square bounding box, preserving aspect ratio.
     MaxEdge(u32),
-    /// Downscale to a maximum width, preserving aspect ratio.
+    /// Downscale to a maximum width and the configured edge limit, preserving aspect ratio.
     ScaleDownWidth(u32),
     /// Scale to cover the box and crop, upscaling smaller sources as needed.
     Cover {
@@ -226,10 +230,18 @@ pub fn render_ladder(
         limits.max_pixels,
     )?;
 
+    if request.decode == DecodePolicy::LenientReducedStill
+        && first_frame.n_pages().is_some_and(|pages| pages > 1)
+    {
+        return Err(RenderError::AnimatedInput);
+    }
     let fused = request.baseline.is_none()
         && request.outputs.len() == 1
         && !request.thumbhash
-        && request.decode == DecodePolicy::LenientReduced
+        && matches!(
+            request.decode,
+            DecodePolicy::LenientReduced | DecodePolicy::LenientReducedStill
+        )
         && first_frame.shrinks_on_load()
         && request.outputs[0].metadata != MetadataPolicy::Srgb
         && !matches!(
@@ -371,8 +383,7 @@ fn resize(
 ) -> Result<(VipsImage, Duration), RenderError> {
     let started = Instant::now();
     let size = oriented_size(source);
-    let (width, opts) =
-        thumbnail_options(size, canonical_spec(spec, size).geometry, limits.max_pixels)?;
+    let (width, opts) = thumbnail_options(size, canonical_spec(spec, size).geometry, limits)?;
     let image = if let Some(input) = reduced_input {
         let resized = VipsImage::thumbnail_buffer(input, width, opts).map_err(decode_error)?;
         if opts.crop.is_none() {
@@ -433,7 +444,7 @@ fn resize(
 fn thumbnail_options(
     (source_width, source_height): (u32, u32),
     geometry: Geometry,
-    max_pixels: u64,
+    limits: &RenderLimits,
 ) -> Result<(i32, ThumbnailOptions), RenderError> {
     let (width, height, crop, size) = match geometry {
         Geometry::MaxEdge(edge) => (edge, edge, None, Some(consts::VIPS_SIZE_DOWN)),
@@ -441,7 +452,12 @@ fn thumbnail_options(
             // Derive the height as the HTTP pipeline does for width-only requests.
             let height = (f64::from(width) * (f64::from(source_height) / f64::from(source_width)))
                 .round() as u32;
-            (width, height.max(1), None, Some(consts::VIPS_SIZE_DOWN))
+            (
+                width,
+                height.clamp(1, limits.max_edge),
+                None,
+                Some(consts::VIPS_SIZE_DOWN),
+            )
         }
         Geometry::Cover {
             width,
@@ -454,7 +470,7 @@ fn thumbnail_options(
                 (f64::from(source_width) * scale).round() as u64,
                 (f64::from(source_height) * scale).round() as u64,
             );
-            check_pixels(pre_crop, max_pixels)?;
+            check_pixels(pre_crop, limits.max_pixels)?;
             if pre_crop.0.max(pre_crop.1) > i32::MAX as u64 {
                 return Err(RenderError::OutputLimit);
             }

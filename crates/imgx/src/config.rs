@@ -153,6 +153,7 @@ pub struct TransformConfig {
     /// faster encodes and larger AVIF files.
     pub avif_effort: u8,
     pub on_failure: TransformFailureMode,
+    pub static_ladder: bool,
 }
 
 impl Default for TransformConfig {
@@ -167,6 +168,7 @@ impl Default for TransformConfig {
             max_animated_pixels: 50_000_000,
             avif_effort: imgx_vips::DEFAULT_AVIF_EFFORT,
             on_failure: TransformFailureMode::default(),
+            static_ladder: false,
         }
     }
 }
@@ -269,6 +271,9 @@ impl Config {
         }
         if let Some(v) = env_var("TRANSFORM_AVIF_EFFORT") {
             cfg.transform.avif_effort = parse_num(&v)?;
+        }
+        if let Some(v) = env_var("TRANSFORM_STATIC_LADDER") {
+            cfg.transform.static_ladder = parse_bool(&v)?;
         }
         if let Some(v) = env_var("TRANSFORM_FAILURE") {
             cfg.transform.on_failure =
