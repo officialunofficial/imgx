@@ -125,3 +125,4 @@ jobs:
         run: |
           docker build --tag imgx-smoke .
           test/smoke-runtime.sh imgx-smoke
+          IMGX_TRANSFORM_STATIC_LADDER=true test/smoke-runtime.sh imgx-smoke

@@ -18,6 +18,8 @@ pub enum RenderError {
     InvalidRequest(&'static str),
     #[error("unsupported image format or unavailable decoder")]
     UnsupportedInput,
+    #[error("requested a still image, but the source is animated")]
+    AnimatedInput,
     #[error("corrupt image: {0}")]
     CorruptInput(VipsError),
     #[error("input is {actual} bytes, limit is {limit}")]
@@ -53,6 +55,8 @@ pub enum DecodePolicy {
     /// Allow libvips' partial-image recovery and shrink on load when rendering
     /// just one JPEG or WebP derivative without a baseline or ThumbHash.
     LenientReduced,
+    /// Like `LenientReduced`, with a header check that refuses animated sources.
+    LenientReducedStill,
 }
 
 /// Recipe for one output.
@@ -226,10 +230,18 @@ pub fn render_ladder(
         limits.max_pixels,
     )?;
 
+    if request.decode == DecodePolicy::LenientReducedStill
+        && first_frame.n_pages().is_some_and(|pages| pages > 1)
+    {
+        return Err(RenderError::AnimatedInput);
+    }
     let fused = request.baseline.is_none()
         && request.outputs.len() == 1
         && !request.thumbhash
-        && request.decode == DecodePolicy::LenientReduced
+        && matches!(
+            request.decode,
+            DecodePolicy::LenientReduced | DecodePolicy::LenientReducedStill
+        )
         && first_frame.shrinks_on_load()
         && request.outputs[0].metadata != MetadataPolicy::Srgb
         && !matches!(
