@@ -11,6 +11,7 @@ categories = ["multimedia::images", "external-ffi-bindings"]
 
 [dependencies]
 libc = "0.2"
+libm = "0.2"
 thiserror = "2"
 
 [build-dependencies]

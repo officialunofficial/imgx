@@ -6,11 +6,15 @@ mod error;
 mod ffi;
 mod image;
 
+pub mod ladder;
+pub mod thumbhash;
+
 pub use error::VipsError;
 pub use image::{
     DEFAULT_AVIF_EFFORT, DEFAULT_WEBP_EFFORT, MAX_AVIF_EFFORT, MAX_WEBP_EFFORT, ThumbnailOptions,
     VipsImage, arrayjoin_vertical, init, shutdown,
 };
+pub use ladder::{Ladder, LadderRequest, RenderError, RenderLimits, render_ladder};
 
 /// libvips C enum constants needed to call the FFI-wrapped operations
 /// (angle, direction, size, interesting/crop mode, colorspace, extend).

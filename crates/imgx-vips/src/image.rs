@@ -1,4 +1,4 @@
-use std::ffi::{CString, c_void};
+use std::ffi::{CStr, CString, c_void};
 use std::ptr;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -167,6 +167,17 @@ macro_rules! thumbnail_with_options {
     };
 }
 
+// Passing "profile" with a null value still makes libvips retain ICC
+// metadata. Omit the argument unless the caller supplied a profile.
+macro_rules! with_save_profile {
+    ($profile:expr, $call:ident) => {
+        match $profile {
+            Some(profile) => $call!(c"profile".as_ptr(), profile.as_ptr()),
+            None => $call!(),
+        }
+    };
+}
+
 impl VipsImage {
     /// Load an image from an in-memory buffer, first frame/page only
     /// (the "probe" load — cheap, used to detect animation metadata). The
@@ -206,12 +217,32 @@ impl VipsImage {
             VipsError::LoadFailed("option string contained an interior NUL".to_string())
         })?;
         let source = OwnedSource::copy_of(data).map_err(VipsError::LoadFailed)?;
+        Self::from_source(&source, &c_opts)
+    }
+
+    pub(crate) fn from_allowed_buffer(
+        data: &[u8],
+        strict: bool,
+        accepts: impl FnOnce(&[u8]) -> bool,
+    ) -> Result<Option<Self>, VipsError> {
+        let source = OwnedSource::copy_of(data).map_err(VipsError::LoadFailed)?;
+        // The loader name is a static class string owned by libvips.
+        let loader = unsafe { ffi::vips_foreign_find_load_source(source.ptr.as_ptr()) };
+        if loader.is_null() || !accepts(unsafe { CStr::from_ptr(loader) }.to_bytes()) {
+            unsafe { ffi::vips_error_clear() };
+            return Ok(None);
+        }
+        let options = if strict { c"fail_on=error" } else { c"" };
+        Self::from_source(&source, options).map(Some)
+    }
+
+    fn from_source(source: &OwnedSource, options: &CStr) -> Result<Self, VipsError> {
         // The loader takes its own reference to the source, so `source`
         // may drop before the image does.
         let raw = unsafe {
             ffi::vips_image_new_from_source(
                 source.ptr.as_ptr(),
-                c_opts.as_ptr(),
+                options.as_ptr(),
                 ptr::null::<c_char>(),
             )
         };
@@ -231,6 +262,20 @@ impl VipsImage {
     #[allow(dead_code)]
     pub(crate) unsafe fn from_raw(raw: *mut ffi::VipsImage) -> Option<Self> {
         ptr::NonNull::new(raw).map(|ptr| VipsImage { ptr })
+    }
+
+    /// Evaluate all pixels into a memory-backed image, keeping its metadata.
+    pub(crate) fn materialize(&self) -> Result<Self, VipsError> {
+        let output = unsafe { ffi::vips_image_copy_memory(self.ptr.as_ptr()) };
+        op_result(0, output, VipsError::OperationFailed)
+    }
+
+    pub(crate) fn remove_icc_profile(&mut self) {
+        unsafe { ffi::vips_image_remove(self.ptr.as_ptr(), c"icc-profile-data".as_ptr()) };
+    }
+
+    pub(crate) fn has_icc_profile(&self) -> bool {
+        unsafe { ffi::vips_image_get_typeof(self.ptr.as_ptr(), c"icc-profile-data".as_ptr()) != 0 }
     }
 
     /// Width in pixels. A negative libvips value reads as 0.
@@ -313,39 +358,65 @@ impl VipsImage {
 
     /// Encode to JPEG. `quality` is 1-100.
     pub fn save_jpeg(&self, quality: i32, strip: bool) -> Result<Vec<u8>, VipsError> {
+        self.save_jpeg_with_profile(quality, strip, None)
+    }
+
+    pub(crate) fn save_jpeg_with_profile(
+        &self,
+        quality: i32,
+        strip: bool,
+        profile: Option<&CStr>,
+    ) -> Result<Vec<u8>, VipsError> {
         let mut buf: *mut c_void = ptr::null_mut();
         let mut len: size_t = 0;
-        let rc = unsafe {
-            ffi::vips_jpegsave_buffer(
-                self.ptr.as_ptr(),
-                &mut buf,
-                &mut len,
-                c"Q".as_ptr(),
-                quality,
-                c"strip".as_ptr(),
-                bool_to_int(strip),
-                ptr::null::<c_char>(),
-            )
-        };
+        macro_rules! save {
+            ($($arg:expr),*) => {
+                    ffi::vips_jpegsave_buffer(
+                        self.ptr.as_ptr(),
+                        &mut buf,
+                        &mut len,
+                        c"Q".as_ptr(),
+                        quality,
+                        c"strip".as_ptr(),
+                        bool_to_int(strip),
+                        $($arg,)*
+                        ptr::null::<c_char>(),
+                    )
+            };
+        }
+        let rc = unsafe { with_save_profile!(profile, save) };
         save_result(rc, buf, len)
     }
 
     /// Encode to PNG. `compression` is 0-9 (zimgx always uses 6, fixed).
     pub fn save_png(&self, compression: i32, strip: bool) -> Result<Vec<u8>, VipsError> {
+        self.save_png_with_profile(compression, strip, None)
+    }
+
+    pub(crate) fn save_png_with_profile(
+        &self,
+        compression: i32,
+        strip: bool,
+        profile: Option<&CStr>,
+    ) -> Result<Vec<u8>, VipsError> {
         let mut buf: *mut c_void = ptr::null_mut();
         let mut len: size_t = 0;
-        let rc = unsafe {
-            ffi::vips_pngsave_buffer(
-                self.ptr.as_ptr(),
-                &mut buf,
-                &mut len,
-                c"compression".as_ptr(),
-                compression,
-                c"strip".as_ptr(),
-                bool_to_int(strip),
-                ptr::null::<c_char>(),
-            )
-        };
+        macro_rules! save {
+            ($($arg:expr),*) => {
+                    ffi::vips_pngsave_buffer(
+                        self.ptr.as_ptr(),
+                        &mut buf,
+                        &mut len,
+                        c"compression".as_ptr(),
+                        compression,
+                        c"strip".as_ptr(),
+                        bool_to_int(strip),
+                        $($arg,)*
+                        ptr::null::<c_char>(),
+                    )
+            };
+        }
+        let rc = unsafe { with_save_profile!(profile, save) };
         save_result(rc, buf, len)
     }
 
@@ -363,22 +434,42 @@ impl VipsImage {
         effort: u8,
         strip: bool,
     ) -> Result<Vec<u8>, VipsError> {
+        self.save_webp_configured(quality, effort, strip, None, false, false)
+    }
+
+    pub(crate) fn save_webp_configured(
+        &self,
+        quality: i32,
+        effort: u8,
+        strip: bool,
+        profile: Option<&CStr>,
+        lossless: bool,
+        smart_subsample: bool,
+    ) -> Result<Vec<u8>, VipsError> {
         let mut buf: *mut c_void = ptr::null_mut();
         let mut len: size_t = 0;
-        let rc = unsafe {
-            ffi::vips_webpsave_buffer(
-                self.ptr.as_ptr(),
-                &mut buf,
-                &mut len,
-                c"Q".as_ptr(),
-                quality,
-                c"effort".as_ptr(),
-                effort as c_int,
-                c"strip".as_ptr(),
-                bool_to_int(strip),
-                ptr::null::<c_char>(),
-            )
-        };
+        macro_rules! save {
+            ($($arg:expr),*) => {
+                    ffi::vips_webpsave_buffer(
+                        self.ptr.as_ptr(),
+                        &mut buf,
+                        &mut len,
+                        c"Q".as_ptr(),
+                        quality,
+                        c"effort".as_ptr(),
+                        effort as c_int,
+                        c"strip".as_ptr(),
+                        bool_to_int(strip),
+                        c"lossless".as_ptr(),
+                        bool_to_int(lossless),
+                        c"smart_subsample".as_ptr(),
+                        bool_to_int(smart_subsample),
+                        $($arg,)*
+                        ptr::null::<c_char>(),
+                    )
+            };
+        }
+        let rc = unsafe { with_save_profile!(profile, save) };
         save_result(rc, buf, len)
     }
 
@@ -441,6 +532,15 @@ impl VipsImage {
     /// options) via `vips_thumbnail_image`. The image is already decoded at
     /// full size. Use `thumbnail_buffer` to decode at reduced size.
     pub fn thumbnail(&self, width: i32, opts: ThumbnailOptions) -> Result<Self, VipsError> {
+        self.thumbnail_with_profile(width, opts, None)
+    }
+
+    pub(crate) fn thumbnail_with_profile(
+        &self,
+        width: i32,
+        opts: ThumbnailOptions,
+        profile: Option<&CStr>,
+    ) -> Result<Self, VipsError> {
         let mut output: *mut ffi::VipsImage = ptr::null_mut();
         macro_rules! call {
             ($($arg:expr),*) => {
@@ -449,6 +549,8 @@ impl VipsImage {
                     &mut output,
                     width,
                     $($arg,)*
+                    c"output_profile".as_ptr(),
+                    profile.map_or(ptr::null(), CStr::as_ptr),
                     ptr::null::<c_char>(),
                 )
             };
@@ -841,6 +943,9 @@ fn op_result(
 /// the original via `g_free`, or report the save error.
 fn save_result(rc: i32, buf: *mut c_void, len: size_t) -> Result<Vec<u8>, VipsError> {
     if rc != 0 {
+        return Err(VipsError::SaveFailed(last_vips_error()));
+    }
+    if buf.is_null() {
         return Err(VipsError::SaveFailed(last_vips_error()));
     }
     let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, len) };

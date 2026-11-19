@@ -74,6 +74,7 @@ unsafe extern "C" {
         data: *const c_void,
         length: size_t,
     ) -> *mut VipsBlob;
+    pub fn vips_foreign_find_load_source(source: *mut VipsSource) -> *const c_char;
     pub fn vips_source_new_from_blob(blob: *mut VipsBlob) -> *mut VipsSource;
     // The option list ends with NULL (G_GNUC_NULL_TERMINATED), for example
     // `vips_image_new_from_source(src, "n=-1", NULL)`.
@@ -82,6 +83,8 @@ unsafe extern "C" {
         option_string: *const c_char,
         ...
     ) -> *mut VipsImage;
+
+    pub fn vips_image_copy_memory(image: *mut VipsImage) -> *mut VipsImage;
 
     // -- raster export --
     // Signature checked against libvips 8.18.4 `vips/image.h`. Not varargs.
@@ -106,6 +109,8 @@ unsafe extern "C" {
         name: *const c_char,
         out: *mut *const c_char,
     ) -> c_int;
+    pub fn vips_image_remove(image: *mut VipsImage, name: *const c_char) -> c_int;
+    pub fn vips_image_get_typeof(image: *const VipsImage, name: *const c_char) -> size_t;
     pub fn vips_image_set_int(image: *mut VipsImage, name: *const c_char, i: c_int);
 
     // -- resample --
