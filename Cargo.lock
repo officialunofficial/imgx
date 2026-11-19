@@ -875,7 +875,6 @@ dependencies = [
  "axum",
  "imgx-vips",
  "jiff",
- "libm",
  "lru",
  "metrics",
  "metrics-exporter-prometheus",
@@ -908,6 +907,7 @@ name = "imgx-vips"
 version = "0.1.11"
 dependencies = [
  "libc",
+ "libm",
  "pkg-config",
  "thiserror",
 ]
