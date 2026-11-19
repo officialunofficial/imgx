@@ -67,6 +67,6 @@ done
 # Render a WebP source through the width-only and card recipes.
 cp "$work/webp" "$work/origin/master.webp"
 for options in 'width=8,format=webp' 'width=24,height=12,fit=cover,format=jpeg'; do
-    curl --fail --silent --show-error "http://$address/image/$options/master.webp" > "$work/card"
+    curl --noproxy 127.0.0.1 --fail --silent --show-error "http://$address/image/$options/master.webp" > "$work/card"
     test -s "$work/card"
 done
