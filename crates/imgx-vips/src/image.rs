@@ -167,6 +167,17 @@ macro_rules! thumbnail_with_options {
     };
 }
 
+// Passing "profile" with a null value still makes libvips retain ICC
+// metadata. Omit the argument unless the caller supplied a profile.
+macro_rules! with_save_profile {
+    ($profile:expr, $call:ident) => {
+        match $profile {
+            Some(profile) => $call!(c"profile".as_ptr(), profile.as_ptr()),
+            None => $call!(),
+        }
+    };
+}
+
 impl VipsImage {
     /// Load an image from an in-memory buffer, first frame/page only
     /// (the "probe" load — cheap, used to detect animation metadata). The
@@ -354,20 +365,22 @@ impl VipsImage {
     ) -> Result<Vec<u8>, VipsError> {
         let mut buf: *mut c_void = ptr::null_mut();
         let mut len: size_t = 0;
-        let rc = unsafe {
-            ffi::vips_jpegsave_buffer(
-                self.ptr.as_ptr(),
-                &mut buf,
-                &mut len,
-                c"Q".as_ptr(),
-                quality,
-                c"strip".as_ptr(),
-                bool_to_int(strip),
-                c"profile".as_ptr(),
-                profile.map_or(ptr::null(), CStr::as_ptr),
-                ptr::null::<c_char>(),
-            )
-        };
+        macro_rules! save {
+            ($($arg:expr),*) => {
+                    ffi::vips_jpegsave_buffer(
+                        self.ptr.as_ptr(),
+                        &mut buf,
+                        &mut len,
+                        c"Q".as_ptr(),
+                        quality,
+                        c"strip".as_ptr(),
+                        bool_to_int(strip),
+                        $($arg,)*
+                        ptr::null::<c_char>(),
+                    )
+            };
+        }
+        let rc = unsafe { with_save_profile!(profile, save) };
         save_result(rc, buf, len)
     }
 
@@ -384,20 +397,22 @@ impl VipsImage {
     ) -> Result<Vec<u8>, VipsError> {
         let mut buf: *mut c_void = ptr::null_mut();
         let mut len: size_t = 0;
-        let rc = unsafe {
-            ffi::vips_pngsave_buffer(
-                self.ptr.as_ptr(),
-                &mut buf,
-                &mut len,
-                c"compression".as_ptr(),
-                compression,
-                c"strip".as_ptr(),
-                bool_to_int(strip),
-                c"profile".as_ptr(),
-                profile.map_or(ptr::null(), CStr::as_ptr),
-                ptr::null::<c_char>(),
-            )
-        };
+        macro_rules! save {
+            ($($arg:expr),*) => {
+                    ffi::vips_pngsave_buffer(
+                        self.ptr.as_ptr(),
+                        &mut buf,
+                        &mut len,
+                        c"compression".as_ptr(),
+                        compression,
+                        c"strip".as_ptr(),
+                        bool_to_int(strip),
+                        $($arg,)*
+                        ptr::null::<c_char>(),
+                    )
+            };
+        }
+        let rc = unsafe { with_save_profile!(profile, save) };
         save_result(rc, buf, len)
     }
 
@@ -429,26 +444,28 @@ impl VipsImage {
     ) -> Result<Vec<u8>, VipsError> {
         let mut buf: *mut c_void = ptr::null_mut();
         let mut len: size_t = 0;
-        let rc = unsafe {
-            ffi::vips_webpsave_buffer(
-                self.ptr.as_ptr(),
-                &mut buf,
-                &mut len,
-                c"Q".as_ptr(),
-                quality,
-                c"effort".as_ptr(),
-                effort as c_int,
-                c"strip".as_ptr(),
-                bool_to_int(strip),
-                c"profile".as_ptr(),
-                profile.map_or(ptr::null(), CStr::as_ptr),
-                c"lossless".as_ptr(),
-                bool_to_int(lossless),
-                c"smart_subsample".as_ptr(),
-                bool_to_int(smart_subsample),
-                ptr::null::<c_char>(),
-            )
-        };
+        macro_rules! save {
+            ($($arg:expr),*) => {
+                    ffi::vips_webpsave_buffer(
+                        self.ptr.as_ptr(),
+                        &mut buf,
+                        &mut len,
+                        c"Q".as_ptr(),
+                        quality,
+                        c"effort".as_ptr(),
+                        effort as c_int,
+                        c"strip".as_ptr(),
+                        bool_to_int(strip),
+                        c"lossless".as_ptr(),
+                        bool_to_int(lossless),
+                        c"smart_subsample".as_ptr(),
+                        bool_to_int(smart_subsample),
+                        $($arg,)*
+                        ptr::null::<c_char>(),
+                    )
+            };
+        }
+        let rc = unsafe { with_save_profile!(profile, save) };
         save_result(rc, buf, len)
     }
 

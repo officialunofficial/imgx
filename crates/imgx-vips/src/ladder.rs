@@ -242,7 +242,9 @@ pub fn render_ladder(
     let source = if fused {
         first_frame
     } else {
-        first_frame.materialize().map_err(decode_error)?
+        let decoded = first_frame.materialize().map_err(decode_error)?;
+        drop(first_frame);
+        decoded
     };
     let mut timings = Timings {
         decode: started.elapsed(),
