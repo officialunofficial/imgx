@@ -882,6 +882,7 @@ dependencies = [
  "reqwest",
  "rusty-s3",
  "serde_json",
+ "sha2",
  "thiserror",
  "tikv-jemallocator",
  "tokio",

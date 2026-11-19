@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -68,7 +67,9 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
+      - name: Run tests and image engine goldens
+        env:
+          IMGX_PINNED_GOLDENS: "1"
         run: cargo test --workspace
 
   coverage:
@@ -114,22 +115,13 @@ jobs:
           command: check
 
   build:
-    needs: [ci-image, lint, test]
+    needs: [lint, test]
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    permissions:
-      contents: read
-      packages: read
-    container:
-      image: ${{ needs.ci-image.outputs.image }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
 
-      - uses: mozilla-actions/sccache-action@v0.0.11
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build (release)
-        run: cargo build --release -p imgx
+      - name: Build and smoke the runtime image
+        run: |
+          docker build --tag imgx-smoke .
+          test/smoke-runtime.sh imgx-smoke
