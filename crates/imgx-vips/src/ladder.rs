@@ -484,6 +484,11 @@ fn resize(
             .thumbnail_with_profile(width, opts, profile)
             .map_err(backend_error)?
     };
+    let evaluation_error = if reduced_input.is_some() {
+        decode_error
+    } else {
+        backend_error
+    };
     let image = if let Some((width, height)) = center_crop {
         let image = image
             .crop(
@@ -498,7 +503,7 @@ fn resize(
             // otherwise force the full scaled raster into memory.
             image
                 .materialize()
-                .map_err(backend_error)?
+                .map_err(evaluation_error)?
                 .autorot()
                 .map_err(backend_error)?
         } else {
@@ -528,11 +533,7 @@ fn resize(
     } else {
         image
     };
-    let image = image.materialize().map_err(if reduced_input.is_some() {
-        decode_error
-    } else {
-        backend_error
-    })?;
+    let image = image.materialize().map_err(evaluation_error)?;
     Ok((image, started.elapsed()))
 }
 
@@ -754,12 +755,21 @@ fn backend_error(error: VipsError) -> RenderError {
 fn classify_native_failure(error: VipsError, failure: fn(VipsError) -> RenderError) -> RenderError {
     let message = match &error {
         VipsError::Resource(_) => return RenderError::Resource(error.to_string()),
-        VipsError::LoadFailed(message) | VipsError::OperationFailed(message) => message,
-        _ => return failure(error),
+        VipsError::InitFailed(message)
+        | VipsError::LoadFailed(message)
+        | VipsError::ResizeFailed(message)
+        | VipsError::SaveFailed(message)
+        | VipsError::OperationFailed(message) => message,
     };
-    // libvips exposes a text buffer, but includes the original libheif
-    // error code and subcode at the end of each "heif:" diagnostic.
-    for line in message.lines().filter(|line| line.starts_with("heif: ")) {
+    for line in message.lines() {
+        // libvips' tracked allocators use this domain for allocation failures.
+        if line.starts_with("vips_tracked: ") {
+            return RenderError::Resource(error.to_string());
+        }
+        // libvips appends the native libheif code and subcode to the diagnostic.
+        if !line.starts_with("heif: ") {
+            continue;
+        }
         if line.ends_with(" (4.3000)") || line.ends_with(" (11.6003)") {
             // Unsupported codec (older libheif) or no matching decoder installed.
             return RenderError::UnsupportedInput;
@@ -934,6 +944,10 @@ mod tests {
         assert!(matches!(decode_error(error), RenderError::Resource(_)));
         let error = VipsError::OperationFailed("heif: native diagnostic (6.1000)".into());
         assert!(matches!(decode_error(error), RenderError::CorruptInput(_)));
+        let error = VipsError::OperationFailed("vips_tracked: localized diagnostic".into());
+        assert!(matches!(decode_error(error), RenderError::Resource(_)));
+        let error = VipsError::SaveFailed("vips_tracked: localized diagnostic".into());
+        assert!(matches!(backend_error(error), RenderError::Resource(_)));
     }
 
     #[test]
