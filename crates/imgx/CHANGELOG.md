@@ -3,6 +3,17 @@
 All notable changes to this project are documented in this file.
 
 
+## [0.1.13] - 2026-11-19
+
+### Bug Fixes
+
+- *(vips)* Bound center crops and type decoder failures ([#87](https://github.com/officialunofficial/imgx/pull/87))(b5a8c97)
+
+### CI/CD
+
+- *(release)* Verify the pushed image before promoting latest ([#89](https://github.com/officialunofficial/imgx/pull/89))(26746d4)
+
+
 ## [0.1.12] - 2026-11-19
 
 ### Features
